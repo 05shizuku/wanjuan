@@ -150,3 +150,21 @@ test('WanjuanPlugin：shadowMode=false 时 compress 真执行', async () => {
     assert.equal(p.wj.ledger.messages.get('m1').status, 'folded');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('apply：折叠渲染带内容时间（atRange 保留）', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const { wj } = ctx._wj.getOrCreate('s1');
+
+    const t1 = Date.parse('2026-11-10T10:00:00Z');
+    const t2 = Date.parse('2026-11-12T10:00:00Z');
+    wj.ledger.recordMsg({ id: 'm1', at: t1, tok: 100, content: 'a' });
+    wj.ledger.recordMsg({ id: 'm2', at: t2, tok: 100, content: 'b' });
+    wj.compressor.compress({ range: ['m1', 'm2'], summary: 'test-summary' });
+
+    const block = wj.ledger.getBlock('b1');
+    assert.deepEqual(block.atRange, [t1, t2]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

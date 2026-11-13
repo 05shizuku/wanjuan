@@ -32,3 +32,12 @@ test('buildNudge：空候选列表不崩', () => {
   const text = p.buildNudge({ candidates: [] });
   assert.ok(text.includes('暂无符合条件的区间'));
 });
+
+
+test('哲学文本含时间锚与因果规则', () => {
+  const p = new Philosophy();
+  const text = p.getKeepDropRules();
+  assert.ok(text.includes('时间锚'));
+  assert.ok(text.includes('YYYY-MM-DD'));
+  assert.ok(text.includes('因果关系成对'));
+});

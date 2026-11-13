@@ -165,3 +165,16 @@ test('重放：新 Ledger 从同一 store 重建状态一致', () => {
     assert.deepEqual(l2.assertInvariants(), l1.assertInvariants());
   } finally { cleanup(); }
 });
+
+test('recordPromote：父块 atRange = children 并集', () => {
+  const { store, cleanup } = fresh();
+  try {
+    const l = new Ledger({ store });
+    l.recordMsg({ id: 'm1', tok: 10 });
+    l.recordMsg({ id: 'm2', tok: 10 });
+    l.recordFold({ block: 'b1', range: ['m1', 'm1'], srcTok: 10, sumTok: 2, tier: 1, rawRef: 'r1', atRange: [100, 200] });
+    l.recordFold({ block: 'b2', range: ['m2', 'm2'], srcTok: 10, sumTok: 2, tier: 1, rawRef: 'r2', atRange: [150, 300] });
+    l.recordPromote({ parent: 'b3', children: ['b1', 'b2'], srcTok: 4, sumTok: 1, tier: 2 });
+    assert.deepEqual(l.blocks.get('b3').atRange, [100, 300]);
+  } finally { cleanup(); }
+});

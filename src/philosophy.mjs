@@ -1,5 +1,5 @@
 // src/philosophy.mjs
-export const PHILOSOPHY_VERSION = 'v2.1-cn';
+export const PHILOSOPHY_VERSION = 'v2.2-cn-time';
 
 export const PHILOSOPHY_KEEP_DROP = `
 【折叠指南：你正在执行一次上下文压缩，请绝对遵循以下原则】
@@ -19,8 +19,15 @@ export const PHILOSOPHY_KEEP_DROP = `
 - 多轮排查后得出的关键结论（例如“发现是因为宿主注入了空 system 消息”）。
 - 工具调用的最终参数（不要保留调用过程，只留调用了什么）。
 
+【时间锚（强制）】
+- 摘要开头必须写时间范围：[YYYY-MM-DD ~ YYYY-MM-DD]
+- 跨天对话必须标记“第 N 天”（从会话首条消息算起）
+- 若涉及未完成目标且有截止日期，写“截止：YYYY-MM-DD”
+- 同一事件的多个动作必须写明先后顺序（“11-10 试了 A，11-11 改用 B”）
+- 因果关系成对保留（“因为 A 所以 B”不能只留一半）
+
 预算紧张时的优先级（从高到低）：
-当前目标 > 决策结论 > 核心代码结构 > 精确错误 > 历史教训
+当前目标 > 决策结论 > 核心代码结构 > 精确错误 > 历史教训 > 过程叙述
 `;
 
 export class Philosophy {
@@ -40,7 +47,7 @@ export class Philosophy {
     lines.push('如果你认为应当压缩，请调用 `compress` 工具；如果不需要，可以直接忽略或调用 `decline_compress`。');
     lines.push('');
     lines.push('当前推荐的候选区间：');
-    
+
     if (candidates.length === 0) {
       lines.push('（暂无符合条件的区间）');
     } else {

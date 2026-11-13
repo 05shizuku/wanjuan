@@ -5,13 +5,11 @@ export class Compressor {
   constructor({ ledger, blocks }) {
     this.ledger = ledger;
     this.blocks = blocks;
-    this._counter = null; // 懒初始化：首次 compress 时从磁盘扫 max
+    this._counter = null;
   }
 
   _nextBlockId() {
-    if (this._counter === null) {
-      this._counter = this.blocks.getMaxBlockId();
-    }
+    if (this._counter === null) this._counter = this.blocks.getMaxBlockId();
     this._counter += 1;
     return `b${this._counter}`;
   }
@@ -32,14 +30,19 @@ export class Compressor {
     const srcTok = toFold.reduce((s, m) => s + (m.tok || 0), 0);
     const rawRef = `block.${blockId}.raw.jsonl`;
 
+    // 时间锚：取真实有 at 的消息的最早/最晚
+    const ats = toFold.map((m) => m.at).filter((t) => typeof t === 'number' && t > 0);
+    const atRange = ats.length > 0 ? [Math.min(...ats), Math.max(...ats)] : null;
+
     this.blocks.writeRaw(blockId, toFold);
 
     try {
       this.blocks.writeBlockMeta(blockId, {
         id: blockId, tier, range, srcTok, sumTok,
         summary, topics, rawRef, createdAt: Date.now(),
+        atRange,
       });
-      this.ledger.recordFold({ block: blockId, range, srcTok, sumTok, tier, rawRef });
+      this.ledger.recordFold({ block: blockId, range, srcTok, sumTok, tier, rawRef, atRange });
       return blockId;
     } catch (err) {
       this.blocks.deleteRaw(blockId);

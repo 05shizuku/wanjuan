@@ -26,7 +26,6 @@ export class Ledger {
     if (ev.k === 'msg') {
       if (!this.messages.has(ev.id)) this.messages.set(ev.id, { ev, status: 'active' });
     } else if (ev.k === 'mut') {
-      // 吸收宿主的原地重写
       const m = this.messages.get(ev.id);
       if (m) {
         m.ev = { ...m.ev, bytes: ev.bytes, content: ev.content };
@@ -37,6 +36,7 @@ export class Ledger {
         id: ev.block, tier: ev.tier, range: ev.range,
         srcTok: ev.srcTok, sumTok: ev.sumTok,
         rawRef: ev.rawRef, note: ev.note,
+        atRange: ev.atRange || null,       // 时间锚
         children: undefined, promotedInto: undefined,
       };
       this.blocks.set(ev.block, block);
@@ -71,6 +71,7 @@ export class Ledger {
           id: ev.parent, tier: ev.tier, range: null,
           srcTok: ev.srcTok, sumTok: ev.sumTok,
           rawRef: null, note: undefined,
+          atRange: ev.atRange || null,     // 时间锚
           children: undefined, promotedInto: undefined,
         };
         this.blocks.set(ev.parent, parent);
@@ -79,6 +80,7 @@ export class Ledger {
       parent.srcTok = ev.srcTok;
       parent.sumTok = ev.sumTok;
       parent.tier = ev.tier;
+      parent.atRange = ev.atRange || parent.atRange;
       for (const c of ev.children) {
         const child = this.blocks.get(c);
         if (child) child.promotedInto = ev.parent;
@@ -99,7 +101,6 @@ export class Ledger {
     return ev;
   }
 
-  // 新增：吸收宿主对已知消息的重写
   recordMut({ id, at = Date.now(), bytes, content }) {
     const m = this.messages.get(id);
     if (!m) throw new InvariantError('归属唯一', `mut 目标消息 ${id} 不存在`);
@@ -109,7 +110,7 @@ export class Ledger {
     return ev;
   }
 
-  recordFold({ block, range, srcTok, sumTok, tier, rawRef, note }) {
+  recordFold({ block, range, srcTok, sumTok, tier, rawRef, note, atRange }) {
     if (!rawRef) throw new InvariantError('原文可达', `fold ${block} 缺少 rawRef`);
     if (this.pendingCompress !== null && this.pendingCompress !== block) {
       throw new InvariantError('并发唯一', `已有未决 compress ${this.pendingCompress}`);
@@ -124,7 +125,8 @@ export class Ledger {
       }
     }
     if (found === 0) throw new InvariantError('归属唯一', `区间 ${range} 内无消息`);
-    const ev = { k: 'fold', block, range, srcTok, sumTok, tier, rawRef, ...(note ? { note } : {}) };
+    const ev = { k: 'fold', block, range, srcTok, sumTok, tier, rawRef,
+      ...(note ? { note } : {}), ...(atRange ? { atRange } : {}) };
     this.store.append(ev);
     this._apply(ev);
     this.pendingCompress = null;
@@ -132,7 +134,9 @@ export class Ledger {
   }
 
   recordUnfold({ block, why }) {
-    if (!['context', 'file'].includes(why)) throw new InvariantError('原文可达', `unfold why 非法：${why}`);
+    if (!['context', 'file'].includes(why)) {
+      throw new InvariantError('原文可达', `unfold why 非法：${why}`);
+    }
     const ev = { k: 'unfold', block, why };
     this.store.append(ev);
     this._apply(ev);
@@ -140,7 +144,9 @@ export class Ledger {
   }
 
   recordEvict({ ids, why }) {
-    if (!['reconcile', 'host-compact'].includes(why)) throw new InvariantError('归属唯一', `evict why 非法：${why}`);
+    if (!['reconcile', 'host-compact'].includes(why)) {
+      throw new InvariantError('归属唯一', `evict why 非法：${why}`);
+    }
     const ev = { k: 'evict', ids, why };
     this.store.append(ev);
     this._apply(ev);
@@ -148,8 +154,22 @@ export class Ledger {
   }
 
   recordPromote({ parent, children, srcTok, sumTok, tier }) {
-    if (!Array.isArray(children) || children.length === 0) throw new InvariantError('归属唯一', `promote ${parent} 缺少子块`);
-    const ev = { k: 'promote', parent, children, srcTok, sumTok, tier };
+    if (!Array.isArray(children) || children.length === 0) {
+      throw new InvariantError('归属唯一', `promote ${parent} 缺少子块`);
+    }
+    // 时间锚：所有 children 的 atRange 并集
+    let atMin = Infinity, atMax = -Infinity;
+    for (const cId of children) {
+      const c = this.blocks.get(cId);
+      if (c && c.atRange && c.atRange.length === 2) {
+        if (c.atRange[0] < atMin) atMin = c.atRange[0];
+        if (c.atRange[1] > atMax) atMax = c.atRange[1];
+      }
+    }
+    const atRange = isFinite(atMin) && isFinite(atMax) ? [atMin, atMax] : null;
+
+    const ev = { k: 'promote', parent, children, srcTok, sumTok, tier,
+      ...(atRange ? { atRange } : {}) };
     this.store.append(ev);
     this._apply(ev);
     return ev;

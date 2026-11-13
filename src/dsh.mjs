@@ -4,7 +4,6 @@ import { createHash } from 'node:crypto';
 import { createWanjuan } from './index.mjs';
 import { PHILOSOPHY_KEEP_DROP } from './philosophy.mjs';
 
-// DSH 原生消息 {role, content}，派生稳定 id
 function deriveMsgId({ role, content }) {
   const h = createHash('sha256').update(`${role}\u0000${content || ''}`).digest('hex').slice(0, 12);
   return `m-${h}`;
@@ -27,10 +26,11 @@ function roleToCls(role) {
   return 'text';
 }
 
-function toLedgerMsg(m) {
+function toLedgerMsg(m, fallbackAt) {
   if (!m || typeof m.content !== 'string' || !m.role) return null;
   return {
     id: deriveMsgId(m),
+    at: typeof m.at === 'number' && m.at > 0 ? m.at : (fallbackAt || Date.now()),
     tok: estimateTok(m.content),
     bytes: m.content.length,
     cls: roleToCls(m.role),
@@ -38,9 +38,33 @@ function toLedgerMsg(m) {
   };
 }
 
-// ============================================================
-// 内脏：跨宿主通用逻辑（M2 启用 onRequest 折叠钩子）
-// ============================================================
+function formatDate(ms) {
+  if (!ms || typeof ms !== 'number') return '?';
+  return new Date(ms).toISOString().slice(0, 10);
+}
+
+function formatBlockLine(blockId, block, meta) {
+  const createdAt = meta?.createdAt || 0;
+  const atRange = block?.atRange || meta?.atRange || null;
+
+  let timeSeg = '';
+  if (atRange && atRange.length === 2) {
+    const span = atRange[0] === atRange[1]
+      ? formatDate(atRange[0])
+      : `${formatDate(atRange[0])} ~ ${formatDate(atRange[1])}`;
+    const foldedAt = formatDate(createdAt);
+    const days = createdAt && atRange[1]
+      ? Math.max(0, Math.floor((createdAt - atRange[1]) / 86400000))
+      : 0;
+    const delaySeg = days >= 1 ? ` | 延迟 ${days} 天折叠` : '';
+    timeSeg = ` | 内容 ${span} | 折叠于 ${foldedAt}${delaySeg}`;
+  } else if (createdAt) {
+    timeSeg = ` | 折叠于 ${formatDate(createdAt)}`;
+  }
+
+  return `[摘要块 ${blockId}${timeSeg}] ${meta?.summary || ''}`;
+}
+
 export class WanjuanPlugin {
   constructor({ name = 'wanjuan-native', config = {} } = {}) {
     this.name = name;
@@ -52,14 +76,15 @@ export class WanjuanPlugin {
   }
 
   async _toolCompress({ range, summary, topics = [] }) {
-    // P2 修复：M1 影子模式拒绝实际压缩（避免账本 fold 与宿主全量渲染发散）
     if (this.config.shadowMode !== false) {
       return '🕵️ 影子模式：当前不执行压缩，只观察记账。切到 M2 后会启用。';
     }
     try {
       const blockId = this.wj.compressor.compress({ range, summary, topics });
       const active = this.wj.ledger.getActiveMessages();
-      const est = this.wj.observer.beforeRequest({ provider: this._currentProvider, model: this._currentModel, messages: active });
+      const est = this.wj.observer.beforeRequest({
+        provider: this._currentProvider, model: this._currentModel, messages: active,
+      });
       this._lastFoldEstRaw = est.estRaw;
       return `✅ 压缩成功，生成块 ${blockId}`;
     } catch (e) { return `❌ 压缩失败: ${e.message}`; }
@@ -81,13 +106,15 @@ export class WanjuanPlugin {
   async _toolSearch({ query }) {
     const res = this.wj.restorer.search(query);
     if (res.length === 0) return '未找到相关摘要块。';
-    return res.map((b) => `[${b.id}] ${b.summary} (${b.srcTok} tok)`).join('\n');
+    return res.map((b) => {
+      const blk = this.wj.ledger.getBlock(b.id);
+      const ar = blk?.atRange;
+      const timeSeg = ar ? ` [${formatDate(ar[0])}~${formatDate(ar[1])}]` : '';
+      return `[${b.id}${timeSeg}] ${b.summary} (${b.srcTok} tok)`;
+    }).join('\n');
   }
 }
 
-// ============================================================
-// 脸面：DSH apply(ctx) 方言（M1 影子期只观察）
-// ============================================================
 export const name = 'wanjuan';
 export const inject = ['tools', 'connection', 'tokenMeter', 'webServer'];
 
@@ -96,17 +123,15 @@ export function apply(ctx, baseConfig = {}) {
   const configDir = baseConfig.dir || '.wanjuan';
   const baseDir = isAbsolute(configDir) ? configDir : join(dshHome, configDir);
 
-  // 挂载时探测宿主形状，一次日志定生死
   try {
     ctx.logger?.info?.(
       `[wanjuan] host shape: on=${typeof ctx.on}, waterfall=${typeof ctx.waterfall}, ` +
-      `effect=${typeof ctx.effect}, tools=${typeof ctx.tools}, ` +
-      `connection.on=${typeof ctx.connection?.on}, tokenMeter=${typeof ctx.tokenMeter}`
+      `effect=${typeof ctx.effect}, tools=${typeof ctx.tools}`
     );
     if (ctx.tokenMeter) {
       ctx.logger.info(`[wanjuan] tokenMeter 可用方法: ${Object.keys(ctx.tokenMeter).join(', ')}`);
     }
-  } catch { /* 忽略 */ }
+  } catch {}
 
   const pluginCache = new Map();
 
@@ -136,11 +161,10 @@ export function apply(ctx, baseConfig = {}) {
   // 1) 工具注册
   if (ctx.tools && typeof ctx.tools.register === 'function' && typeof ctx.effect === 'function') {
     ctx.effect(() => {
-      const keepDropRules = PHILOSOPHY_KEEP_DROP;
       const defs = [
         {
           name: 'compress',
-          description: `压缩一段连续消息为摘要块。生成摘要时必须严格遵循以下折叠规则：\n${keepDropRules}`,
+          description: `压缩一段连续消息为摘要块。生成摘要时必须严格遵循以下折叠规则：\n${PHILOSOPHY_KEEP_DROP}`,
           parameters: {
             type: 'object',
             properties: {
@@ -175,11 +199,11 @@ export function apply(ctx, baseConfig = {}) {
     });
   }
 
-  // 2) 消息面 —— 真挂点：session/event（Post-commit, fire-and-forget append feed）
-  function handleMsgBatch(msgs, sid) {
+  // 2) 消息面（真挂点：session/event）
+  function handleMsgBatch(msgs, sid, fallbackAt) {
     try {
       const wj = getOrCreate(sid).wj;
-      const ledgerMsgs = msgs.map(toLedgerMsg).filter(Boolean);
+      const ledgerMsgs = msgs.map((m) => toLedgerMsg(m, fallbackAt)).filter(Boolean);
       if (ledgerMsgs.length === 0) return;
       for (const m of ledgerMsgs) wj.ledger.recordMsg(m);
       wj.fingerprinter.check(ledgerMsgs);
@@ -191,18 +215,15 @@ export function apply(ctx, baseConfig = {}) {
   function handleSessionEvent(event) {
     try {
       const sid = resolveSid(event);
-      // 探测可能的结构：
-      //   {type:'message', message:{role,content}}
-      //   {type:'step', messages:[...]}
-      //   {message:{role,content}} 直接
+      const fallbackAt = event?.at || event?.timestamp || Date.now();
       if (event?.type === 'message' && event?.message) {
-        handleMsgBatch([event.message], sid);
+        handleMsgBatch([event.message], sid, fallbackAt);
       } else if (event?.type === 'step' && Array.isArray(event?.messages)) {
-        handleMsgBatch(event.messages, sid);
+        handleMsgBatch(event.messages, sid, fallbackAt);
       } else if (Array.isArray(event?.messages)) {
-        handleMsgBatch(event.messages, sid);
+        handleMsgBatch(event.messages, sid, fallbackAt);
       } else if (event?.message?.role) {
-        handleMsgBatch([event.message], sid);
+        handleMsgBatch([event.message], sid, fallbackAt);
       }
     } catch (e) {
       ctx.logger?.warn?.(`[wanjuan] handleSessionEvent 失败: ${e.message}`);
@@ -215,7 +236,7 @@ export function apply(ctx, baseConfig = {}) {
     }
   }
 
-  // 3) 用量面 —— 真挂点：llm/stream waterfall，包住流，从 finish chunk 拿 usage
+  // 3) 用量面（真挂点：llm/stream waterfall）
   function handleUsage(usage, meta) {
     try {
       if (!usage) return;
@@ -227,8 +248,7 @@ export function apply(ctx, baseConfig = {}) {
       const est = wj.observer.beforeRequest({ provider, model, messages });
       wj.observer.afterRequest({ provider, model, est, usage });
       wj.diagnoser.record({
-        n: wj.diagnoser.size() + 1,
-        provider, model, usage, est,
+        n: wj.diagnoser.size() + 1, provider, model, usage, est,
         degraded: wj.estimator.getDegraded(),
       });
     } catch (e) {
@@ -238,7 +258,6 @@ export function apply(ctx, baseConfig = {}) {
 
   function extractUsageFromChunk(chunk) {
     if (!chunk) return null;
-    // 常见形状探测
     return chunk.usage || chunk.stats?.usage || chunk.finish?.usage || null;
   }
 
@@ -247,7 +266,6 @@ export function apply(ctx, baseConfig = {}) {
       ctx.waterfall('llm/stream', async (request, next) => {
         const result = await next(request);
 
-        // 情况 1：result 是 async iterable → wrap 并拿最后 chunk 的 usage
         if (result && typeof result[Symbol.asyncIterator] === 'function') {
           const stream = result;
           return (async function* () {
@@ -268,7 +286,6 @@ export function apply(ctx, baseConfig = {}) {
           })();
         }
 
-        // 情况 2：result 直接带 usage（一次性返回）
         const usage = extractUsageFromChunk(result);
         if (usage) {
           handleUsage(usage, {
@@ -284,8 +301,6 @@ export function apply(ctx, baseConfig = {}) {
       ctx.logger?.warn?.(`[wanjuan] 挂 llm/stream 失败: ${e.message}`);
     }
   }
-
-  // 4) M1 不挂 agent/pre-step（折叠渲染钩子 M2 再启用）
 
   ctx.logger?.info?.('[wanjuan] M1 影子期已挂载：session/event + llm/stream');
 }
