@@ -1,0 +1,25 @@
+# wanjuan/dsh.bundle.patch.yml
+# 注意：inject 是整列表替换，必须从宿主当前版本导出全量后再追加。
+# 此配置假设宿主当前没有 inject 项，若有请手动合并。
+
+- id: compaction-basic
+  config: { auto: false } # 关闭宿主原生自动压缩，由万卷接管
+
+- id: wanjuan-native
+  name: wanjuan/dsh.mjs # 指向我们的插件入口
+  config:
+    dir: ".wanjuan" # 数据目录
+
+- id: wanjuan-gate
+  name: wanjuan/dsh-gate.mjs # 退化轮门服务，先占位，M3 已实现 gate 但不独立起服务
+
+# 强制重写 preset-standard 的 inject 列表，加入万卷策略
+- id: preset-standard
+  inject: [wanjuanCompactionPolicy]
+
+- id: llm-deepseek
+  config:
+    retryPolicy:
+      mode: normal
+      # 继承 BC 的教训，补上 MALFORMED_RESPONSE
+      retryableCodes: [EMPTY_RESPONSE, RATE_LIMIT, SERVER, TIMEOUT, TRANSPORT, MALFORMED_RESPONSE]
