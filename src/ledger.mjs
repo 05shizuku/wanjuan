@@ -1,6 +1,4 @@
 // src/ledger.mjs
-// L1 账本层。事件溯源封装 Store，维护消息/块状态，做不变式检查。
-
 export class InvariantError extends Error {
   constructor(name, detail) {
     super(`不变式 ${name} 违反：${detail}`);
@@ -60,7 +58,6 @@ export class Ledger {
         this.blocks.delete(ev.block);
       }
     } else if (ev.k === 'promote') {
-      // 晋升 = 创建（或更新）tier-2/3 父块；父块不写新 raw，rawRef 为 null
       let parent = this.blocks.get(ev.parent);
       if (!parent) {
         parent = {
@@ -174,7 +171,6 @@ export class Ledger {
       this._degrade('pending-without-block');
     }
 
-    // 原文可达：叶子块必须有 rawRef；有 children 的父块靠 children 递归展开，rawRef 允许为 null
     for (const b of this.blocks.values()) {
       if (b.children && b.children.length > 0) continue;
       if (!b.rawRef) throw new InvariantError('原文可达', `块 ${b.id} 缺 rawRef`);

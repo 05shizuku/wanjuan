@@ -8,6 +8,8 @@ export class WanjuanPlugin {
     this.config = config;
     this.wj = null;
     this._currentNudgeReserve = 0;
+    this._lastFoldEst = 0;
+    this._nativeEst = null;
   }
 
   async bind(dshCtx) {
@@ -27,12 +29,13 @@ export class WanjuanPlugin {
     
     // 1. 对账与锚点吸收
     const fpResult = this.wj.fingerprinter.check(messages);
-    if (fpResult.action === 'full' && fpResult.divergedAt) {
+    if (fpResult.action === 'full' && fpResult.divergenceKind === 'content-mismatch') {
       const noteMsg = {
         id: `wj-anchor-${Date.now()}`,
         cls: 'sys',
         tok: 50,
-        content: `[万卷锚点说明] 宿主在历史 ${fpResult.divergedAt} 处修改了上下文。由于前缀纪律，我们不重写历史。请基于当前最新的上下文继续任务。`
+        ephemeral: true,
+        content: `[万卷锚点说明] 宿主在历史 ${fpResult.divergedAt} 处修改了上下文。请基于当前最新的上下文继续任务。`
       };
       req.messages = [...messages, noteMsg];
       this._currentNudgeReserve += 50;
@@ -47,17 +50,28 @@ export class WanjuanPlugin {
       });
     }
 
-    // 2. 估算与门判定
-    const est = this.wj.observer.beforeRequest({ provider: req.provider, model: req.model, messages: req.messages });
-    const lastFoldEst = 0; 
-    const gateRes = this.wj.gate.check({ currentEst: est.estFinal, lastFoldEst, window: est.window });
+    // 2. 原生估算（在注入任何 nudge 之前）
+    this._nativeEst = this.wj.observer.beforeRequest({ 
+      provider: req.provider, model: req.model, messages: req.messages 
+    });
+    
+    if (this._lastFoldEst === 0) {
+      this._lastFoldEst = this._nativeEst.estFinal;
+    }
 
-    // 3. Nudge 注入
+    // 3. 门判定与 Nudge 注入
+    const gateRes = this.wj.gate.check({ 
+      currentEst: this._nativeEst.estFinal, 
+      lastFoldEst: this._lastFoldEst, 
+      window: this._nativeEst.window 
+    });
+
     if (gateRes.shouldNudge) {
       const active = this.wj.ledger.getActiveMessages();
       const candidates = this.wj.nudge.findCandidates(active);
       const turn = this.wj.diagnoser.size() + 1;
       const nudgeMsg = this.wj.nudge.buildNudgeMessage(candidates, turn);
+      
       if (nudgeMsg) {
         req.messages = [...req.messages, nudgeMsg];
         this._currentNudgeReserve += nudgeMsg.tok;
@@ -68,8 +82,15 @@ export class WanjuanPlugin {
   }
 
   async onResponse(req, res, next) {
-    const est = this.wj.observer.beforeRequest({ provider: req.provider, model: req.model, messages: req.messages });
-    this.wj.observer.afterRequest({ provider: req.provider, model: req.model, est, usage: res.usage });
+    // Bug ⑤ 修复：用未包含注入的 nativeEst 来校准
+    const est = this._nativeEst || this.wj.observer.beforeRequest({ 
+      provider: req.provider, model: req.model, messages: req.messages 
+    });
+    
+    this.wj.observer.afterRequest({ 
+      provider: req.provider, model: req.model, est, usage: res.usage 
+    });
+    
     this.wj.diagnoser.record({
       n: this.wj.diagnoser.size() + 1,
       provider: req.provider,
@@ -78,6 +99,7 @@ export class WanjuanPlugin {
       est,
       degraded: this.wj.estimator.getDegraded(),
     });
+    
     this._currentNudgeReserve = 0;
     return next(res);
   }
@@ -85,6 +107,13 @@ export class WanjuanPlugin {
   async _toolCompress({ range, summary, topics = [] }) {
     try {
       const blockId = this.wj.compressor.compress({ range, summary, topics });
+      
+      // Bug ⑥ 修复：压缩成功后，更新 _lastFoldEst 防止下一轮立刻再次触发
+      const active = this.wj.ledger.getActiveMessages();
+      this._lastFoldEst = this.wj.observer.beforeRequest({ 
+        provider: 'deepseek', model: 'deepseek-chat', messages: active 
+      }).estFinal;
+
       return `✅ 压缩成功，生成块 ${blockId}，范围 ${range[0]} ~ ${range[1]}`;
     } catch (e) {
       return `❌ 压缩失败: ${e.message}`;

@@ -2,7 +2,9 @@
 import { createHash } from 'node:crypto';
 
 function hashMsg(m) {
-  return createHash('sha256').update(JSON.stringify({ id: m.id, tok: m.tok, cls: m.cls })).digest('hex');
+  return createHash('sha256')
+    .update(JSON.stringify({ id: m.id, bytes: m.bytes ?? 0, content: m.content ?? '' }))
+    .digest('hex');
 }
 
 export class Fingerprinter {
@@ -31,8 +33,9 @@ export class Fingerprinter {
     
     for (const m of messages) {
       const a = activeMap.get(m.id);
-      if (!a) return { msgId: m.id, reason: 'missing-in-ledger' };
-      if (hashMsg(a) !== hashMsg(m)) return { msgId: m.id, reason: 'content-mismatch' };
+      // 账本里没有的消息是“正常生长”，不是错误
+      if (!a) return { msgId: m.id, kind: 'growth' };
+      if (hashMsg(a) !== hashMsg(m)) return { msgId: m.id, kind: 'content-mismatch' };
     }
     return null;
   }
@@ -51,7 +54,7 @@ export class Fingerprinter {
     let added = 0;
     for (const m of messages) {
       if (!ledgerMap.has(m.id)) {
-        this.ledger.recordMsg({ id: m.id, tok: m.tok, cls: m.cls, bytes: m.bytes });
+        this.ledger.recordMsg({ id: m.id, tok: m.tok, cls: m.cls, bytes: m.bytes, content: m.content });
         added++;
       }
     }
@@ -93,7 +96,13 @@ export class Fingerprinter {
     if (!this.checkLight(messages)) {
       const div = this.findDivergence(messages);
       const r = this.reconcile(messages, 'host-compact');
-      return { action: 'full', reason: 'light-mismatch', ...r, divergedAt: div?.msgId };
+      return { 
+        action: 'full', 
+        reason: 'light-mismatch', 
+        ...r, 
+        divergedAt: div?.msgId,
+        divergenceKind: div?.kind 
+      };
     }
 
     const needSample = this.turnsSinceFull >= this.sampleEvery || sawRewrite || hostVersionChanged || forceFull;

@@ -17,7 +17,7 @@ function fresh() {
 
 function seedLedger(ledger, n) {
   for (let i = 0; i < n; i++) {
-    ledger.recordMsg({ id: `m${i}`, tok: 10, bytes: 100, cls: 'text' });
+    ledger.recordMsg({ id: `m${i}`, tok: 10, bytes: 100, cls: 'text', content: `content-${i}` });
   }
 }
 
@@ -48,6 +48,24 @@ test('轻指纹：末条 id 变化失配', () => {
     const messages = ledger.getActiveMessages().map((m) => ({ ...m }));
     messages[messages.length - 1].id = 'm999';
     assert.equal(fp.checkLight(messages), false);
+  } finally { cleanup(); }
+});
+
+test('findDivergence：区分正常生长与宿主重写', () => {
+  const { ledger, cleanup } = fresh();
+  try {
+    ledger.recordMsg({ id: 'm1', tok: 10, bytes: 100, content: 'hello' });
+    const fp = new Fingerprinter({ ledger });
+
+    // 正常生长（尾部新增）
+    let div = fp.findDivergence([...ledger.getActiveMessages(), { id: 'm2', tok: 10, bytes: 100, content: 'new' }]);
+    assert.equal(div.kind, 'growth');
+    assert.equal(div.msgId, 'm2');
+
+    // 宿主重写（内容变化）
+    div = fp.findDivergence([{ id: 'm1', tok: 10, bytes: 100, content: 'hacked' }]);
+    assert.equal(div.kind, 'content-mismatch');
+    assert.equal(div.msgId, 'm1');
   } finally { cleanup(); }
 });
 
@@ -82,7 +100,7 @@ test('采样对账：中间消息被改写 → 捕获', () => {
     seedLedger(ledger, 10);
     const fp = new Fingerprinter({ ledger });
     const messages = ledger.getActiveMessages().map((m) => ({ ...m }));
-    messages[5] = { ...messages[5], tok: 999 };
+    messages[5] = { ...messages[5], content: 'hacked' };
     let i = 0;
     const seq = [0.1, 0.5, 0.9];
     const rng = () => seq[i++ % 3];
