@@ -1,8 +1,6 @@
 // src/dsh.mjs
 // L4 宿主集成（DSH 插件入口）。
 // 负责把 createWanjuan 返回的内核包装成 DSH 认识的插件形状。
-// 暴露工具：compress, decline_compress, decompress, search_context。
-// 暴露钩子：onRequest（注入 nudge、对账）、onResponse（更新 usage）。
 
 import { join } from 'node:path';
 import { createWanjuan } from './index.mjs';
@@ -11,16 +9,13 @@ export class WanjuanPlugin {
   constructor({ name = 'wanjuan-native', config = {} } = {}) {
     this.name = name;
     this.config = config;
-    this.wj = null; // 延迟初始化，在 bind 或 request 时按需创建
+    this.wj = null;
   }
 
-  // DSH 生命周期：插件挂载时调用
   async bind(dshCtx) {
-    // 从宿主环境变量或配置获取数据目录，默认放 ~/.dsh/.wanjuan
     const dir = this.config.dir || join(dshCtx.dshHome || '.', '.wanjuan', 'sessions', dshCtx.sessionId || 'default');
     this.wj = createWanjuan({ dir, ...this.config });
 
-    // 向 DSH 注册工具
     dshCtx.registerTools({
       compress: this._toolCompress.bind(this),
       decline_compress: this._toolDecline.bind(this),
@@ -29,8 +24,6 @@ export class WanjuanPlugin {
     });
   }
 
-  // DSH 生命周期：每次请求发出前调用
-  // 用于注入 nudge 和进行指纹对账
   async onRequest(req, next) {
     const messages = req.messages || [];
     
@@ -48,7 +41,8 @@ export class WanjuanPlugin {
     });
 
     // 3. 增速门判定
-    // 注意：M5 阶段先写死上次折叠点为 0，实际接入应持久化或从账本推算
+    // TODO(M4): 真实环境中，lastFoldEst 应该通过查询账本最后一条 fold 事件时的估算值来得出。
+    // 目前 M5 阶段暂用 0 代替。
     const lastFoldEst = 0; 
     const gateRes = this.wj.gate.check({ currentEst: est.estFinal, lastFoldEst, window: est.window });
 
@@ -56,25 +50,22 @@ export class WanjuanPlugin {
     if (gateRes.shouldNudge) {
       const active = this.wj.ledger.getActiveMessages();
       const candidates = this.wj.nudge.findCandidates(active);
-      // 假设用请求次数作为 turn 计数
-      const turn = messages.length; 
+      
+      // 用当前已经记录的请求数作为轮次，代替 messages.length（防止宿主压缩后数量突变）
+      const turn = this.wj.diagnoser.size() + 1;
       const nudgeMsg = this.wj.nudge.buildNudgeMessage(candidates, turn);
       
       if (nudgeMsg) {
-        // 将 nudge 消息追加到请求尾部（DSH 会自动将其放在 wire 末尾）
         req.messages = [...messages, nudgeMsg];
-        // 记录 nudgeReserve，供后续 fits 检查
         this._currentNudgeReserve = nudgeMsg.tok;
       }
     }
 
-    // 继续后续请求流程
     return next(req);
   }
 
-  // DSH 生命周期：请求返回后调用
   async onResponse(req, res, next) {
-    // 记录 usage，更新 k̂
+    // 复用 beforeRequest 来复现估算状态，或者可以从上下文缓存里拿
     const est = this.wj.observer.beforeRequest({
       provider: req.provider,
       model: req.model,
@@ -89,7 +80,7 @@ export class WanjuanPlugin {
     });
 
     this.wj.diagnoser.record({
-      n: Date.now(),
+      n: this.wj.diagnoser.size() + 1,
       provider: req.provider,
       model: req.model,
       usage: res.usage,
@@ -100,8 +91,6 @@ export class WanjuanPlugin {
     return next(res);
   }
 
-  // ---- 工具实现 ----
-  
   async _toolCompress({ range, summary, topics = [] }) {
     try {
       const blockId = this.wj.compressor.compress({ range, summary, topics });
@@ -112,8 +101,7 @@ export class WanjuanPlugin {
   }
 
   async _toolDecline({ range, reason }) {
-    // 记录拒绝，触发降频
-    this.wj.nudge.recordReject(range, Date.now());
+    this.wj.nudge.recordReject(range, this.wj.diagnoser.size() + 1);
     return `已记录拒绝区间 ${range[0]} ~ ${range[1]}，理由：${reason || '未说明'}`;
   }
 

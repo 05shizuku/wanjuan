@@ -14,7 +14,7 @@ export function classifyMiss({ usage, est }) {
   if (typeof usage.cached !== 'number') return 'unattributed';
   const missTok = Math.max(0, usage.input_tokens - usage.cached);
   if (missTok === 0) return 'new';
-  return 'unattributed';
+  return 'unattributed'; // M1 粗判：有 miss 但没归因
 }
 
 export class Diagnoser {
@@ -54,6 +54,11 @@ export class Diagnoser {
       out.push(JSON.parse(line));
     }
     return out;
+  }
+
+  // 新增：获取已记录的请求数量，用于 dsh.mjs 里的轮次计算
+  size() {
+    return this.readAll().length;
   }
 
   summarize() {
