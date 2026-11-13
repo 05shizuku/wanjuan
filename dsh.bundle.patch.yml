@@ -3,9 +3,11 @@
 # 若要切换为正式接管版，请将 auto 改为 false，并手动导出 inject 列表。
 
 - id: wanjuan-native
-  name: wanjuan/dsh.mjs # 修正：对齐真实的 src/dsh.mjs
+  name: wanjuan/dsh.mjs # 指向真实的 src/dsh.mjs
   config:
-    dir: ".wanjuan" 
+    # dir 是相对路径时，会自动锚到 dshHome（不依赖 CWD），再按 sessionId 分格。
+    # 若需指定绝对路径（如 D:\wanjuan-data），直接写全路径即可。
+    dir: ".wanjuan"
 
 # 注意：宿主的 inject 列表必须完整导出后再追加。
 # 在当前影子阶段，请不要强行覆盖 inject，让万卷静默旁观。

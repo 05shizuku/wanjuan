@@ -1,7 +1,7 @@
 // src/store.mjs
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync,
-         statSync, readdirSync, unlinkSync, openSync, fsyncSync, closeSync, renameSync } from 'node:fs';
+         statSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 const FORBIDDEN = new Set(['__proto__', 'constructor', 'prototype']);
@@ -22,13 +22,14 @@ export function hashCanonical(v, fields) {
 const SEG_RE = /^ledger\.(\d{4})\.jsonl$/;
 
 export class Store {
-  constructor({ dir, snapshotBudget = 1000, segBytes = 100 * 1024 * 1024, blockMaxBytes = 4 * 1024 * 1024 }) {
+  constructor({ dir, snapshotBudget = 1000, segBytes = 100 * 1024 * 1024, blockMaxBytes = 4 * 1024 * 1024, onWarn } = {}) {
     this.dir = dir;
     this.snapshotBudget = snapshotBudget;
     this.segBytes = segBytes;
     this.blockMaxBytes = blockMaxBytes;
-    this.segIndex = 1;
+    this.onWarn = onWarn ?? ((msg) => console.warn(`[wanjuan/store] ${msg}`));
     this.degraded = [];
+    this._degradedWarned = false;
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     this._syncSegIndex();
   }
@@ -55,7 +56,7 @@ export class Store {
     return ev;
   }
 
-  // 修复：坏行跳过，不拖垮全账本
+  // 坏行跳过不拖垮账本；首次发现坏行 warn 一次，让运维知道
   replay() {
     const files = readdirSync(this.dir).filter((f) => SEG_RE.test(f)).sort();
     const events = [];
@@ -72,6 +73,10 @@ export class Store {
         }
       }
     }
+    if (this.degraded.length > 0 && !this._degradedWarned) {
+      this._degradedWarned = true;
+      this.onWarn(`账本有 ${this.degraded.length} 行损坏，已跳过。详情: ${JSON.stringify(this.degraded)}`);
+    }
     return this._reduce(events);
   }
 
@@ -80,14 +85,14 @@ export class Store {
     const blocks = new Map();
     const evicted = new Set();
     const mutated = new Map();
-    
+
     for (const ev of events) {
       if (ev.k === 'msg') messages.push(ev);
       else if (ev.k === 'mut') mutated.set(ev.id, ev);
       else if (ev.k === 'fold') blocks.set(ev.block, ev);
       else if (ev.k === 'evict') for (const id of ev.ids) evicted.add(id);
-      else if (ev.k === 'promote') { 
-        for (const c of ev.children) { const b = blocks.get(c); if (b) b.promotedInto = ev.parent; } 
+      else if (ev.k === 'promote') {
+        for (const c of ev.children) { const b = blocks.get(c); if (b) b.promotedInto = ev.parent; }
       }
     }
     return { events, messages, blocks, evicted, mutated };
@@ -118,4 +123,7 @@ export class Store {
     writeFileSync(join(this.dir, `block.${id}.json`), text, 'utf8');
     return bytes;
   }
+
+  hasDegraded() { return this.degraded.length > 0; }
+  getDegraded() { return [...this.degraded]; }
 }
