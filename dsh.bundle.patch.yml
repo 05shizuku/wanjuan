@@ -3,8 +3,9 @@
 # 真挂点：session/event（消息面）、llm/stream waterfall（用量面）。
 # 切到 M2 时：把 shadowMode 改为 false，并补挂 agent/pre-step 折叠钩子。
 
-- id: wanjuan-native
-  name: wanjuan/dsh
-  config:
-    dir: ".wanjuan"
-    shadowMode: true   # M1 强制影子：compress 工具只返回提示，不真的 fold
+- insert:
+    - id: wanjuan-native
+      name: 'wanjuan/dsh'
+      config:
+        dir: '.wanjuan'
+        shadowMode: true   # M1 强制影子：compress 工具只返回提示，不真的 fold
