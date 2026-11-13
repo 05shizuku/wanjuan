@@ -25,6 +25,13 @@ export class Ledger {
   _apply(ev) {
     if (ev.k === 'msg') {
       if (!this.messages.has(ev.id)) this.messages.set(ev.id, { ev, status: 'active' });
+    } else if (ev.k === 'mut') {
+      // 吸收宿主的原地重写
+      const m = this.messages.get(ev.id);
+      if (m) {
+        m.ev = { ...m.ev, bytes: ev.bytes, content: ev.content };
+        m.ev.mutatedAt = ev.at;
+      }
     } else if (ev.k === 'fold') {
       const block = {
         id: ev.block, tier: ev.tier, range: ev.range,
@@ -92,6 +99,16 @@ export class Ledger {
     return ev;
   }
 
+  // 新增：吸收宿主对已知消息的重写
+  recordMut({ id, at = Date.now(), bytes, content }) {
+    const m = this.messages.get(id);
+    if (!m) throw new InvariantError('归属唯一', `mut 目标消息 ${id} 不存在`);
+    const ev = { k: 'mut', id, at, bytes, content };
+    this.store.append(ev);
+    this._apply(ev);
+    return ev;
+  }
+
   recordFold({ block, range, srcTok, sumTok, tier, rawRef, note }) {
     if (!rawRef) throw new InvariantError('原文可达', `fold ${block} 缺少 rawRef`);
     if (this.pendingCompress !== null && this.pendingCompress !== block) {
@@ -115,9 +132,7 @@ export class Ledger {
   }
 
   recordUnfold({ block, why }) {
-    if (!['context', 'file'].includes(why)) {
-      throw new InvariantError('原文可达', `unfold why 非法：${why}`);
-    }
+    if (!['context', 'file'].includes(why)) throw new InvariantError('原文可达', `unfold why 非法：${why}`);
     const ev = { k: 'unfold', block, why };
     this.store.append(ev);
     this._apply(ev);
@@ -125,9 +140,7 @@ export class Ledger {
   }
 
   recordEvict({ ids, why }) {
-    if (!['reconcile', 'host-compact'].includes(why)) {
-      throw new InvariantError('归属唯一', `evict why 非法：${why}`);
-    }
+    if (!['reconcile', 'host-compact'].includes(why)) throw new InvariantError('归属唯一', `evict why 非法：${why}`);
     const ev = { k: 'evict', ids, why };
     this.store.append(ev);
     this._apply(ev);
@@ -135,9 +148,7 @@ export class Ledger {
   }
 
   recordPromote({ parent, children, srcTok, sumTok, tier }) {
-    if (!Array.isArray(children) || children.length === 0) {
-      throw new InvariantError('归属唯一', `promote ${parent} 缺少子块`);
-    }
+    if (!Array.isArray(children) || children.length === 0) throw new InvariantError('归属唯一', `promote ${parent} 缺少子块`);
     const ev = { k: 'promote', parent, children, srcTok, sumTok, tier };
     this.store.append(ev);
     this._apply(ev);

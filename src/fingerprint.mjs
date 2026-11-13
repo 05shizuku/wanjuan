@@ -2,9 +2,7 @@
 import { createHash } from 'node:crypto';
 
 function hashMsg(m) {
-  return createHash('sha256')
-    .update(JSON.stringify({ id: m.id, bytes: m.bytes ?? 0, content: m.content ?? '' }))
-    .digest('hex');
+  return createHash('sha256').update(JSON.stringify({ id: m.id, bytes: m.bytes ?? 0, content: m.content ?? '' })).digest('hex');
 }
 
 export class Fingerprinter {
@@ -27,19 +25,6 @@ export class Fingerprinter {
     return a.count === b.count && a.first === b.first && a.last === b.last && a.bytes === b.bytes;
   }
 
-  findDivergence(messages) {
-    const active = this.ledger.getActiveMessages();
-    const activeMap = new Map(active.map((m) => [m.id, m]));
-    
-    for (const m of messages) {
-      const a = activeMap.get(m.id);
-      // 账本里没有的消息是“正常生长”，不是错误
-      if (!a) return { msgId: m.id, kind: 'growth' };
-      if (hashMsg(a) !== hashMsg(m)) return { msgId: m.id, kind: 'content-mismatch' };
-    }
-    return null;
-  }
-
   reconcile(messages, why = 'reconcile') {
     const present = new Set(messages.map((m) => m.id));
     const ledgerActive = this.ledger.getActiveMessages();
@@ -52,15 +37,21 @@ export class Fingerprinter {
     if (toEvict.length > 0) this.ledger.recordEvict({ ids: toEvict, why });
 
     let added = 0;
+    const mutated = []; // 收集被重写的 id
     for (const m of messages) {
-      if (!ledgerMap.has(m.id)) {
+      const existing = ledgerMap.get(m.id);
+      if (!existing) {
         this.ledger.recordMsg({ id: m.id, tok: m.tok, cls: m.cls, bytes: m.bytes, content: m.content });
         added++;
+      } else if (hashMsg(existing) !== hashMsg(m)) {
+        // 账本有，且内容不一致 -> 宿主重写，记 mut 事件
+        this.ledger.recordMut({ id: m.id, bytes: m.bytes, content: m.content });
+        mutated.push(m.id);
       }
     }
 
     this.turnsSinceFull = 0;
-    return { evicted: toEvict.length, added };
+    return { evicted: toEvict.length, added, mutated };
   }
 
   sampleCheck(messages, rng = Math.random) {
@@ -94,15 +85,8 @@ export class Fingerprinter {
     this.turnsSinceFull += 1;
 
     if (!this.checkLight(messages)) {
-      const div = this.findDivergence(messages);
       const r = this.reconcile(messages, 'host-compact');
-      return { 
-        action: 'full', 
-        reason: 'light-mismatch', 
-        ...r, 
-        divergedAt: div?.msgId,
-        divergenceKind: div?.kind 
-      };
+      return { action: 'full', reason: 'light-mismatch', ...r };
     }
 
     const needSample = this.turnsSinceFull >= this.sampleEvery || sawRewrite || hostVersionChanged || forceFull;

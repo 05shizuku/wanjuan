@@ -51,24 +51,6 @@ test('轻指纹：末条 id 变化失配', () => {
   } finally { cleanup(); }
 });
 
-test('findDivergence：区分正常生长与宿主重写', () => {
-  const { ledger, cleanup } = fresh();
-  try {
-    ledger.recordMsg({ id: 'm1', tok: 10, bytes: 100, content: 'hello' });
-    const fp = new Fingerprinter({ ledger });
-
-    // 正常生长（尾部新增）
-    let div = fp.findDivergence([...ledger.getActiveMessages(), { id: 'm2', tok: 10, bytes: 100, content: 'new' }]);
-    assert.equal(div.kind, 'growth');
-    assert.equal(div.msgId, 'm2');
-
-    // 宿主重写（内容变化）
-    div = fp.findDivergence([{ id: 'm1', tok: 10, bytes: 100, content: 'hacked' }]);
-    assert.equal(div.kind, 'content-mismatch');
-    assert.equal(div.msgId, 'm1');
-  } finally { cleanup(); }
-});
-
 test('reconcile：宿主吃掉中间消息 → evict 正确', () => {
   const { ledger, cleanup } = fresh();
   try {
@@ -91,6 +73,27 @@ test('reconcile：请求有、账本没有 → recordMsg', () => {
     const r = fp.reconcile(messages);
     assert.equal(r.added, 1);
     assert.ok(ledger.messages.has('m-new'));
+  } finally { cleanup(); }
+});
+
+test('reconcile：内容变更触发 mut 事件，账本收敛不报错', () => {
+  const { ledger, cleanup } = fresh();
+  try {
+    ledger.recordMsg({ id: 'm1', tok: 10, bytes: 10, content: 'old' });
+    const fp = new Fingerprinter({ ledger });
+
+    // 宿主重写了 m1
+    const hostMessages = [{ id: 'm1', tok: 10, bytes: 11, content: 'new' }];
+    const r = fp.reconcile(hostMessages);
+    
+    // 账本里应该已更新
+    assert.equal(ledger.messages.get('m1').ev.content, 'new');
+    assert.equal(r.mutated.length, 1);
+    assert.equal(r.mutated[0], 'm1');
+
+    // 验证收敛：用同样的 hostMessages 再对账一次，不应该再触发 mut
+    const r2 = fp.reconcile(hostMessages);
+    assert.equal(r2.mutated.length, 0); 
   } finally { cleanup(); }
 });
 

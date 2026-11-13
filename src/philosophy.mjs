@@ -1,8 +1,5 @@
 // src/philosophy.mjs
-// 哲学文本（KEEP/DROP）与 nudge 注入话术。
-// 版本化：v2 (中文实战版)。修改措辞会影响模型行为，需在账本记 cfg 事件。
-
-export const PHILOSOPHY_VERSION = 'v2-cn';
+export const PHILOSOPHY_VERSION = 'v2.1-cn';
 
 export const PHILOSOPHY_KEEP_DROP = `
 【折叠指南：你正在执行一次上下文压缩，请绝对遵循以下原则】
@@ -14,11 +11,13 @@ export const PHILOSOPHY_KEEP_DROP = `
 - 已经被推翻的探索路径（如“我试试用 A 方案，不行”，请直接丢弃试错过程，仅保留结论“A 方案不可行”）。
 
 必须保留（KEEP）：
-- 带行号的具体文件路径和函数签名（例如 \`src/dsh.mjs:42\`）。
-- 精确的错误字符串（如 \`ERR_MODULE_NOT_FOUND\`）。
+- 引用历史消息或块时，必须写明 ID（如 m0012, b0003），绝不要直接复述原话。
+- 如果当前任务未完成，必须在摘要最后明确写出“未完成目标：[具体内容]”。
+- 所有文件路径必须写全路径（相对于项目根目录）。
+- 带行号的具体文件路径和函数签名（例如 src/dsh.mjs:42）。
+- 精确的错误字符串（如 ERR_MODULE_NOT_FOUND）。
 - 多轮排查后得出的关键结论（例如“发现是因为宿主注入了空 system 消息”）。
 - 工具调用的最终参数（不要保留调用过程，只留调用了什么）。
-- 当前尚未完成的核心任务状态。
 
 预算紧张时的优先级（从高到低）：
 当前目标 > 决策结论 > 核心代码结构 > 精确错误 > 历史教训
