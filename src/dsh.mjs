@@ -1,189 +1,222 @@
 // src/dsh.mjs
-// L4 宿主集成（DSH 插件入口）。
-// 适配 DSH 的 apply(ctx) 方言。
-
 import { join, isAbsolute } from 'node:path';
 import { createWanjuan } from './index.mjs';
+import { PHILOSOPHY_KEEP_DROP } from './philosophy.mjs';
 
-// 暴露给 DSH 宿主的入口函数
-export function apply(ctx, config = {}) {
-  const sid = ctx.sessionId || `pid-${process.pid}`;
-  const configDir = config.dir || '.wanjuan';
-  const baseDir = isAbsolute(configDir) ? configDir : join(ctx.dshHome || '.', configDir);
-  const dir = join(baseDir, 'sessions', sid);
+// ============================================================
+// 内脏：跨宿主通用逻辑（M2 启用 onRequest 折叠钩子）
+// ============================================================
+export class WanjuanPlugin {
+  constructor({ name = 'wanjuan-native', config = {} } = {}) {
+    this.name = name;
+    this.config = config;
+    this.wj = null;
+    this._lastFoldEstRaw = 0;
+    this._currentProvider = 'deepseek';
+    this._currentModel = 'deepseek-chat';
+  }
 
-  const wj = createWanjuan({ ...config, dir });
+  async bind(dshCtx) {
+    const sid = dshCtx.sessionId || `pid-${process.pid}`;
+    const configDir = this.config.dir || '.wanjuan';
+    const baseDir = isAbsolute(configDir) ? configDir : join(dshCtx.dshHome || '.', configDir);
+    const dir = join(baseDir, 'sessions', sid);
+    this.wj = createWanjuan({ ...this.config, dir });
+  }
 
-  let lastFoldEstRaw = 0;
-  let currentProvider = 'deepseek';
-  let currentModel = 'deepseek-chat';
+  async _toolCompress({ range, summary, topics = [] }) {
+    try {
+      const blockId = this.wj.compressor.compress({ range, summary, topics });
+      const active = this.wj.ledger.getActiveMessages();
+      const est = this.wj.observer.beforeRequest({ provider: this._currentProvider, model: this._currentModel, messages: active });
+      this._lastFoldEstRaw = est.estRaw;
+      return `✅ 压缩成功，生成块 ${blockId}`;
+    } catch (e) { return `❌ 压缩失败: ${e.message}`; }
+  }
 
-  // 1. 注册工具（假设 DSH 的注册方法是 ctx.registerTool 或 ctx.tools.set）
-  // TODO: 如果 DSH 是 ctx.registerTool(name, schema, handler)，请调整调用方式
-  const keepDropRules = wj.nudge.philosophy.getKeepDropRules();
-  const tools = {
-    compress: {
-      description: `压缩一段连续消息为摘要块。生成摘要时必须严格遵循以下折叠规则：\n${keepDropRules}`,
-      parameters: {
-        type: 'object',
-        properties: {
-          range: { type: 'array', items: { type: 'string' }, description: '起始和结束消息 ID（含）' },
-          summary: { type: 'string', description: '依据折叠规则生成的摘要' },
-          topics: { type: 'array', items: { type: 'string' }, description: '检索关键词' }
+  async _toolDecline({ range, reason }) {
+    this.wj.nudge.recordReject(range, this.wj.diagnoser.size() + 1);
+    return `已记录拒绝区间 ${range[0]} ~ ${range[1]}，理由：${reason || '未说明'}`;
+  }
+
+  async _toolDecompress({ blockId, mode = 'context' }) {
+    try {
+      const res = this.wj.restorer.decompress(blockId, mode);
+      if (mode === 'context') return res.map((m) => `[${m.id}] ${m.content}`).join('\n');
+      return `恢复成功：${res}`;
+    } catch (e) { return `❌ 恢复失败: ${e.message}`; }
+  }
+
+  async _toolSearch({ query }) {
+    const res = this.wj.restorer.search(query);
+    if (res.length === 0) return '未找到相关摘要块。';
+    return res.map((b) => `[${b.id}] ${b.summary} (${b.srcTok} tok)`).join('\n');
+  }
+}
+
+// ============================================================
+// 脸面：DSH apply(ctx) 方言（M1 影子期只观察）
+// ============================================================
+export const name = 'wanjuan';
+export const inject = ['tools', 'connection', 'tokenMeter', 'webServer'];
+
+export function apply(ctx, baseConfig = {}) {
+  const dshHome = baseConfig.dshHome || ctx.dshHome || process.env.DSH_HOME || process.cwd();
+  const configDir = baseConfig.dir || '.wanjuan';
+  const baseDir = isAbsolute(configDir) ? configDir : join(dshHome, configDir);
+
+  const pluginCache = new Map();
+
+  function getOrCreate(sid) {
+    const key = sid || 'default';
+    if (pluginCache.has(key)) return pluginCache.get(key);
+    const dir = join(baseDir, 'sessions', key);
+    const plugin = new WanjuanPlugin({ config: { ...baseConfig, dir } });
+    plugin.wj = createWanjuan({ ...baseConfig, dir });
+    pluginCache.set(key, plugin);
+    return plugin;
+  }
+
+  function resolveSid(ev, fallback) {
+    return (ev && (ev.sessionId || ev.sid)) || fallback || ctx.sessionId || 'default';
+  }
+
+  // 观测句柄挂到 ctx 上：便于测试 / wj_status HTTP 端点 / 真机调试
+  ctx._wj = {
+    getOrCreate,
+    get plugins() { return [...pluginCache.values()]; },
+    get pluginCount() { return pluginCache.size; },
+  };
+
+  // 1) 工具注册（DSH 形状：ctx.effect + ctx.tools.register(def)）
+  if (ctx.tools && typeof ctx.tools.register === 'function' && typeof ctx.effect === 'function') {
+    ctx.effect(() => {
+      const keepDropRules = PHILOSOPHY_KEEP_DROP;
+      const defs = [
+        {
+          name: 'compress',
+          description: `压缩一段连续消息为摘要块。生成摘要时必须严格遵循以下折叠规则：\n${keepDropRules}`,
+          parameters: {
+            type: 'object',
+            properties: {
+              range: { type: 'array', items: { type: 'string' }, description: '起始和结束消息 ID（含）' },
+              summary: { type: 'string', description: '依据折叠规则生成的摘要' },
+              topics: { type: 'array', items: { type: 'string' }, description: '检索关键词' }
+            },
+            required: ['range', 'summary']
+          },
+          execute: async (args, exec) => {
+            const sid = resolveSid(exec, exec?.sessionId);
+            return getOrCreate(sid)._toolCompress(args);
+          }
         },
-        required: ['range', 'summary']
-      },
-      handler: async ({ range, summary, topics = [] }) => {
-        try {
-          const blockId = wj.compressor.compress({ range, summary, topics });
-          const active = wj.ledger.getActiveMessages();
-          const est = wj.observer.beforeRequest({ provider: currentProvider, model: currentModel, messages: active });
-          lastFoldEstRaw = est.estRaw;
-          return `✅ 压缩成功，生成块 ${blockId}`;
-        } catch (e) { return `❌ 压缩失败: ${e.message}`; }
-      }
-    },
-    decline_compress: {
-      description: '显式拒绝本次压缩建议。',
-      parameters: { type: 'object', properties: { range: { type: 'array' }, reason: { type: 'string' } }, required: ['range'] },
-      handler: async ({ range, reason }) => {
-        wj.nudge.recordReject(range, wj.diagnoser.size() + 1);
-        return `已记录拒绝区间 ${range[0]} ~ ${range[1]}`;
-      }
-    },
-    decompress: {
-      description: '恢复指定块的原文。',
-      parameters: { type: 'object', properties: { blockId: { type: 'string' }, mode: { type: 'string', enum: ['context', 'file'] } }, required: ['blockId'] },
-      handler: async ({ blockId, mode = 'context' }) => {
-        try {
-          const res = wj.restorer.decompress(blockId, mode);
-          if (mode === 'context') return res.map((m) => `[${m.id}] ${m.content}`).join('\n');
-          return `恢复成功：${res}`;
-        } catch (e) { return `❌ 恢复失败: ${e.message}`; }
-      }
-    },
-    search_context: {
-      description: '按关键词检索块摘要。',
-      parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
-      handler: async ({ query }) => {
-        const res = wj.restorer.search(query);
-        if (res.length === 0) return '未找到相关摘要块。';
-        return res.map((b) => `[${b.id}] ${b.summary} (${b.srcTok} tok)`).join('\n');
-      }
-    }
-  };
-
-  // 假设 DSH 有注册工具的 API (如 ctx.registerTool 或 ctx.tools.register)
-  if (ctx.registerTool) {
-    for (const [name, tool] of Object.entries(tools)) {
-      ctx.registerTool(name, tool);
-    }
-  } else if (ctx.tools && ctx.tools.set) {
-    for (const [name, tool] of Object.entries(tools)) {
-      ctx.tools.set(name, tool);
-    }
-  }
-
-  // 2. 拦截请求（渲染钩子 + Nudge）
-  // TODO: 需替换为 DSH 真实的前置请求拦截事件（如 ctx.onBeforeRequest / ctx.middleware）
-  const onRequest = async (req, next) => {
-    currentProvider = req.provider || 'deepseek';
-    currentModel = req.model || 'deepseek-chat';
-
-    const fpResult = wj.fingerprinter.check(req.messages);
-    if (fpResult.action === 'full' && fpResult.mutated && fpResult.mutated.length > 0) {
-      wj.diagnoser.record({
-        n: wj.diagnoser.size() + 1,
-        provider: req.provider, model: req.model,
-        usage: { input_tokens: 0, cached: 0 }, est: { estFinal: 0 },
-        overrideMissKind: 'host-rewrite'
-      });
-    }
-
-    // 折叠渲染
-    const activeMessages = wj.ledger.getActiveMessages();
-    const activeIds = new Set(activeMessages.map(m => m.id));
-    const renderedMessages = [];
-    const foldedBlocks = new Set();
-
-    for (const m of req.messages) {
-      if (activeIds.has(m.id)) {
-        renderedMessages.push(m);
-      } else {
-        const ledgerMsg = wj.ledger.messages.get(m.id);
-        if (ledgerMsg && ledgerMsg.status === 'folded' && ledgerMsg.blockId) {
-          foldedBlocks.add(ledgerMsg.blockId);
+        {
+          name: 'decline_compress',
+          description: '显式拒绝本次压缩建议。',
+          parameters: { type: 'object', properties: { range: { type: 'array' }, reason: { type: 'string' } }, required: ['range'] },
+          execute: async (args, exec) => {
+            const sid = resolveSid(exec, exec?.sessionId);
+            return getOrCreate(sid)._toolDecline(args);
+          }
+        },
+        {
+          name: 'decompress',
+          description: '恢复指定块的原文。',
+          parameters: { type: 'object', properties: { blockId: { type: 'string' }, mode: { type: 'string', enum: ['context', 'file'] } }, required: ['blockId'] },
+          execute: async (args, exec) => {
+            const sid = resolveSid(exec, exec?.sessionId);
+            return getOrCreate(sid)._toolDecompress(args);
+          }
+        },
+        {
+          name: 'search_context',
+          description: '按关键词检索块摘要。',
+          parameters: { type: 'object', properties: { query: { type: 'string' } }, required: ['query'] },
+          execute: async (args, exec) => {
+            const sid = resolveSid(exec, exec?.sessionId);
+            return getOrCreate(sid)._toolSearch(args);
+          }
         }
-      }
-    }
-
-    const blockSummaries = [];
-    for (const bId of foldedBlocks) {
-      try {
-        const meta = wj.blocks.readBlockMeta(bId);
-        blockSummaries.push({
-          id: `block-${bId}`,
-          cls: 'sys',
-          tok: meta.sumTok || 0,
-          content: `[摘要块 ${bId}] ${meta.summary || ''}`
-        });
-      } catch (e) {}
-    }
-    req.messages = [...blockSummaries, ...renderedMessages];
-
-    // 原生估算与门限
-    const nativeEst = wj.observer.beforeRequest({ provider: req.provider, model: req.model, messages: req.messages });
-    if (lastFoldEstRaw === 0) lastFoldEstRaw = nativeEst.estRaw;
-
-    const gateRes = wj.gate.check({
-      currentEstRaw: nativeEst.estRaw,
-      lastFoldEstRaw: lastFoldEstRaw,
-      estFinal: nativeEst.estFinal,
-      window: nativeEst.window
+      ];
+      for (const def of defs) ctx.tools.register(def);
     });
-
-    // 瞬态 Nudge 注入
-    if (gateRes.shouldNudge) {
-      const candidates = wj.nudge.findCandidates(activeMessages);
-      const turn = wj.diagnoser.size() + 1;
-      const nudgeMsg = wj.nudge.buildNudgeMessage(candidates, turn);
-      if (nudgeMsg) {
-        req.messages.push(nudgeMsg);
-        req._wjInjectedNudge = nudgeMsg;
-      }
-    }
-
-    if (typeof next === 'function') return next(req);
-    return req;
-  };
-
-  // 3. 拦截响应（清理瞬态 + 记账）
-  const onResponse = async (req, res, next) => {
-    if (req._wjInjectedNudge) {
-      const idx = req.messages.lastIndexOf(req._wjInjectedNudge);
-      if (idx !== -1) req.messages.splice(idx, 1);
-      delete req._wjInjectedNudge;
-    }
-
-    const est = wj.observer.beforeRequest({ provider: req.provider, model: req.model, messages: req.messages });
-    wj.observer.afterRequest({ provider: req.provider, model: req.model, est, usage: res?.usage });
-    wj.diagnoser.record({
-      n: wj.diagnoser.size() + 1, provider: req.provider, model: req.model,
-      usage: res?.usage, est, degraded: wj.estimator.getDegraded(),
-    });
-    
-    if (typeof next === 'function') return next(res);
-    return res;
-  };
-
-  // 假设 DSH 的事件监听 API (如 ctx.on, ctx.middleware, ctx.hooks)
-  if (ctx.middleware) {
-    ctx.middleware(onRequest); // 假设 DSH 使用单一中间件模式
-  } else if (ctx.on) {
-    ctx.on('before:request', onRequest);
-    ctx.on('after:response', onResponse);
   }
 
-  // 暴露一个只读 API 供外部查看状态
-  return { wj, onRequest, onResponse };
+  // 2) 消息面（M1 只记账 + 指纹对账，绝不动 req.messages）
+  const onMessage = (ev) => {
+    try {
+      const sid = resolveSid(ev);
+      const { wj } = getOrCreate(sid);
+      if (ev && ev.id) {
+        wj.ledger.recordMsg({
+          id: ev.id,
+          tok: ev.tok ?? 0,
+          bytes: ev.bytes ?? 0,
+          cls: ev.cls || 'text',
+          content: ev.content,
+        });
+      }
+      if (Array.isArray(ev?.messages)) {
+        wj.fingerprinter.check(ev.messages);
+      }
+    } catch (e) {
+      ctx.logger?.warn?.(`[wanjuan] onMessage 失败: ${e.message}`);
+    }
+  };
+
+  if (ctx.connection && typeof ctx.connection.on === 'function') {
+    ctx.connection.on('message', onMessage);
+  } else if (typeof ctx.on === 'function') {
+    ctx.on('connection:message', onMessage);
+  }
+
+  // 3) 用量面（M1 只更新 k̂ + 落 requests.jsonl）
+  if (ctx.tokenMeter) {
+    try {
+      const keys = Object.keys(ctx.tokenMeter);
+      ctx.logger?.info?.(`[wanjuan] tokenMeter 可用方法: ${keys.join(', ')}`);
+    } catch (e) { /* 忽略 */ }
+
+    const onUsage = (ev) => {
+      try {
+        const sid = resolveSid(ev);
+        const { wj } = getOrCreate(sid);
+        const messages = ev?.messages || [];
+        const est = wj.observer.beforeRequest({
+          provider: ev?.provider || 'deepseek',
+          model: ev?.model || 'deepseek-chat',
+          messages,
+        });
+        wj.observer.afterRequest({
+          provider: ev?.provider || 'deepseek',
+          model: ev?.model || 'deepseek-chat',
+          est,
+          usage: ev?.usage,
+        });
+        wj.diagnoser.record({
+          n: wj.diagnoser.size() + 1,
+          provider: ev?.provider || 'deepseek',
+          model: ev?.model || 'deepseek-chat',
+          usage: ev?.usage,
+          est,
+          degraded: wj.estimator.getDegraded(),
+        });
+      } catch (e) {
+        ctx.logger?.warn?.(`[wanjuan] onUsage 失败: ${e.message}`);
+      }
+    };
+
+    if (typeof ctx.tokenMeter.on === 'function') {
+      ctx.tokenMeter.on('usage', onUsage);
+    } else if (typeof ctx.tokenMeter.subscribe === 'function') {
+      ctx.tokenMeter.subscribe(onUsage);
+    } else if (typeof ctx.tokenMeter.observe === 'function') {
+      ctx.tokenMeter.observe(onUsage);
+    } else {
+      ctx.logger?.warn?.(`[wanjuan] tokenMeter 未暴露 on/subscribe/observe，M1 期间暂无法自动校准 k̂`);
+    }
+  }
+
+  // 4) M1 不挂 onRequest/onResponse：mut 锚点、nudge 注入、折叠渲染整段不启用（等 M2 + A1 改完）
+  // class 里的 onRequest/onResponse 代码仍在（M2 启用），但 apply 不接线。
 }
