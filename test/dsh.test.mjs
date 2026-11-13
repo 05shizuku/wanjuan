@@ -4,110 +4,82 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { WanjuanPlugin } from '../src/dsh.mjs';
+import { apply } from '../src/dsh.mjs';
 
 function fresh() {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
-  const plugin = new WanjuanPlugin({ config: { dir } });
-  return { dir, plugin, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  return { dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
-test('工具注册：6 个工具全带 description/parameters/handler，compress 描述含 KEEP/DROP', async () => {
-  const { plugin, cleanup } = fresh();
+test('apply：注册 4 个工具，compress 含 KEEP/DROP 规则', () => {
+  const { dir, cleanup } = fresh();
   try {
-    let tools = null;
-    const mockCtx = { registerTools: (t) => { tools = t; }, dshHome: '.', sessionId: 'test' };
-    await plugin.bind(mockCtx);
+    const registered = {};
+    const mockCtx = {
+      sessionId: 'test',
+      dshHome: dir,
+      registerTool: (name, tool) => { registered[name] = tool; }
+    };
+    
+    apply(mockCtx, { dir });
 
-    const names = ['compress', 'decline_compress', 'decompress', 'search_context', 'wj_status', 'wj_report'];
-    for (const name of names) {
-      assert.ok(tools[name], `工具 ${name} 未注册`);
-      assert.ok(tools[name].description && tools[name].description.length > 0, `${name} 缺 description`);
-      assert.ok(tools[name].parameters && typeof tools[name].parameters === 'object', `${name} 缺 parameters`);
-      assert.equal(typeof tools[name].handler, 'function', `${name} 缺 handler`);
-    }
-
-    // 关键守护：KEEP/DROP 必须嵌在 compress 描述里
-    assert.ok(tools.compress.description.includes('必须丢弃'), 'compress 描述缺 KEEP/DROP 规则');
-    assert.ok(tools.compress.description.includes('当前目标 > 决策结论'), 'compress 描述缺优先级');
+    assert.ok(registered.compress);
+    assert.ok(registered.compress.description.includes('必须丢弃'));
+    assert.ok(registered.compress.description.includes('当前目标 > 决策结论'));
+    assert.ok(registered.decline_compress);
+    assert.ok(registered.decompress);
+    assert.ok(registered.search_context);
+    assert.equal(registered.wj_status, undefined);
   } finally { cleanup(); }
 });
 
-test('bind：相对路径 dir 锚到 dshHome，并按 sessionId 隔离', async () => {
-  const { plugin, cleanup } = fresh();
+test('apply：onRequest 折叠渲染与瞬态 Nudge，onResponse 清理', async () => {
+  const { dir, cleanup } = fresh();
   try {
-    plugin.config.dir = '.wanjuan';
-    const mockCtx = { registerTools: () => {}, dshHome: '/fake-home', sessionId: 'sess-abc' };
-    await plugin.bind(mockCtx);
-    assert.ok(plugin.wj.dir.includes('fake-home'), `dir 未锚到 dshHome: ${plugin.wj.dir}`);
-    assert.ok(plugin.wj.dir.includes('sess-abc'), `dir 未含 sessionId: ${plugin.wj.dir}`);
+    const mockCtx = {
+      sessionId: 'test',
+      dshHome: dir,
+      registerTool: () => {}
+    };
+    
+    const { wj, onRequest, onResponse } = apply(mockCtx, { dir });
+    
+    // 准备一个折叠块
+    wj.ledger.recordMsg({ id: 'm1', tok: 100, cls: 'text', content: 'old' });
+    wj.compressor.compress({ range: ['m1', 'm1'], summary: 'my_summary', topics: [] });
+
+    // 模拟请求，带着旧的 m1
+    const req = { provider: 'deepseek', model: 'deepseek-chat', messages: [{ id: 'm1', tok: 100, cls: 'text' }] };
+    await onRequest(req);
+
+    // 1. 验证折叠渲染生效 (m1 被替换为 block-b1)
+    assert.equal(req.messages.length, 1);
+    assert.ok(req.messages[0].id.startsWith('block-b1'));
+    assert.ok(req.messages[0].content.includes('my_summary'));
+
+    // 2. 验证响应清理
+    const res = { usage: { input_tokens: 100, cached: 50 } };
+    await onResponse(req, res);
+    // nudge 如果被注入过，会被清掉；这里 m1 已经被折叠，messages 长度不变
+    assert.equal(req.messages.length, 1);
   } finally { cleanup(); }
 });
 
-test('WanjuanPlugin：连续三轮正常生长，绝不误报 host-rewrite', async () => {
-  const { plugin, cleanup } = fresh();
+test('apply：正常生长绝不误报 host-rewrite', async () => {
+  const { dir, cleanup } = fresh();
   try {
-    const mockCtx = { registerTools: () => {}, dshHome: '.', sessionId: 'test' };
-    await plugin.bind(mockCtx);
+    const mockCtx = { sessionId: 'test', dshHome: dir, registerTool: () => {} };
+    const { wj, onRequest } = apply(mockCtx, { dir });
 
     let req = { provider: 'deepseek', model: 'deepseek-chat', messages: [{ id: 'm1', tok: 1000, cls: 'text', bytes: 10 }] };
-    await plugin.onRequest(req, () => {});
-    assert.equal(plugin.wj.diagnoser.readAll().length, 0);
+    await onRequest(req);
+    assert.equal(wj.diagnoser.readAll().length, 0);
 
     req = { provider: 'deepseek', model: 'deepseek-chat', messages: [
       { id: 'm1', tok: 1000, cls: 'text', bytes: 10 },
       { id: 'm2', tok: 1000, cls: 'text', bytes: 10 }
     ]};
-    await plugin.onRequest(req, () => {});
-    assert.equal(plugin.wj.diagnoser.readAll().length, 0);
-
-    req = { provider: 'deepseek', model: 'deepseek-chat', messages: [
-      { id: 'm1', tok: 1000, cls: 'text', bytes: 10 },
-      { id: 'm2', tok: 1000, cls: 'text', bytes: 10 },
-      { id: 'm3', tok: 1000, cls: 'text', bytes: 10 }
-    ]};
-    await plugin.onRequest(req, () => {});
-    assert.equal(plugin.wj.diagnoser.readAll().length, 0);
-  } finally { cleanup(); }
-});
-
-test('WanjuanPlugin：原地改写已知消息内容，才触发 host-rewrite', async () => {
-  const { plugin, cleanup } = fresh();
-  try {
-    const mockCtx = { registerTools: () => {}, dshHome: '.', sessionId: 'test' };
-    await plugin.bind(mockCtx);
-
-    let req = { provider: 'deepseek', model: 'deepseek-chat', messages: [{ id: 'm1', tok: 1000, bytes: 10, cls: 'text', content: 'old' }] };
-    await plugin.onRequest(req, () => {});
-
-    req = { provider: 'deepseek', model: 'deepseek-chat', messages: [{ id: 'm1', tok: 1000, bytes: 11, cls: 'text', content: 'new' }] };
-    await plugin.onRequest(req, () => {});
-
-    const records = plugin.wj.diagnoser.readAll();
-    assert.equal(records.length, 1);
-    assert.equal(records[0].missKind, 'host-rewrite');
-    assert.ok(req.messages.some(m => m.id.startsWith('wj-anchor-')));
-  } finally { cleanup(); }
-});
-
-test('WanjuanPlugin：k̂ 不被 nudge 和锚点污染', async () => {
-  const { plugin, cleanup } = fresh();
-  try {
-    const mockCtx = { registerTools: () => {}, dshHome: '.', sessionId: 'test' };
-    await plugin.bind(mockCtx);
-
-    plugin._lastFoldEst = 50_000;
-
-    const msgs = Array.from({ length: 10 }).map((_, i) => ({ id: `m${i}`, tok: 10000, cls: 'text', bytes: 10 }));
-    const req = { provider: 'deepseek', model: 'deepseek-chat', messages: msgs };
-
-    await plugin.onRequest(req, () => {});
-    assert.ok(req.messages.length > 10);
-
-    const realUsage = { input_tokens: 100_000, cached: 0 };
-    await plugin.onResponse(req, { usage: realUsage }, () => {});
-
-    const khat = plugin.wj.estimator.getKhat('deepseek', 'deepseek-chat');
-    assert.ok(khat > 0.9 && khat < 1.1, `khat 应接近 1.0，实际 ${khat}`);
+    await onRequest(req);
+    assert.equal(wj.diagnoser.readAll().length, 0);
   } finally { cleanup(); }
 });

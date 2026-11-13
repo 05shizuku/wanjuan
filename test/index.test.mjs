@@ -80,17 +80,14 @@ test('createWanjuan：M2 折叠与恢复全流程', () => {
     const wj = WJ.createWanjuan({ dir });
     wj.ledger.recordMsg({ id: 'm1', tok: 10, content: 'hello' });
     wj.ledger.recordMsg({ id: 'm2', tok: 20, content: 'world' });
-    
-    // 折叠
+
     const bId = wj.compressor.compress({ range: ['m1', 'm2'], summary: 'greeting' });
     assert.equal(wj.ledger.getActiveMessages().length, 0);
-    
-    // 搜索
+
     const searchRes = wj.restorer.search('greeting');
     assert.equal(searchRes.length, 1);
     assert.equal(searchRes[0].id, bId);
-    
-    // 恢复
+
     const msgs = wj.restorer.decompress(bId, 'context');
     assert.equal(msgs.length, 2);
     assert.equal(msgs[0].content, 'hello');
@@ -98,50 +95,41 @@ test('createWanjuan：M2 折叠与恢复全流程', () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('createWanjuan：M3 自动化流水线全链路', () => {
+test('createWanjuan：M3 自动化流水线全链路（estRaw 口径）', () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-idx-m3-'));
   try {
     const wj = WJ.createWanjuan({ dir, nudgeOptions: { minSize: 100 } });
-    
-    // 1. 模拟消息入账
+
     wj.ledger.recordMsg({ id: 'm1', tok: 60 });
     wj.ledger.recordMsg({ id: 'm2', tok: 60 });
     wj.ledger.recordMsg({ id: 'm3', tok: 60 });
-    
-    // 2. 模拟上下文增长（当前 180，上次 50，增量 130）
-    const window = 200_000;
-    const currentEst = 130_000; 
-    const lastFoldEst = 50_000;
-    
-    // 3. 增速门判定（增量 80K > 50K，应触发）
-    const gateRes = wj.gate.check({ currentEst, lastFoldEst, window });
+
+    // A5 修复后，gate 用 estRaw 口径
+    const gateRes = wj.gate.check({
+      currentEstRaw: 130_000,
+      lastFoldEstRaw: 50_000,
+      estFinal: 130_000,
+      window: 200_000
+    });
     assert.equal(gateRes.action, 'nudge');
-    
-    // 4. 寻找候选区间
+
     const candidates = wj.nudge.findCandidates(wj.ledger.getActiveMessages());
-    assert.equal(candidates.length, 2); // m1-m2 (120) 和 m3 (60)
-    
-    // 5. 生成 Nudge 消息
+    assert.equal(candidates.length, 2);
+
     const nudgeMsg = wj.nudge.buildNudgeMessage(candidates, 1);
     assert.ok(nudgeMsg);
     assert.ok(nudgeMsg.content.includes('m1 ~ m2'));
-    
-    // 6. 模拟模型拒绝前两次
+
     wj.nudge.recordReject(candidates[0].range, 1);
     wj.nudge.recordReject(candidates[0].range, 2);
-    
-    // 7. 第三次触发时，该区间仍应出现
     const nudgeMsg2 = wj.nudge.buildNudgeMessage([candidates[0]], 3);
     assert.ok(nudgeMsg2);
-    
-    // 8. 记录第三次拒绝，触发降频
+
     wj.nudge.recordReject(candidates[0].range, 3);
     const nudgeMsg3 = wj.nudge.buildNudgeMessage([candidates[0]], 4);
-    assert.equal(nudgeMsg3, null); // 被降频拦下
-    
-    // 9. 模拟第 6 轮（距上次拒绝 3 轮），重新放行
+    assert.equal(nudgeMsg3, null);
+
     const nudgeMsg4 = wj.nudge.buildNudgeMessage([candidates[0]], 6);
     assert.ok(nudgeMsg4);
-    
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

@@ -6,6 +6,7 @@
   "main": "./src/index.mjs",
   "exports": {
     ".": "./src/index.mjs",
+    "./dsh": "./src/dsh.mjs",
     "./estimate": "./src/estimate.mjs",
     "./store": "./src/store.mjs",
     "./ledger": "./src/ledger.mjs",
@@ -24,6 +25,9 @@
   },
   "engines": {
     "node": ">=20"
+  },
+  "dsh": {
+    "bundle": { "patch": "./dsh.bundle.patch.yml" }
   },
   "license": "MIT"
 }

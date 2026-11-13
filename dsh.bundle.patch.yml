@@ -1,16 +1,14 @@
-# wanjuan/dsh.bundle.patch.yml
-# ⚠️ 当前为：M1/M2 影子观测版。请确保宿主原生压缩（compaction-basic）保持开启！
-# 若要切换为正式接管版，请将 auto 改为 false，并手动导出 inject 列表。
+# wanjuan/dsh.bundle.patch.yml — M1 影子观测版（只记账，不动手）
+# ⚠️ 宿主原生压缩（compaction-basic）必须保持开启：本补丁不覆盖任何宿主行、
+#    不改任何 preset 的 inject，万卷只作为旁观者记录消息与用量。
+# 转正步骤（M2+）：先完成 A2 宿主钩子勘察（折叠渲染谁来做）再谈 auto:false，
+#    见 DESIGN.md §7 依赖表新增行「folded 渲染替换」。
 
-- id: wanjuan-native
-  name: wanjuan/dsh.mjs # 指向真实的 src/dsh.mjs
-  config:
-    # dir 是相对路径时，会自动锚到 dshHome（不依赖 CWD），再按 sessionId 分格。
-    # 若需指定绝对路径（如 D:\wanjuan-data），直接写全路径即可。
-    dir: ".wanjuan"
-
-# 注意：宿主的 inject 列表必须完整导出后再追加。
-# 在当前影子阶段，请不要强行覆盖 inject，让万卷静默旁观。
-# 若宿主支持追加策略，请确保 wanjuanCompactionPolicy 模块确实存在。
-# - id: preset-standard
-#   inject: [<宿主全量...>, wanjuanCompactionPolicy]
+- insert:
+    - id: wanjuan-native
+      # 子路径引用：走 profile node_modules 的 Junction → package.json exports
+      # （相对路径会被 ESM 当目录导入报 ERR_UNSUPPORTED_DIR_IMPORT，dsh-she 教训 2026-11-06）
+      name: 'wanjuan/dsh'
+      config:
+        # dir 相对路径时由入口锚到 dshHome，再按 sessionId 分格（apply 里处理）
+        dir: ".wanjuan"
