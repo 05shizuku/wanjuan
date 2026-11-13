@@ -85,10 +85,11 @@ export class Ledger {
   _degrade(kind) { if (!this.degraded.includes(kind)) this.degraded.push(kind); }
   getDegraded() { return [...this.degraded]; }
 
-  recordMsg({ id, at = 0, bytes = 0, tok = 0, cls = 'text', gen = 0 }) {
+  recordMsg({ id, at = 0, bytes = 0, tok = 0, cls = 'text', gen = 0, content }) {
     const existing = this.messages.get(id);
     if (existing && existing.status === 'active') return existing.ev;
     const ev = { k: 'msg', id, at, bytes, tok, cls, gen };
+    if (content !== undefined) ev.content = content;
     this.store.append(ev);
     this._apply(ev);
     return ev;

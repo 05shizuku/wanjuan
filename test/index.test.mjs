@@ -13,6 +13,9 @@ test('聚合导出：所有模块的类与函数都在', () => {
   assert.equal(typeof WJ.Observer, 'function');
   assert.equal(typeof WJ.Fingerprinter, 'function');
   assert.equal(typeof WJ.Diagnoser, 'function');
+  assert.equal(typeof WJ.BlocksManager, 'function');
+  assert.equal(typeof WJ.Compressor, 'function');
+  assert.equal(typeof WJ.Restorer, 'function');
   assert.equal(typeof WJ.InvariantError, 'function');
   assert.equal(typeof WJ.canonical, 'function');
   assert.equal(typeof WJ.hashCanonical, 'function');
@@ -65,5 +68,29 @@ test('createWanjuan：fp 与 ledger 共享同一实例', () => {
     wj.ledger.recordMsg({ id: 'm1', tok: 10, bytes: 100 });
     assert.equal(wj.fingerprinter.ledger, wj.ledger);
     assert.equal(wj.fingerprinter.checkLight(wj.ledger.getActiveMessages()), true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('createWanjuan：M2 折叠与恢复全流程', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-idx-m2-'));
+  try {
+    const wj = WJ.createWanjuan({ dir });
+    wj.ledger.recordMsg({ id: 'm1', tok: 10, content: 'hello' });
+    wj.ledger.recordMsg({ id: 'm2', tok: 20, content: 'world' });
+    
+    // 折叠
+    const bId = wj.compressor.compress({ range: ['m1', 'm2'], summary: 'greeting' });
+    assert.equal(wj.ledger.getActiveMessages().length, 0);
+    
+    // 搜索
+    const searchRes = wj.restorer.search('greeting');
+    assert.equal(searchRes.length, 1);
+    assert.equal(searchRes[0].id, bId);
+    
+    // 恢复
+    const msgs = wj.restorer.decompress(bId, 'context');
+    assert.equal(msgs.length, 2);
+    assert.equal(msgs[0].content, 'hello');
+    assert.equal(msgs[1].content, 'world');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

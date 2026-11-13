@@ -1,6 +1,6 @@
 // src/index.mjs
-// 万卷 M1 聚合出口。所有对外能力从这里 import。
-// createWanjuan({ dir }) 把六个模块串成一个可直接用的实例。
+// 万卷 M2 聚合出口。所有对外能力从这里 import。
+// createWanjuan({ dir }) 把九个模块串成一个可直接用的实例。
 
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -11,6 +11,9 @@ import { Ledger } from './ledger.mjs';
 import { Observer } from './observe.mjs';
 import { Fingerprinter } from './fingerprint.mjs';
 import { Diagnoser } from './diagnose.mjs';
+import { BlocksManager } from './blocks.mjs';
+import { Compressor } from './compress.mjs';
+import { Restorer } from './restore.mjs';
 
 export { Estimator } from './estimate.mjs';
 export { Store, canonical, hashCanonical } from './store.mjs';
@@ -19,6 +22,9 @@ export { Observer } from './observe.mjs';
 export { Fingerprinter } from './fingerprint.mjs';
 export { Diagnoser, classifyMiss } from './diagnose.mjs';
 export { buildReport, reportFromDisk } from './report.mjs';
+export { BlocksManager, BlockError } from './blocks.mjs';
+export { Compressor } from './compress.mjs';
+export { Restorer } from './restore.mjs';
 
 export const DEFAULT_MODELS = JSON.parse(
   readFileSync(fileURLToPath(new URL('./models.json', import.meta.url)), 'utf8')
@@ -38,5 +44,12 @@ export function createWanjuan({
   const observer = new Observer({ estimator });
   const fingerprinter = new Fingerprinter({ ledger, sampleEvery });
   const diagnoser = new Diagnoser({ dir });
-  return { dir, store, ledger, estimator, observer, fingerprinter, diagnoser };
+  const blocks = new BlocksManager({ store });
+  const compressor = new Compressor({ ledger, blocks });
+  const restorer = new Restorer({ ledger, blocks });
+  
+  return { 
+    dir, store, ledger, estimator, observer, 
+    fingerprinter, diagnoser, blocks, compressor, restorer 
+  };
 }
