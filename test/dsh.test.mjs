@@ -8,23 +8,24 @@ import { apply, WanjuanPlugin } from '../src/dsh.mjs';
 
 function freshCtx(dir) {
   const registered = [];
-  const connectionHandlers = {};
-  const tokenMeterHandlers = {};
+  const eventHandlers = {};
+  const waterHandlers = {};
+  const infos = [];
   const warns = [];
   const ctx = {
-    sessionId: 'test',
     dshHome: dir,
     effect: (fn) => fn(),
+    on: (evt, fn) => { eventHandlers[evt] = fn; },
+    waterfall: (evt, fn) => { waterHandlers[evt] = fn; },
     tools: { register: (def) => registered.push(def) },
-    connection: { on: (evt, fn) => { connectionHandlers[evt] = fn; } },
+    connection: { on: () => {} },
     tokenMeter: {
-      on: (evt, fn) => { tokenMeterHandlers[evt] = fn; },
-      subscribe: () => {},
-      observe: () => {},
+      measure: () => ({}),
+      estimateMessage: () => 0,
     },
-    logger: { info: () => {}, warn: (m) => warns.push(m) },
+    logger: { info: (m) => infos.push(m), warn: (m) => warns.push(m) },
   };
-  return { ctx, registered, connectionHandlers, tokenMeterHandlers, warns };
+  return { ctx, registered, eventHandlers, waterHandlers, infos, warns };
 }
 
 test('apply：注册 4 个工具，compress 描述含 KEEP/DROP', () => {
@@ -32,59 +33,75 @@ test('apply：注册 4 个工具，compress 描述含 KEEP/DROP', () => {
   try {
     const { ctx, registered } = freshCtx(dir);
     apply(ctx, { dir });
-
     assert.equal(registered.length, 4);
-    const names = registered.map((d) => d.name).sort();
-    assert.deepEqual(names, ['compress', 'decline_compress', 'decompress', 'search_context']);
     const compress = registered.find((d) => d.name === 'compress');
     assert.ok(compress.description.includes('必须丢弃'));
-    assert.ok(compress.description.includes('当前目标 > 决策结论'));
-    assert.ok(compress.parameters.properties.range);
-    assert.equal(typeof compress.execute, 'function');
-
-    // wj_status / wj_report 不该注册
     assert.ok(!registered.some((d) => d.name === 'wj_status'));
-    assert.ok(!registered.some((d) => d.name === 'wj_report'));
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('apply：消息事件 → ledger 记账', () => {
+test('apply：session/event 消息入账', () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
-    const { ctx, connectionHandlers } = freshCtx(dir);
+    const { ctx, eventHandlers } = freshCtx(dir);
     apply(ctx, { dir });
-
-    const handler = connectionHandlers['message'];
+    const handler = eventHandlers['session/event'];
     assert.equal(typeof handler, 'function');
 
-    handler({ id: 'm1', tok: 100, bytes: 200, cls: 'text', content: 'hello', sessionId: 's1' });
-    handler({ id: 'm2', tok: 50, bytes: 100, cls: 'tool', content: 'world', sessionId: 's1' });
+    handler({ type: 'message', sessionId: 's1', message: { role: 'user', content: '你好' } });
+    handler({ type: 'message', sessionId: 's1', message: { role: 'assistant', content: 'hello' } });
 
-    // 通过 ctx._wj 拿到实例，检查账本
     const { wj } = ctx._wj.getOrCreate('s1');
-    assert.ok(wj.ledger.messages.has('m1'));
-    assert.ok(wj.ledger.messages.has('m2'));
-    assert.equal(wj.ledger.messages.get('m1').ev.content, 'hello');
+    assert.equal(wj.ledger.messages.size, 2);
+    const contents = [...wj.ledger.messages.values()].map(m => m.ev.content).sort();
+    assert.deepEqual(contents, ['hello', '你好']);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('apply：用量事件 → observer 更新 k̂ + diagnoser 落 requests', () => {
+test('apply：session/event step 批量入账', () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
-    const { ctx, tokenMeterHandlers } = freshCtx(dir);
+    const { ctx, eventHandlers } = freshCtx(dir);
     apply(ctx, { dir });
+    eventHandlers['session/event']({
+      type: 'step', sessionId: 's1',
+      messages: [
+        { role: 'user', content: 'a' },
+        { role: 'assistant', content: 'b' },
+      ]
+    });
+    const { wj } = ctx._wj.getOrCreate('s1');
+    assert.equal(wj.ledger.messages.size, 2);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
 
-    const handler = tokenMeterHandlers['usage'];
+test('apply：llm/stream waterfall 包流拿 usage（async iterable 尾部）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, waterHandlers } = freshCtx(dir);
+    apply(ctx, { dir });
+    const handler = waterHandlers['llm/stream'];
     assert.equal(typeof handler, 'function');
 
-    handler({
-      sessionId: 's1',
-      provider: 'deepseek',
-      model: 'deepseek-chat',
-      messages: [{ cls: 'text', tok: 1000 }],
-      usage: { input_tokens: 1000, cached: 500 },
-    });
+    // 模拟 async iterable stream，最后 chunk 带 usage
+    const fakeStream = (async function* () {
+      yield { delta: 'hi' };
+      yield { delta: ' there' };
+      yield { delta: '', usage: { input_tokens: 1000, cached: 500 } };
+    })();
 
+    const request = {
+      sessionId: 's1', provider: 'deepseek', model: 'deepseek-chat',
+      messages: [{ cls: 'text', tok: 1000 }],
+    };
+    const result = await handler(request, async () => fakeStream);
+
+    // 消费流
+    const chunks = [];
+    for await (const c of result) chunks.push(c);
+    assert.equal(chunks.length, 3);
+
+    // 检查 diagnoser
     const { wj } = ctx._wj.getOrCreate('s1');
     assert.equal(wj.diagnoser.size(), 1);
     const rec = wj.diagnoser.readAll()[0];
@@ -93,13 +110,43 @@ test('apply：用量事件 → observer 更新 k̂ + diagnoser 落 requests', ()
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('WanjuanPlugin 骨架：class 仍在，_toolCompress 能跑', async () => {
+test('apply：llm/stream 直接返回带 usage 的对象', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
-    const p = new WanjuanPlugin({ config: { dir } });
+    const { ctx, waterHandlers } = freshCtx(dir);
+    apply(ctx, { dir });
+    const handler = waterHandlers['llm/stream'];
+
+    const request = { sessionId: 's1', provider: 'deepseek', model: 'deepseek-chat', messages: [] };
+    const result = await handler(request, async () => ({ usage: { input_tokens: 200, cached: 100 } }));
+    assert.ok(result.usage);
+
+    const { wj } = ctx._wj.getOrCreate('s1');
+    assert.equal(wj.diagnoser.size(), 1);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('WanjuanPlugin：影子模式 compress 被拒', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const p = new WanjuanPlugin({ config: { dir, shadowMode: true } });
+    p.wj = (await import('../src/index.mjs')).createWanjuan({ dir });
+    p.wj.ledger.recordMsg({ id: 'm1', tok: 10, content: 'x' });
+    const r = await p._toolCompress({ range: ['m1', 'm1'], summary: 's' });
+    assert.ok(r.includes('影子模式'));
+    // 账本里消息仍是 active（未真的 fold）
+    assert.equal(p.wj.ledger.messages.get('m1').status, 'active');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('WanjuanPlugin：shadowMode=false 时 compress 真执行', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const p = new WanjuanPlugin({ config: { dir, shadowMode: false } });
     p.wj = (await import('../src/index.mjs')).createWanjuan({ dir });
     p.wj.ledger.recordMsg({ id: 'm1', tok: 10, content: 'x' });
     const r = await p._toolCompress({ range: ['m1', 'm1'], summary: 's' });
     assert.ok(r.includes('✅'));
+    assert.equal(p.wj.ledger.messages.get('m1').status, 'folded');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

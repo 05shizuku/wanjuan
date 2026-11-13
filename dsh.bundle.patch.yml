@@ -1,14 +1,10 @@
-# wanjuan/dsh.bundle.patch.yml — M1 影子观测版（只记账，不动手）
-# ⚠️ 宿主原生压缩（compaction-basic）必须保持开启：本补丁不覆盖任何宿主行、
-#    不改任何 preset 的 inject，万卷只作为旁观者记录消息与用量。
-# 转正步骤（M2+）：先完成 A2 宿主钩子勘察（折叠渲染谁来做）再谈 auto:false，
-#    见 DESIGN.md §7 依赖表新增行「folded 渲染替换」。
+# wanjuan/dsh.bundle.patch.yml
+# M1 影子期：只观察，不压缩、不改 req.messages、不挂 agent/pre-step。
+# 真挂点：session/event（消息面）、llm/stream waterfall（用量面）。
+# 切到 M2 时：把 shadowMode 改为 false，并补挂 agent/pre-step 折叠钩子。
 
-- insert:
-    - id: wanjuan-native
-      # 子路径引用：走 profile node_modules 的 Junction → package.json exports
-      # （相对路径会被 ESM 当目录导入报 ERR_UNSUPPORTED_DIR_IMPORT，dsh-she 教训 2026-11-06）
-      name: 'wanjuan/dsh'
-      config:
-        # dir 相对路径时由入口锚到 dshHome，再按 sessionId 分格（apply 里处理）
-        dir: ".wanjuan"
+- id: wanjuan-native
+  name: wanjuan/dsh
+  config:
+    dir: ".wanjuan"
+    shadowMode: true   # M1 强制影子：compress 工具只返回提示，不真的 fold

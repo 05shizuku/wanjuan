@@ -1,3 +1,7 @@
+// M1 说明（P2-7）：emergency 动作（usageRatio ≥ 0.95）返回后，dsh.mjs 无人接。
+//   M1 期间 emergency 和 nudge 行为一致（都只是"该 nudge 了"的信号）。
+//   M2 会实现 emergency 加强版 nudge（门降到 0、语气升级、推荐列表标红）。
+//   在此之前，若真机跑到 ≥95%，行为退化为普通 nudge，不影响正确性。
 // src/gate.mjs
 // 增速门：决定何时触发 nudge。
 // A5 修复：所有增长计算一律基于 est_raw（纯结构），与 khat 和 usage 解耦。

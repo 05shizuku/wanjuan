@@ -1,8 +1,5 @@
 // src/restore.mjs
-// L3 执行：恢复（decompress）与检索（search）。
-// decompress：从 raw.jsonl 读出原文，返回给宿主（宿主负责尾部追加）。
-// search：块粒度检索，搜 summary 和 topics。
-
+import { join } from 'node:path';
 import { BlockError } from './blocks.mjs';
 
 export class Restorer {
@@ -11,65 +8,52 @@ export class Restorer {
     this.blocks = blocks;
   }
 
-  // 恢复指定块的原文
-  // mode: 'context' (返回消息数组，供宿主尾部追加) / 'file' (返回文件路径)
   decompress(blockId, mode = 'context') {
     const block = this.ledger.getBlock(blockId);
     if (!block) {
       throw new BlockError('BLOCK_NOT_FOUND', `块 ${blockId} 不存在于账本中`);
     }
 
-    // 如果块已晋升（有 children），递归展开
+    // 父块递归展开
     if (block.children && block.children.length > 0) {
       const allMsgs = [];
       for (const childId of block.children) {
-        const childMsgs = this.decompress(childId, mode);
-        if (Array.isArray(childMsgs)) {
-          allMsgs.push(...childMsgs);
-        }
+        allMsgs.push(...this.decompress(childId, mode));
       }
       return allMsgs;
     }
 
-    // 叶子块：直接读 raw
     const rawMsgs = this.blocks.readRaw(blockId);
 
     if (mode === 'context') {
+      // 让账本跟上宿主（尾部追加后这些消息重新 active）
+      this.ledger.recordUnfold({ block: blockId, why: 'context' });
       return rawMsgs;
     } else if (mode === 'file') {
-      // 模拟写入文件，直接返回 raw 的路径
-      return `./blocks/${block.rawRef}`;
+      // 修：rawRef 是文件名（block.b1.raw.jsonl），正确路径在 blocks.dir 下
+      return join(this.blocks.dir, block.rawRef || `block.${blockId}.raw.jsonl`);
     } else {
       throw new Error(`未知的 decompress mode: ${mode}`);
     }
   }
 
-  // 块粒度检索
   search(query) {
     const q = query.toLowerCase();
     const blocks = this.ledger.listBlocks();
     const matches = [];
-
     for (const b of blocks) {
-      // 只搜当前的叶子块（已被晋升的父块不直接参与搜索，搜子块即可）
       if (b.promotedInto) continue;
-
-      const meta = this.blocks.readBlockMeta(b.id);
+      let meta;
+      try { meta = this.blocks.readBlockMeta(b.id); } catch { continue; }
       const inSummary = (meta.summary || '').toLowerCase().includes(q);
       const inTopics = (meta.topics || []).some((t) => t.toLowerCase().includes(q));
-
       if (inSummary || inTopics) {
         matches.push({
-          id: b.id,
-          tier: b.tier,
-          summary: meta.summary,
-          topics: meta.topics,
-          srcTok: b.srcTok,
-          sumTok: b.sumTok,
+          id: b.id, tier: b.tier, summary: meta.summary,
+          topics: meta.topics, srcTok: b.srcTok, sumTok: b.sumTok,
         });
       }
     }
-
     return matches;
   }
 }

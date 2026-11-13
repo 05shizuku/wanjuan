@@ -98,13 +98,13 @@ test('createWanjuan：M2 折叠与恢复全流程', () => {
 test('createWanjuan：M3 自动化流水线全链路（estRaw 口径）', () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-idx-m3-'));
   try {
-    const wj = WJ.createWanjuan({ dir, nudgeOptions: { minSize: 100 } });
+    // 关键：显式传 tailKeepTok: 0，否则 180 tok 全落在默认 30k 尾部保留窗
+    const wj = WJ.createWanjuan({ dir, nudgeOptions: { minSize: 100, tailKeepTok: 0 } });
 
     wj.ledger.recordMsg({ id: 'm1', tok: 60 });
     wj.ledger.recordMsg({ id: 'm2', tok: 60 });
     wj.ledger.recordMsg({ id: 'm3', tok: 60 });
 
-    // A5 修复后，gate 用 estRaw 口径
     const gateRes = wj.gate.check({
       currentEstRaw: 130_000,
       lastFoldEstRaw: 50_000,

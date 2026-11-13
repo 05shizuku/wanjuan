@@ -37,9 +37,7 @@ test('compress：跨越已折叠消息报错', () => {
     ledger.recordMsg({ id: 'm1', tok: 10 });
     ledger.recordMsg({ id: 'm2', tok: 10 });
     ledger.recordMsg({ id: 'm3', tok: 10 });
-    
     compressor.compress({ range: ['m1', 'm1'], summary: 's1' });
-    // 现在 m1 是 folded，m2,m3 是 active。尝试 fold m1 到 m3 会报错（因为 m1 不在 active 列表里）
     assert.throws(
       () => compressor.compress({ range: ['m1', 'm3'], summary: 's2' }),
       (e) => e.invariant === '归属唯一'
@@ -59,10 +57,7 @@ test('restore.decompress：孤儿块（meta 有但 raw 无）报错', () => {
   try {
     ledger.recordMsg({ id: 'm1', tok: 10 });
     compressor.compress({ range: ['m1', 'm1'], summary: 's1' });
-    
-    // 强行删掉 raw 模拟孤儿
     blocks.deleteRaw('b1');
-    
     assert.throws(() => restorer.decompress('b1'), /原文缺失/);
   } finally { cleanup(); }
 });
@@ -71,17 +66,27 @@ test('失败原子性：写账本失败时清理 raw', () => {
   const { dir, ledger, blocks, compressor, cleanup } = fresh();
   try {
     ledger.recordMsg({ id: 'm1', tok: 10 });
-    
-    // 故意占位，让 ledger 报错（并发唯一）
     ledger.setPendingCompress('b-other');
-    
     assert.throws(
       () => compressor.compress({ range: ['m1', 'm1'], summary: 's1' }),
       (e) => e.invariant === '并发唯一'
     );
-    
-    // 验证 b1 的 raw 和 meta 都被清理了（没有落盘）
     assert.equal(existsSync(join(dir, 'block.b1.raw.jsonl')), false);
     assert.equal(existsSync(join(dir, 'block.b1.json')), false);
+  } finally { cleanup(); }
+});
+
+// P1 修复守护：decompress(context) 后账本 unfold，块消失
+test('decompress(context)：成功后账本 unfold，块消失', () => {
+  const { ledger, compressor, restorer, cleanup } = fresh();
+  try {
+    ledger.recordMsg({ id: 'm1', tok: 10, content: 'x' });
+    const b1 = compressor.compress({ range: ['m1', 'm1'], summary: 's1' });
+    assert.equal(ledger.messages.get('m1').status, 'folded');
+
+    restorer.decompress(b1, 'context');
+
+    assert.equal(ledger.messages.get('m1').status, 'active');
+    assert.equal(ledger.getBlock(b1), undefined);
   } finally { cleanup(); }
 });

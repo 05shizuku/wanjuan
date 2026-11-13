@@ -83,3 +83,22 @@ test('restore.search：块粒度检索命中 topics', () => {
     assert.equal(res[0].id, 'b1');
   } finally { cleanup(); }
 });
+
+test('compress：重启后 blockId 从磁盘 max+1，不撞旧块', () => {
+  const { ledger, blocks, cleanup } = fresh();
+  try {
+    ledger.recordMsg({ id: 'm1', tok: 10, content: 'a' });
+    const c1 = new Compressor({ ledger, blocks });
+    const b1 = c1.compress({ range: ['m1', 'm1'], summary: 's1' });
+    assert.equal(b1, 'b1');
+
+    // 模拟重启：新 Compressor 实例（counter 归零）
+    const c2 = new Compressor({ ledger, blocks });
+    ledger.recordMsg({ id: 'm2', tok: 10, content: 'b' });
+    const b2 = c2.compress({ range: ['m2', 'm2'], summary: 's2' });
+    assert.equal(b2, 'b2'); // 绝不能是 b1（否则旧 raw 被覆盖）
+
+    // 旧块 raw 仍完好
+    assert.equal(blocks.readRaw('b1')[0].content, 'a');
+  } finally { cleanup(); }
+});

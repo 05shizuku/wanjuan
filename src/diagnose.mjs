@@ -1,3 +1,8 @@
+// M1 局限（P2-5）：classifyMiss 只会产 new/unattributed。
+//   ttl/seam/restart/abort/provider-miss 归因检测待 M3 的 seam 探针 + 供应商反馈接线。
+//   summarize 的 byOwner 在 M1 阶段会大量落在 unattributed（尤其首次真机跑），
+//   这是预期的半成品状态——月报的招牌功能要 M3 才算完整。
+//   责任隔离机制本身已在：overrideMissKind 可注入 host-rewrite，写月报时能分离。
 // src/diagnose.mjs
 import { appendFileSync, existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
