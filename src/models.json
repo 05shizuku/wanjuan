@@ -1,0 +1,9 @@
+{
+  "deepseek": {
+    "deepseek-chat":     { "window": 200000, "output": 8192, "khatPrior": 0.97, "unitPrice": 1 },
+    "deepseek-reasoner": { "window": 200000, "output": 8192, "khatPrior": 0.95, "unitPrice": 1 }
+  },
+  "anthropic": {
+    "claude-3-5":        { "window": 200000, "output": 8192, "khatPrior": 0.99, "unitPrice": 1 }
+  }
+}
