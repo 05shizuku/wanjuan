@@ -1,7 +1,4 @@
 // src/dsh.mjs
-// L4 宿主集成（DSH 插件入口）。
-// 负责把 createWanjuan 返回的内核包装成 DSH 认识的插件形状。
-
 import { join } from 'node:path';
 import { createWanjuan } from './index.mjs';
 
@@ -10,6 +7,7 @@ export class WanjuanPlugin {
     this.name = name;
     this.config = config;
     this.wj = null;
+    this._currentNudgeReserve = 0;
   }
 
   async bind(dshCtx) {
@@ -27,37 +25,42 @@ export class WanjuanPlugin {
   async onRequest(req, next) {
     const messages = req.messages || [];
     
-    // 1. 轻指纹对账
+    // 1. 对账与锚点吸收
     const fpResult = this.wj.fingerprinter.check(messages);
-    if (fpResult.action === 'full') {
-      console.log(`[万卷] 触发全量对账，原因：${fpResult.reason}`);
+    if (fpResult.action === 'full' && fpResult.divergedAt) {
+      const noteMsg = {
+        id: `wj-anchor-${Date.now()}`,
+        cls: 'sys',
+        tok: 50,
+        content: `[万卷锚点说明] 宿主在历史 ${fpResult.divergedAt} 处修改了上下文。由于前缀纪律，我们不重写历史。请基于当前最新的上下文继续任务。`
+      };
+      req.messages = [...messages, noteMsg];
+      this._currentNudgeReserve += 50;
+      
+      this.wj.diagnoser.record({
+        n: this.wj.diagnoser.size() + 1,
+        provider: req.provider,
+        model: req.model,
+        usage: { input_tokens: 0, cached: 0 },
+        est: { estFinal: 0 },
+        overrideMissKind: 'host-rewrite'
+      });
     }
 
-    // 2. 估算当前上下文
-    const est = this.wj.observer.beforeRequest({
-      provider: req.provider,
-      model: req.model,
-      messages,
-    });
-
-    // 3. 增速门判定
-    // TODO(M4): 真实环境中，lastFoldEst 应该通过查询账本最后一条 fold 事件时的估算值来得出。
-    // 目前 M5 阶段暂用 0 代替。
+    // 2. 估算与门判定
+    const est = this.wj.observer.beforeRequest({ provider: req.provider, model: req.model, messages: req.messages });
     const lastFoldEst = 0; 
     const gateRes = this.wj.gate.check({ currentEst: est.estFinal, lastFoldEst, window: est.window });
 
-    // 4. 注入 Nudge（只追加在尾部）
+    // 3. Nudge 注入
     if (gateRes.shouldNudge) {
       const active = this.wj.ledger.getActiveMessages();
       const candidates = this.wj.nudge.findCandidates(active);
-      
-      // 用当前已经记录的请求数作为轮次，代替 messages.length（防止宿主压缩后数量突变）
       const turn = this.wj.diagnoser.size() + 1;
       const nudgeMsg = this.wj.nudge.buildNudgeMessage(candidates, turn);
-      
       if (nudgeMsg) {
-        req.messages = [...messages, nudgeMsg];
-        this._currentNudgeReserve = nudgeMsg.tok;
+        req.messages = [...req.messages, nudgeMsg];
+        this._currentNudgeReserve += nudgeMsg.tok;
       }
     }
 
@@ -65,20 +68,8 @@ export class WanjuanPlugin {
   }
 
   async onResponse(req, res, next) {
-    // 复用 beforeRequest 来复现估算状态，或者可以从上下文缓存里拿
-    const est = this.wj.observer.beforeRequest({
-      provider: req.provider,
-      model: req.model,
-      messages: req.messages,
-    });
-    
-    this.wj.observer.afterRequest({
-      provider: req.provider,
-      model: req.model,
-      est,
-      usage: res.usage,
-    });
-
+    const est = this.wj.observer.beforeRequest({ provider: req.provider, model: req.model, messages: req.messages });
+    this.wj.observer.afterRequest({ provider: req.provider, model: req.model, est, usage: res.usage });
     this.wj.diagnoser.record({
       n: this.wj.diagnoser.size() + 1,
       provider: req.provider,
@@ -87,7 +78,7 @@ export class WanjuanPlugin {
       est,
       degraded: this.wj.estimator.getDegraded(),
     });
-
+    this._currentNudgeReserve = 0;
     return next(res);
   }
 
@@ -123,5 +114,3 @@ export class WanjuanPlugin {
     return res.map((b) => `[${b.id}] ${b.summary} (${b.srcTok} tok)`).join('\n');
   }
 }
-
-export default WanjuanPlugin;

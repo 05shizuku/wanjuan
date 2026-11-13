@@ -6,7 +6,7 @@ import { Philosophy, PHILOSOPHY_VERSION } from '../src/philosophy.mjs';
 test('版本号与文本导出正确', () => {
   const p = new Philosophy();
   assert.equal(p.version, PHILOSOPHY_VERSION);
-  assert.ok(p.getKeepDropRules().includes('目标 > 决策 > 工件'));
+  assert.ok(p.getKeepDropRules().includes('当前目标 > 决策结论'));
 });
 
 test('buildNudge：包含必要提醒且不含填充比例', () => {
@@ -18,7 +18,7 @@ test('buildNudge：包含必要提醒且不含填充比例', () => {
   });
 
   assert.ok(text.includes('不是溢出警告'));
-  assert.ok(text.includes('可以拒绝')); // 现在这句话在源码里有了
+  assert.ok(text.includes('选择接受或拒绝')); // 改成匹配文案
   assert.ok(text.includes('m1 ~ m5'));
   assert.ok(text.includes('约 1000 tokens'));
   

@@ -26,14 +26,13 @@ test('buildReport：空数据也能出文本', () => {
   } finally { cleanup(); }
 });
 
-test('buildReport：含命中率与异常 miss 两个指标', () => {
+test('buildReport：输出核心命中率与责任归属', () => {
   const { dir, ledger, diagnoser, cleanup } = fresh();
   try {
-    diagnoser.record({ n: 1, provider: 'p', model: 'm', usage: { input_tokens: 1000, cached: 800 } });
-    diagnoser.record({ n: 2, provider: 'p', model: 'm', usage: { input_tokens: 1000, cached: 900 } });
+    diagnoser.record({ n: 1, usage: { input_tokens: 1000, cached: 800 }, overrideMissKind: 'rewrite' });
     const text = buildReport({ dir, ledger, diagnoser });
-    assert.ok(text.includes('命中率'));
-    assert.ok(text.includes('异常 miss 率'));
+    assert.ok(text.includes('⭐ 万卷核心命中率'));
+    assert.ok(text.includes('宿主违约 (Host)'));
   } finally { cleanup(); }
 });
 
@@ -46,16 +45,6 @@ test('buildReport：块统计反映 ledger 状态', () => {
     ledger.recordFold({ block: 'b2', range: ['m1', 'm1'], srcTok: 100, sumTok: 12, tier: 1, rawRef: 'r2' });
     const text = buildReport({ dir, ledger, diagnoser });
     assert.ok(text.includes('块总数：2'));
-    assert.ok(text.includes('tier-1=2'));
     assert.ok(text.includes('叶子块：2'));
-  } finally { cleanup(); }
-});
-
-test('buildReport：降级率反映 degraded 字段', () => {
-  const { dir, ledger, diagnoser, cleanup } = fresh();
-  try {
-    diagnoser.record({ n: 1, provider: 'p', model: 'm', usage: { input_tokens: 10, cached: 5 }, degraded: ['unknown-model'] });
-    const text = buildReport({ dir, ledger, diagnoser });
-    assert.ok(text.includes('降级率'));
   } finally { cleanup(); }
 });

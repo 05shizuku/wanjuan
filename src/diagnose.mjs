@@ -1,12 +1,12 @@
 // src/diagnose.mjs
-// L0 诊断层（M1 core）。把请求的原始信息落 requests.jsonl，统计命中率与异常 miss。
-// M1 阶段 missKind 只做两层粗判（new / unattributed），完整归因树留 M3。
-// 命中率口径：cached / (cached + new + missTok)。异常 miss 口径：所有非 new 的 miss。
-
 import { appendFileSync, existsSync, readFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 const EXPECTED_MISS = new Set(['new', 'compress-repay']);
+// 责任方映射
+const HOST_MISS = new Set(['rewrite', 'host-compact', 'host-rewrite']);
+const UPSTREAM_MISS = new Set(['ttl', 'provider-miss', 'switch-model']);
+const WANJUAN_MISS = new Set(['seam', 'abort']);
 
 export function classifyMiss({ usage, est }) {
   if (!usage) return 'unattributed';
@@ -14,7 +14,7 @@ export function classifyMiss({ usage, est }) {
   if (typeof usage.cached !== 'number') return 'unattributed';
   const missTok = Math.max(0, usage.input_tokens - usage.cached);
   if (missTok === 0) return 'new';
-  return 'unattributed'; // M1 粗判：有 miss 但没归因
+  return 'unattributed';
 }
 
 export class Diagnoser {
@@ -24,11 +24,12 @@ export class Diagnoser {
     this.path = join(dir, 'requests.jsonl');
   }
 
-  record({ n, t = Date.now(), provider, model, usage, est, khat, calibrating, degraded = [], divergeAt = null }) {
+  record({ n, t = Date.now(), provider, model, usage, est, khat, calibrating, degraded = [], divergeAt = null, overrideMissKind = null }) {
     const input = usage?.input_tokens ?? 0;
     const cached = usage?.cached ?? 0;
     const missTok = Math.max(0, input - cached);
-    const missKind = classifyMiss({ usage, est });
+    const missKind = overrideMissKind || classifyMiss({ usage, est });
+    
     const rec = {
       n, t, provider, model,
       input, cached,
@@ -56,45 +57,45 @@ export class Diagnoser {
     return out;
   }
 
-  // 新增：获取已记录的请求数量，用于 dsh.mjs 里的轮次计算
-  size() {
-    return this.readAll().length;
-  }
+  size() { return this.readAll().length; }
 
   summarize() {
     const rs = this.readAll();
     if (rs.length === 0) {
-      return {
-        total: 0, hitRate: 0,
-        expectedMissTok: 0, anomalyMissTok: 0, anomalyMissRate: 0,
-        unattributedRatio: 0, calibratingCount: 0, degradedRate: 0,
-        byKind: {},
-      };
+      return { total: 0, hitRate: 0, coreHitRate: 0, expectedMissTok: 0, anomalyMissTok: 0, byOwner: { host: 0, upstream: 0, wanjuan: 0, unattributed: 0 } };
     }
-    let cached = 0, input = 0;
+
+    let input = 0, cached = 0;
     let expectedMissTok = 0, anomalyMissTok = 0;
-    let unattributed = 0, calibrating = 0, degradedReq = 0;
-    const byKind = {};
+    let hostMissTok = 0, upstreamMissTok = 0;
+    const byOwner = { host: 0, upstream: 0, wanjuan: 0, unattributed: 0 };
+
     for (const r of rs) {
-      input += r.input;
-      cached += r.cached;
-      if (EXPECTED_MISS.has(r.missKind)) expectedMissTok += r.missTok;
-      else { anomalyMissTok += r.missTok; byKind[r.missKind] = (byKind[r.missKind] ?? 0) + r.missTok; }
-      if (r.missKind === 'unattributed') unattributed++;
-      if (r.calibrating) calibrating++;
-      if (Array.isArray(r.degraded) && r.degraded.length > 0) degradedReq++;
+      input += r.input; cached += r.cached;
+      const isExpected = EXPECTED_MISS.has(r.missKind);
+      
+      if (isExpected) {
+        expectedMissTok += r.missTok;
+      } else {
+        anomalyMissTok += r.missTok;
+        if (HOST_MISS.has(r.missKind)) { hostMissTok += r.missTok; byOwner.host += r.missTok; }
+        else if (UPSTREAM_MISS.has(r.missKind)) { upstreamMissTok += r.missTok; byOwner.upstream += r.missTok; }
+        else if (WANJUAN_MISS.has(r.missKind)) { byOwner.wanjuan += r.missTok; }
+        else { byOwner.unattributed += r.missTok; }
+      }
     }
-    const missTotal = expectedMissTok + anomalyMissTok;
+
+    const hitRate = input === 0 ? 0 : cached / input;
+    const coreInput = input - hostMissTok - upstreamMissTok;
+    const coreHitRate = coreInput <= 0 ? hitRate : cached / coreInput;
+
     return {
       total: rs.length,
-      hitRate: input === 0 ? 0 : cached / input,
+      hitRate,
+      coreHitRate,
       expectedMissTok,
       anomalyMissTok,
-      anomalyMissRate: missTotal === 0 ? 0 : anomalyMissTok / missTotal,
-      unattributedRatio: rs.length === 0 ? 0 : unattributed / rs.length,
-      calibratingCount: calibrating,
-      degradedRate: rs.length === 0 ? 0 : degradedReq / rs.length,
-      byKind,
+      byOwner,
     };
   }
 }
