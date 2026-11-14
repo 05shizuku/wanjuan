@@ -1,11 +1,12 @@
 # wanjuan/dsh.bundle.patch.yml
-# M1 影子期：只观察，不压缩、不改 req.messages、不挂 agent/pre-step。
-# 真挂点：session/event（消息面）、llm/stream waterfall（用量面）。
-# 切到 M2 时：把 shadowMode 改为 false，并补挂 agent/pre-step 折叠钩子。
+# M3.5 阶段：M1 观测 + M3 水位自动折叠 + M3.5 宿主 compaction 桥接。
+# 真挂点：session/event（消息面 + turn/end 水位检查）、ctx.compaction（真实上下文收缩）。
+# 注意：agent/pre-step 只有本轮 UserMessage[]；agent/request 明文禁止改 messages；
+# llm/stream 的 LOOP 请求深度冻结（reconstructability 原则）——不要尝试在瀑布里改写请求历史。
 
 - insert:
     - id: wanjuan-native
       name: 'wanjuan/dsh'
       config:
         dir: '.wanjuan'
-        shadowMode: false   # M1 强制影子：compress 工具只返回提示，不真的 fold
+        shadowMode: false   # false：M3 水位引擎与 M3.5 桥接生效；true 则退回影子提示

@@ -81,6 +81,9 @@ test('apply：session/event 消息入账（真实宿主词汇 user/message + ass
     const byId = new Map([...wj.ledger.messages.values()].map(m => [m.ev.id, m.ev]));
     assert.equal(byId.get('u1').at, 1000);
     assert.equal(byId.get('a1').at, 2000);
+    // M3.5：seq 锚入账（供 compactRegion 做真实日志区间映射）
+    assert.equal(byId.get('u1').seq, 1);
+    assert.equal(byId.get('a1').seq, 2);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -177,5 +180,180 @@ test('apply：折叠渲染带内容时间（atRange 保留）', () => {
 
     const block = wj.ledger.getBlock('b1');
     assert.deepEqual(block.atRange, [t1, t2]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('compress：ids 精确折叠不受 UUID 字典序影响', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const { wj } = ctx._wj.getOrCreate('s1');
+    // 人造 id：字典序与时间序刻意错开（模拟宿主 UUID id）
+    wj.ledger.recordMsg({ id: 'uuid-ccc', at: 1000, tok: 10, content: 'oldest' });
+    wj.ledger.recordMsg({ id: 'uuid-aaa', at: 2000, tok: 10, content: 'middle' });
+    wj.ledger.recordMsg({ id: 'uuid-bbb', at: 3000, tok: 10, content: 'newest' });
+
+    // 时间序最老两条 = uuid-ccc, uuid-aaa。若走 range 端点 (ccc→aaa)，
+    // 在字典序列 [aaa,bbb,ccc] 上会 startIndex>endIndex 直接抛错。
+    const blockId = wj.compressor.compress({ ids: ['uuid-ccc', 'uuid-aaa'], summary: 's' });
+    assert.equal(wj.ledger.messages.get('uuid-ccc').status, 'folded');
+    assert.equal(wj.ledger.messages.get('uuid-aaa').status, 'folded');
+    assert.equal(wj.ledger.messages.get('uuid-bbb').status, 'active');
+    const block = wj.ledger.getBlock(blockId);
+    // ids 数组按账本活跃序（id 字典序）存储，集合正确即可
+    assert.deepEqual(block.ids, ['uuid-aaa', 'uuid-ccc']);
+    assert.deepEqual(block.atRange, [1000, 2000]);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('M3 水位：超过 95% 自动折叠最老消息并保尾 20 条', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const { wj } = ctx._wj.getOrCreate('s1');
+
+    // 25 条消息：最老 5 条各 30000 tok（合计 150000），其余 20 条各 10 tok
+    // estRaw = 150200；未知模型 → window 128000、khat=1 → estFinal = ceil(150200*1.05)=157710
+    // 水位 ≈ 123% ≥ 95% → 折叠最老 5 条，保尾 20 条
+    for (let i = 1; i <= 25; i++) {
+      const id = `u${String(i).padStart(2, '0')}`;
+      wj.ledger.recordMsg({ id, at: 1000 + i, tok: i <= 5 ? 30000 : 10, content: `m${i}` });
+    }
+    assert.equal(wj.ledger.messages.size, 25);
+
+    eventHandlers['session/event']({
+      type: 'turn/end', sessionId: 's1', seq: 99, time: 9999,
+      data: { turn: 1, reason: { kind: 'completed' } },
+    });
+
+    assert.equal(wj.ledger.blocks.size, 1);
+    const folded = [...wj.ledger.messages.values()].filter(m => m.status === 'folded');
+    const active = [...wj.ledger.messages.values()].filter(m => m.status === 'active');
+    assert.equal(folded.length, 5);
+    assert.equal(active.length, 20);
+    assert.deepEqual(folded.map(m => m.ev.id).sort(), ['u01', 'u02', 'u03', 'u04', 'u05']);
+    assert.ok(active.every(m => m.ev.id > 'u05'), '保尾的必须是最新 20 条');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('M3 水位：低于 80% 不折叠', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const { wj } = ctx._wj.getOrCreate('s1');
+
+    for (let i = 1; i <= 25; i++) {
+      wj.ledger.recordMsg({ id: `u${String(i).padStart(2, '0')}`, at: 1000 + i, tok: 10, content: `m${i}` });
+    }
+    eventHandlers['session/event']({
+      type: 'turn/end', sessionId: 's1', seq: 99, time: 9999,
+      data: { turn: 1, reason: { kind: 'completed' } },
+    });
+
+    assert.equal(wj.ledger.blocks.size, 0);
+    assert.equal([...wj.ledger.messages.values()].every(m => m.status === 'active'), true);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('M3.5：折叠后桥接宿主 compaction（compactRegion 以 seq 区间调用）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    const compactionCalls = [];
+    ctx.compaction = {
+      compactRegion: async (start, end, agent) => {
+        compactionCalls.push([start, end, agent]);
+        return { ok: true };
+      },
+    };
+    apply(ctx, { dir, shadowMode: false });
+
+    // 25 条消息：最老 5 条各 30000 tok，其余 20 条各 10 tok；seq 随事件递增
+    for (let i = 1; i <= 25; i++) {
+      eventHandlers['session/event']({
+        type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: i <= 5 ? 30000 : 10 },
+      });
+    }
+    eventHandlers['session/event']({
+      type: 'turn/end', sessionId: 's1', seq: 99, time: 9999,
+      data: { turn: 1, reason: { kind: 'completed' } },
+    });
+
+    // 账本折叠立即发生：最老 5 条折叠、保尾 20 条
+    const { wj } = ctx._wj.getOrCreate('s1');
+    assert.equal(wj.ledger.blocks.size, 1);
+    const folded = [...wj.ledger.messages.values()].filter(m => m.status === 'folded');
+    assert.equal(folded.length, 5);
+
+    // 桥接是 fire-and-forget，等微任务清空后再断言
+    await new Promise((r) => setImmediate(r));
+    assert.equal(compactionCalls.length, 1);
+    // 区间 = 被折 5 条消息的 seq 跨度（u01..u05 → seq 1..5）
+    assert.deepEqual(compactionCalls[0].slice(0, 2), [1, 5]);
+    assert.ok(compactionCalls[0][2], 'session/agent 占位已传入');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('M3.5：宿主 compaction 缺失时折叠照常、不抛错', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir); // freshCtx 没有 compaction
+    apply(ctx, { dir, shadowMode: false });
+
+    for (let i = 1; i <= 25; i++) {
+      eventHandlers['session/event']({
+        type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: i <= 5 ? 30000 : 10 },
+      });
+    }
+    assert.doesNotThrow(() => eventHandlers['session/event']({
+      type: 'turn/end', sessionId: 's1', seq: 99, time: 9999,
+      data: { turn: 1, reason: { kind: 'completed' } },
+    }));
+
+    const { wj } = ctx._wj.getOrCreate('s1');
+    assert.equal(wj.ledger.blocks.size, 1, '账本折叠不依赖宿主服务');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('日志环：pushLog 截断 30 条，wj_report 附最近日志（含自动折叠记录）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers, registered } = freshCtx(dir);
+    ctx.compaction = { compactRegion: async () => ({ ok: true }) };
+    apply(ctx, { dir, shadowMode: false });
+    const plugin = ctx._wj;
+
+    // 环形截断：塞 35 条，留最后 30 条
+    for (let i = 1; i <= 35; i++) plugin.pushLog('log', `测试日志 ${i}`);
+    assert.equal(plugin.logs.length, 30);
+    assert.equal(plugin.logs[0].msg, '测试日志 6');
+    assert.equal(plugin.logs[29].msg, '测试日志 35');
+
+    // 走一遍真实的折叠流程，让日志环里出现「自动折叠完成」
+    for (let i = 1; i <= 25; i++) {
+      eventHandlers['session/event']({
+        type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: i <= 5 ? 30000 : 10 },
+      });
+    }
+    eventHandlers['session/event']({
+      type: 'turn/end', sessionId: 's1', seq: 99, time: 9999,
+      data: { turn: 1, reason: { kind: 'completed' } },
+    });
+    await new Promise((r) => setImmediate(r)); // 等 M3.5 桥接的 fire-and-forget 落日志
+
+    const report = registered.find((d) => d.name === 'wj_report');
+    const out = await report.handler({});
+    const text = out.content[0].text;
+    assert.ok(text.includes('最近日志'), '报告应附日志环');
+    assert.ok(text.includes('🚨 水位达到'), '应包含水位告警');
+    assert.ok(text.includes('✅ 自动折叠完成'), '应包含折叠成功记录');
+    assert.ok(text.includes('M3.5：宿主原生压缩完成'), '应包含桥接成功记录');
+    assert.ok(!text.includes('测试日志 6'), '更早的日志应已被挤出/不显示');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

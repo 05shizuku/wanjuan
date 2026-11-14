@@ -37,14 +37,27 @@ export class Ledger {
         srcTok: ev.srcTok, sumTok: ev.sumTok,
         rawRef: ev.rawRef, note: ev.note,
         atRange: ev.atRange || null,       // 时间锚
+        ids: ev.ids || null,               // M3：显式 id 集合（UUID 主机的 id 字典序≠时间序）
         children: undefined, promotedInto: undefined,
       };
       this.blocks.set(ev.block, block);
-      const [start, end] = ev.range;
-      for (const [id, m] of this.messages) {
-        if (id >= start && id <= end && m.status === 'active') {
-          m.status = 'folded';
-          m.blockId = ev.block;
+      if (Array.isArray(ev.ids)) {
+        // 精确集合折叠：不依赖 id 排序
+        const want = new Set(ev.ids);
+        for (const [id, m] of this.messages) {
+          if (want.has(id) && m.status === 'active') {
+            m.status = 'folded';
+            m.blockId = ev.block;
+          }
+        }
+      } else {
+        // 旧语义：id 字典序区间（仅当 id 排序与时间序一致时才安全）
+        const [start, end] = ev.range;
+        for (const [id, m] of this.messages) {
+          if (id >= start && id <= end && m.status === 'active') {
+            m.status = 'folded';
+            m.blockId = ev.block;
+          }
         }
       }
     } else if (ev.k === 'evict') {
@@ -91,11 +104,12 @@ export class Ledger {
   _degrade(kind) { if (!this.degraded.includes(kind)) this.degraded.push(kind); }
   getDegraded() { return [...this.degraded]; }
 
-  recordMsg({ id, at = 0, bytes = 0, tok = 0, cls = 'text', gen = 0, content }) {
+  recordMsg({ id, at = 0, bytes = 0, tok = 0, cls = 'text', gen = 0, content, seq }) {
     const existing = this.messages.get(id);
     if (existing && existing.status === 'active') return existing.ev;
     const ev = { k: 'msg', id, at, bytes, tok, cls, gen };
     if (content !== undefined) ev.content = content;
+    if (seq !== undefined) ev.seq = seq;  // M3.5：宿主会话日志序号，用于 compactRegion 区间映射
     this.store.append(ev);
     this._apply(ev);
     return ev;
@@ -110,11 +124,34 @@ export class Ledger {
     return ev;
   }
 
-  recordFold({ block, range, srcTok, sumTok, tier, rawRef, note, atRange }) {
+  recordFold({ block, ids, range, srcTok, sumTok, tier, rawRef, note, atRange }) {
     if (!rawRef) throw new InvariantError('原文可达', `fold ${block} 缺少 rawRef`);
     if (this.pendingCompress !== null && this.pendingCompress !== block) {
       throw new InvariantError('并发唯一', `已有未决 compress ${this.pendingCompress}`);
     }
+
+    if (Array.isArray(ids)) {
+      // M3 精确集合折叠：不依赖 id 字典序（宿主 UUID id 的时间序与字典序无关）
+      if (ids.length === 0) throw new InvariantError('归属唯一', `fold ${block} 的 ids 为空`);
+      let found = 0;
+      for (const id of ids) {
+        const m = this.messages.get(id);
+        if (!m) throw new InvariantError('归属唯一', `消息 ${id} 不存在`);
+        if (m.status === 'folded') throw new InvariantError('归属唯一', `消息 ${id} 已属于块 ${m.blockId}`);
+        if (m.status === 'evicted') throw new InvariantError('归属唯一', `消息 ${id} 已 evict`);
+        found++;
+      }
+      if (found === 0) throw new InvariantError('归属唯一', `fold ${block} 的 ids 无活跃消息`);
+      const ev = { k: 'fold', block, ids: [...ids], range: [ids[0], ids[ids.length - 1]],
+        srcTok, sumTok, tier, rawRef,
+        ...(note ? { note } : {}), ...(atRange ? { atRange } : {}) };
+      this.store.append(ev);
+      this._apply(ev);
+      this.pendingCompress = null;
+      return ev;
+    }
+
+    // 旧语义：id 字典序区间
     const [start, end] = range;
     let found = 0;
     for (const [id, m] of this.messages) {
