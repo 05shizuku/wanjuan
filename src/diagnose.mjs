@@ -4,7 +4,7 @@
 //   这是预期的半成品状态——月报的招牌功能要 M3 才算完整。
 //   责任隔离机制本身已在：overrideMissKind 可注入 host-rewrite，写月报时能分离。
 // src/diagnose.mjs
-import { appendFileSync, existsSync, readFileSync, mkdirSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 
 const EXPECTED_MISS = new Set(['new', 'compress-repay']);
@@ -47,6 +47,13 @@ export class Diagnoser {
       degraded: Array.isArray(degraded) ? [...degraded] : [],
       divergeAt,
     };
+    // v0.6.5：遥测非 durability 数据——超 5MB 轮转保留尾 2000 行，防止无限增长
+    try {
+      if (statSync(this.path).size > 5 * 1024 * 1024) {
+        const tail = readFileSync(this.path, 'utf8').trim().split('\n').slice(-2000);
+        writeFileSync(this.path, tail.join('\n') + '\n', 'utf8');
+      }
+    } catch {}
     appendFileSync(this.path, JSON.stringify(rec) + '\n', 'utf8');
     return rec;
   }

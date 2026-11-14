@@ -716,3 +716,36 @@ test('M4.1：wj_report logTail 深读落盘日志', async () => {
     assert.ok(!shallow.content[0].text.includes('落盘日志尾部'), '缺省不深读');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('v0.6.5：requests.jsonl 超 5MB 轮转保留尾 2000 行', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    const { writeFileSync: wf, readFileSync: rf } = await import('node:fs');
+    // 预置 >5MB 的历史记录（约 260 行 × 20KB）
+    const big = Array.from({ length: 260 }, (_, i) => JSON.stringify({ t: i, provider: 'p', model: 'm', input: 1, cached: 0, new: 1, estBy: 0, khat: 1, calibrating: false, missKind: 'unattributed', missTok: 1, degraded: [], divergeAt: null, pad: 'y'.repeat(20000) })).join('\n');
+    wf(join(dir, 'requests.jsonl'), big + '\n', 'utf8');
+    eventHandlers['session/event']({ type: 'assistant/message', sessionId: 's1', seq: 1, time: 1000,
+      data: { message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'nvmine', model: 'glm' }, content: [] }, usage: { inputTokens: 100, cacheReadTokens: 0 } } });
+    const lines = rf(join(dir, 'requests.jsonl'), 'utf8').trim().split('\n');
+    assert.ok(lines.length <= 2001, `轮转后应 ≤2001 行，实际 ${lines.length}`);
+    const last = JSON.parse(lines[lines.length - 1]);
+    assert.equal(last.input, 100, '最新记录应在轮转后保留');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.6.5：桥接超时——宿主挂死时转 failed 而非永远等待', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    ctx.compaction = { compactRegion: () => new Promise(() => {}) }; // 永不返回
+    apply(ctx, { dir, shadowMode: false, bridgeTimeoutMs: 40 });
+    ctx._wj.tryHostCompaction(ctx._wj._lastHostSession ?? { id: 's1' }, 1, 5, 'bt');
+    await new Promise((r) => setTimeout(r, 120));
+    assert.equal(ctx._wj._bridgeStatus.bt.status, 'failed', '超时应标记 failed（瞬态，下轮重试）');
+    assert.ok(ctx._wj._bridgeStatus.bt.error.includes('桥接超时'), '错误信息应注明超时');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('桥接超时')), '日志环应记录超时');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

@@ -495,7 +495,7 @@ export function apply(ctx, config = {}) {
         } catch {}
         return null;
       };
-      return Promise.resolve()
+      const workP = Promise.resolve()
         .then(async () => {
           // 宿主契约（2026-11-14 真机实测）：第三参是 agent 包装 { session, options }，
           // 不是裸 Session——宿主内部走 agent.session.surface，裸传必抛 reading 'surface'。
@@ -514,7 +514,22 @@ export function apply(ctx, config = {}) {
               start = prev;
             }
           }
-        })
+        });
+        // v0.6.5：桥接超时（默认 180s，config.bridgeTimeoutMs 可调）——宿主摘要挂死时
+        // 手动路径不再永远等待；超时转 failed（瞬态），下轮补桥自动重试，
+        // 宿主若迟到完成则被「not found in surface → skip」自愈。
+        const timeoutMs = Number(config.bridgeTimeoutMs) > 0 ? Number(config.bridgeTimeoutMs) : 180000;
+        let timeoutP;
+        const timer = setTimeout(() => { timeoutP?.reject?.(); }, 0); // 占位防lint，真实实现见下
+        clearTimeout(timer);
+        let timeoutReject;
+        timeoutP = new Promise((_, rej) => {
+          timeoutReject = rej;
+          const t = setTimeout(() => rej(new Error(`M3.5：桥接超时（${Math.round(timeoutMs / 1000)}s，宿主摘要未返回）`)), timeoutMs);
+          if (t.unref) t.unref();
+        });
+        timeoutP.catch(() => {}); // 迟到的拒绝不得成为 unhandledRejection
+        return Promise.race([workP, timeoutP])
         .then((res) => {
           markBridge(blockId, 'ok');
           plugin.pushLog('log', `M3.5：宿主原生压缩完成（seq ${startSeq}→${endSeq}）${res ? JSON.stringify(res).slice(0, 120) : ''}`);
