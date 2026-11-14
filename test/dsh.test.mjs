@@ -676,3 +676,43 @@ test('M4：重启恢复——首个会话事件即触发补扫（限流兜底）
     assert.ok(ctx._wj._lastAutoReconcile > 0, '自动补桥限流时间戳应更新');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('M4.1：账本对数压缩——等价极简流 + 旧卷归档 + 重放一致', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
+  try {
+    const { Store } = await import('../src/store.mjs');
+    const { Ledger } = await import('../src/ledger.mjs');
+    const store = new Store({ dir });
+    const ledger = new Ledger({ store });
+    for (let i = 1; i <= 8; i++) ledger.recordMsg({ id: `m${i}`, at: i, tok: 10, seq: i });
+    ledger.recordFold({ block: 'b1', ids: ['m1', 'm2', 'm3', 'm4'], range: ['m1', 'm4'], srcTok: 40, sumTok: 10, tier: 1, rawRef: 'block.b1.raw.jsonl' });
+    ledger.recordEvict({ ids: ['m5'], why: 'reconcile' });
+    const before = ledger._lastReplayEventCount;
+    const r = ledger.compactNow();
+    assert.ok(r.before >= before && r.after < r.before, `压缩应缩减事件数 ${r.before} → ${r.after}`);
+    assert.deepEqual(ledger.getActiveMessages().map((m) => m.id), ['m6', 'm7', 'm8'], '活跃集不变');
+    assert.equal(ledger.getBlock('b1').rawRef, 'block.b1.raw.jsonl', '块元数据保留');
+    const { existsSync: ex, readdirSync: rd } = await import('node:fs');
+    assert.ok(ex(join(dir, 'ledger.0000.jsonl')), '压缩流应写为 0000 卷');
+    assert.ok(ex(join(dir, 'archive')), '旧卷应归档');
+    assert.ok(rd(join(dir, 'archive')).some((f) => f.startsWith('ledger.')), '归档里应有旧账本卷');
+    const ledger2 = new Ledger({ store: new Store({ dir }) });
+    assert.deepEqual(ledger2.getActiveMessages().map((m) => m.id), ['m6', 'm7', 'm8'], '重放后活跃集一致');
+    assert.equal(ledger2.getBlock('b1').id, 'b1', '重放后块一致');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('M4.1：wj_report logTail 深读落盘日志', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, registered } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    ctx._wj.pushLog('warn', '深读审计线索γ');
+    const report = registered.find((d) => d.name === 'wj_report');
+    const deep = await report.handler({ logTail: 20 });
+    assert.ok(deep.content[0].text.includes('落盘日志尾部'), '应附落盘日志段');
+    assert.ok(deep.content[0].text.includes('深读审计线索γ'), '应读到落盘的历史行');
+    const shallow = await report.handler({});
+    assert.ok(!shallow.content[0].text.includes('落盘日志尾部'), '缺省不深读');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

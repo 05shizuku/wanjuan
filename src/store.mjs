@@ -1,7 +1,7 @@
 // src/store.mjs
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync,
-         statSync, readdirSync } from 'node:fs';
+         statSync, readdirSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 
 const FORBIDDEN = new Set(['__proto__', 'constructor', 'prototype']);
@@ -122,6 +122,20 @@ export class Store {
     }
     writeFileSync(join(this.dir, `block.${id}.json`), text, 'utf8');
     return bytes;
+  }
+
+  // M4.1 对数压缩：把等价极简事件流写为 ledger.0000.jsonl（排序最前，replay 语义零改动），
+  // 其余卷移入 archive/（原文永不删除）。月度会话的启动重放延迟从此有界。
+  compact(events) {
+    const body = events.map((ev) => JSON.stringify(ev) + '\n').join('');
+    writeFileSync(this._segPath(0), body, 'utf8');
+    const adir = join(this.dir, 'archive');
+    if (!existsSync(adir)) mkdirSync(adir, { recursive: true });
+    for (const f of readdirSync(this.dir).filter((x) => SEG_RE.test(x) && x !== 'ledger.0000.jsonl')) {
+      renameSync(join(this.dir, f), join(adir, f));
+    }
+    this._syncSegIndex();
+    return events.length;
   }
 
   hasDegraded() { return this.degraded.length > 0; }

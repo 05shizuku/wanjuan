@@ -3,7 +3,7 @@
 //  - 不注册 ctx.on('llm/stream')。
 //  - 工具定义使用 parameters 字段。
 //  - render 签名修正为 (_args, value) => value，防止宿主把 args 误当返回值处理导致 content.some 崩溃。
-import { readFileSync, writeFileSync, appendFileSync, statSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, statSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { createWanjuan, PHILOSOPHY_KEEP_DROP } from './index.mjs';
 
@@ -262,10 +262,10 @@ function buildTools(plugin) {
     ),
     makeTool(
       'wj_report',
-      '生成缓存命中率与责任归属报告。',
-      {},
+      '生成缓存命中率与责任归属报告。可选 logTail 深读落盘日志尾部（事故现场审计）。',
+      { logTail: { type: 'number', description: '额外读取 wanjuan.log.jsonl 尾部行数（≤200，缺省 0 只看内存日志环）' } },
       [],
-      () => {
+      (args) => {
         const { wj } = plugin.getOrCreate('default');
         if (!wj || !wj.diagnoser || typeof wj.diagnoser.readAll !== 'function') {
           throw new Error('诊断器尚未初始化');
@@ -294,7 +294,22 @@ function buildTools(plugin) {
           const fmtT = (t) => (typeof t === 'number' ? new Date(t).toLocaleTimeString('zh-CN', { hour12: false }) : '?');
           logTail = '\n最近日志：\n' + logs.map((l) => `  [${fmtT(l.t)}] ${l.level} ${l.msg}`).join('\n');
         }
-        return `万卷报告：requests.jsonl 累计 ${total} 条${span}${warn}。${logTail}`;
+        // v0.6.5：可选深读落盘日志（事故现场不重启也能看）
+        let deepLog = '';
+        const want = Math.min(Number(args?.logTail) || 0, 200);
+        if (want > 0 && plugin.wj) {
+          try {
+            const lp = join(plugin.wj.blocks.dir, 'wanjuan.log.jsonl');
+            if (existsSync(lp)) {
+              const fmtD = (t) => (typeof t === 'number' ? new Date(t).toLocaleTimeString('zh-CN', { hour12: false }) : '?');
+              const lines = readFileSync(lp, 'utf8').trim().split('\n').slice(-want);
+              deepLog = '\n落盘日志尾部：\n' + lines.map((l) => {
+                try { const o = JSON.parse(l); return `  [${fmtD(o.t)}] ${o.level} ${o.msg}`; } catch { return `  ${String(l).slice(0, 120)}`; }
+              }).join('\n');
+            } else deepLog = '\n落盘日志：尚无文件';
+          } catch (e) { deepLog = `\n落盘日志读取失败：${e.message}`; }
+        }
+        return `万卷报告：requests.jsonl 累计 ${total} 条${span}${warn}。${logTail}${deepLog}`;
       }
     ),
   ];

@@ -1,4 +1,5 @@
 // src/ledger.mjs
+const COMPACTION_THRESHOLD = 5000; // 事件数超过此值时自动对数压缩
 export class InvariantError extends Error {
   constructor(name, detail) {
     super(`不变式 ${name} 违反：${detail}`);
@@ -15,10 +16,15 @@ export class Ledger {
     this.pendingCompress = null;
     this.degraded = [];
     this._replay();
+    // M4.1：账本自压缩——事件超阈值时生成等价极简流并归档旧卷（重放延迟有界）
+    if (this._lastReplayEventCount > COMPACTION_THRESHOLD) {
+      try { this.compactNow(); } catch { this._degrade('compact-fail'); }
+    }
   }
 
   _replay() {
     const state = this.store.replay();
+    this._lastReplayEventCount = state.events.length;
     for (const ev of state.events) this._apply(ev);
   }
 
@@ -211,6 +217,35 @@ export class Ledger {
     this.store.append(ev);
     this._apply(ev);
     return ev;
+  }
+
+  // M4.1：等价极简事件流 = 活跃 msg（原序）+ 全部 fold（重建块）+ 全部 promote（重建层级）。
+  // 已折叠/已驱逐消息的 msg 事件可安全丢弃：原文在块 raw 文件里永远可达（原文可达不变式）。
+  _compactionEvents() {
+    const out = [];
+    for (const m of this.getActiveMessages()) out.push({ ...m });
+    for (const b of this.blocks.values()) {
+      out.push({ k: 'fold', block: b.id, tier: b.tier, range: b.range, srcTok: b.srcTok, sumTok: b.sumTok, rawRef: b.rawRef,
+        ...(b.ids ? { ids: b.ids } : {}), ...(b.atRange ? { atRange: b.atRange } : {}), ...(b.note ? { note: b.note } : {}) });
+    }
+    for (const b of this.blocks.values()) {
+      if (b.children && b.children.length > 0) {
+        out.push({ k: 'promote', parent: b.id, children: b.children, srcTok: b.srcTok, sumTok: b.sumTok, tier: b.tier,
+          ...(b.atRange ? { atRange: b.atRange } : {}) });
+      }
+    }
+    return out;
+  }
+
+  compactNow() {
+    const before = this.store.replay().events.length; // 实测计数（_lastReplayEventCount 只是构造时快照）
+    const events = this._compactionEvents();
+    this.store.compact(events);
+    this.messages.clear();
+    this.blocks.clear();
+    this.degraded.length = 0;
+    this._replay();
+    return { before, after: events.length };
   }
 
   setPendingCompress(blockId) { this.pendingCompress = blockId; }
