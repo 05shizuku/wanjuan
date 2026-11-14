@@ -13,19 +13,42 @@
 - **绝对容错（断电保护）**：写到一半断电导致账本坏行？万卷跳过坏行并大声告警，绝不让一行错误拖垮整个会话。
 - **并发安全（目录隔离）**：多窗口同时聊天？按 Session ID 严格隔离账本，互不干涉。
 
-## 🏗 里程碑现状（M1 → M3.5）
+## 🏗 里程碑现状（M1 → M3.6）
 
 | 里程碑 | 状态 | 内容 |
 |---|---|---|
 | M1 观测模式 | ✅ | `session/event` 全词汇入账（`user/message` / `assistant/message` / `tool/result`），TokenUsage 驼峰 `miss + cached` 语义对齐 |
 | M2 手动折叠 | ✅ | `wj_compress` / `wj_decompress` / `wj_search` / `wj_report` 四工具 |
 | M3 自动水位 | ✅ | `turn/end` 时用三段式估算器测水位：≥95% 自动折叠最老消息（保尾 20 条），≥80% 提示模型主动折叠 |
-| M3.5 真实接管 | ✅ | 折叠后桥接宿主原生 `ctx.compaction.compactRegion`，把真实会话日志区间替换成摘要节点 |
+| M3.5 真实接管 | ✅ 2026-11-14 真机闭环 | 折叠后桥接宿主原生 `ctx.compaction.compactRegion`，真实日志区间替换成宿主 checkpoint 摘要节点 |
+| M3.6 动态窗口 | ✅ | 窗口三级取值：宿主注册表 `resolveModelInfo` → models.json → 128K；换模型即时自适应 |
+| M3.6b 窗口自学习 | ✅ | 解析成功的窗口落盘 `<dir>/models.learned.json`，重启合并进 estimator，零配置自愈 |
 
 ### M3 的两个关键修正
 
-- **`estimator.estRaw` 不存在**：它是 `estimate()` 返回值的字段，不是方法。水位用 `estFinal`（k̂ 校准 + 5% 偏置）除以 `est.window`。
-- **宿主消息 ID 是 UUID**：字典序 ≠ 时间序（实测不单调）。折叠一律走**显式 ids 列表**，绝不传 range 端点——`ledger.recordFold` 与 `compressor.compress` 均已支持。
+- **`estimator.estRaw` 不存在**：它是 `estimate()` 返回值的字段，不是方法。水位用 `estFinal`（k̂ 校准 + 5% 偏置）除以 `est.window`。k̂ 通过 `observeUsage` 用真实 usage 做按模型 EMA 校准（5 个样本后收敛）。
+- **宿主消息 ID 是 UUID**：字典序 ≠ 时间序（实测不单调）。折叠一律走**显式 ids 列表**，绝不传 range 端点——`ledger.recordFold` 与 `compressor.compress` 均已支持；`wj_compress` 工具同样提供 `ids` 参数。
+
+### M3.5 为什么桥接宿主 compaction，而不是自己改请求
+
+宿主三条瀑布全查证过：
+
+- `agent/pre-step`：只给本轮新进的 `UserMessage[]`，历史不在场；
+- `agent/request`：契约明文 **"cannot mutate messages"**，`LlmCallConfig` 只有控制项；
+- `llm/stream`：LOOP 请求的 `messages` **深度冻结**（reconstructability 原则：请求必须是会话日志的纯函数）。
+
+唯一合法入口是 `ctx.compaction.compactRegion(startSeq, endSeq, agent)`——成功后真实日志区间替换成一个摘要节点，模型可见、缓存责任归宿主。万卷在账本里记录事件 `seq`（SessionSeq），完成「账本消息 → 真实日志区间」的映射；服务缺失时优雅降级为只折账本。
+
+### M3.5 真机契约四层（每层都是实测踩出来的）
+
+| 层 | 坑 | 解法 |
+|---|---|---|
+| ① 访问控制 | 直接 `ctx.compaction` 抛 `cannot get property without inject` | `inject` 声明 `compaction`（及 `llm`） |
+| ② agent 形态 | 裸传 Session 抛 `reading 'surface'` | 包装 `{ session, options }`（宿主内部走 `agent.session.surface`） |
+| ③ whole-surface 稳定性 | 摘要期间表面变化即弃（实测：工具结果消息落进摘要期） | 手动路径 **await 宿主摘要完成**再返回工具结果 |
+| ④ 净收益检查 | `summary is not smaller than the shadowed content`——宿主拒绝越压越大 | 跨度要足够大（宿主 checkpoint 模板摘要 ~1.2K token 起步） |
+
+另有两处边界细节：region 起点必须是 user 消息（否则拆散 tool-call/result 对）；终点所在 step 必须已闭合。宿主压缩失败为**软失败**：告警入日志环，账本折叠照常生效。
 
 ### M3.5 为什么桥接宿主 compaction，而不是自己改请求
 
@@ -41,7 +64,7 @@
 
 | 工具 | 作用 |
 |---|---|
-| `wj_compress` | 把指定消息折叠为摘要（内置 KEEP/DROP 哲学） |
+| `wj_compress` | 把指定消息折叠为摘要（`ids` 显式集合优先，`range` 二选一；内置 KEEP/DROP 哲学） |
 | `wj_decompress` | 恢复折叠块原文 |
 | `wj_search` | 在折叠块中检索 |
 | `wj_report` | 磁盘账本报告 + **最近日志环**（水位告警、折叠结果、桥接成败一目了然） |
@@ -50,14 +73,15 @@
 
 - **零第三方依赖**：纯原生 Node.js ESM（>= 20）。
 - **事件溯源账本**：`msg / mut / fold / evict / unfold / promote`，坏行告警、断电保护、多会话隔离。
-- **三段式估算**：`est_raw → × khat → × 1.05 偏置`，引入贝叶斯先验，且绝不污染真实 usage 校准。
+- **三段式估算**：`est_raw → × khat → × 1.05 偏置`，引入贝叶斯先验，真实 usage 按模型 EMA 校准 k̂。
+- **动态窗口感知（M3.6）**：从宿主模型注册表实时解析 `contextWindow`，换模型零配置自适应；解析结果自学习落盘，重启后兜底链依然精确。
 - **日志环**：Electron 主进程的 console 在 Windows 下不可见，插件内存保留最近 30 条日志，`wj_report` 直接展示。
-- **防弹测试**：138 个自动化测试用例（含大量失败注入），`node --test` 全绿。
+- **防弹测试**：141 个自动化测试用例（含大量失败注入），`node --test` 全绿。
 
 ## 🚀 跑起来看看
 
 ```bash
-# 运行测试（预期 138 个用例全绿）
+# 运行测试（预期 141 个用例全绿）
 npm test
 ```
 

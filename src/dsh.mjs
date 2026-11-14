@@ -3,10 +3,15 @@
 //  - 不注册 ctx.on('llm/stream')。
 //  - 工具定义使用 parameters 字段。
 //  - render 签名修正为 (_args, value) => value，防止宿主把 args 误当返回值处理导致 content.some 崩溃。
+import { readFileSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { createWanjuan, PHILOSOPHY_KEEP_DROP } from './index.mjs';
 
 export const name = 'wanjuan';
-export const inject = ['tools', 'connection', 'tokenMeter', 'webServer'];
+// compaction：M3.5 真实上下文接管必需。宿主访问控制要求先声明 inject
+// （2026-11-14 真机实测：直接属性访问抛 "cannot get property without inject"）。
+// 若 profile 未挂 compaction 实现导致加载失败，需在插件管理里启用原生 compaction-basic。
+export const inject = ['tools', 'connection', 'tokenMeter', 'webServer', 'compaction', 'llm'];
 
 let _seq = 0;
 function nextMsgId() { return `m${++_seq}`; }
@@ -89,7 +94,25 @@ export class WanjuanPlugin {
     if (this.shadowMode) {
       return '影子模式：只提示，不真的折叠。把 shadowMode 设为 false 才生效。';
     }
-    this.wj.compressor.compress(args);
+    const before = new Set(this.wj.ledger.listBlocks().map((b) => b.id));
+    this.wj.compressor.compress({
+      ...args,
+      // 手动路径也补 sumTok（此前只有自动折叠路径传了）
+      sumTok: this.wj.estimator.estimate({ messages: [{ bytes: Buffer.byteLength(args.summary ?? ''), cls: 'text' }] }, { provider: '', model: '' }).estRaw,
+    });
+    // M3.5：手动折叠后同样桥接宿主原生压缩（1M 大窗口下自然折叠稀少，
+    // 手动路径同时是 M3.5 的实时验证通路）。
+    const newBlock = this.wj.ledger.listBlocks().find((b) => !before.has(b.id));
+    if (newBlock && typeof this.tryHostCompaction === 'function') {
+      const seqs = [];
+      for (const m of this.wj.ledger.messages.values()) {
+        if (m.status === 'folded' && m.blockId === newBlock.id && typeof m.ev.seq === 'number') seqs.push(m.ev.seq);
+      }
+      if (seqs.length > 0) {
+        const p = this.tryHostCompaction(this._lastHostSession, Math.min(...seqs), Math.max(...seqs));
+        if (p) await p; // 等宿主压缩完成再返回——工具结果消息必须落在压缩之后，表面稳定性才成立
+      }
+    }
     return '✅ 已折叠';
   }
 }
@@ -141,10 +164,11 @@ function buildTools(plugin) {
       'wj_compress',
       `${PHILOSOPHY_KEEP_DROP}\n把指定区间的消息折叠为摘要。summary 必须丢弃可恢复细节，只保留因果与结论。`,
       {
-        range: { type: 'array', items: { type: 'string' }, description: '要折叠的消息 ID 区间' },
+        range: { type: 'array', items: { type: 'string' }, description: '要折叠的消息 ID 区间（与 ids 二选一）' },
+        ids: { type: 'array', items: { type: 'string' }, description: '显式消息 ID 集合（UUID 主机推荐，优先于 range）' },
         summary: { type: 'string', description: '摘要内容' },
       },
-      ['range', 'summary'],
+      ['summary'],
       (args) => plugin._toolCompress(args)
     ),
     makeTool(
@@ -222,6 +246,7 @@ export function apply(ctx, config = {}) {
   const recordUsage = (wj, usage, provider, model) => {
     const u = normalizeUsage(usage);
     if (!u) return;
+    warmupModelWindow(wj, provider, model); // M3.6：顺手预热当前模型的窗口解析（并自学习落盘）
     const usageObj = {
       input_tokens: u.input,
       input: u.input,
@@ -239,6 +264,93 @@ export function apply(ctx, config = {}) {
     } catch (e) {
       plugin.pushLog('warn', `diagnoser.record fail: ${e.message}`);
     }
+    // k̂ 校准接线：observe.mjs 里的 observeUsage 此前无人喂真实 usage，
+    // k̂ 永远停在先验 1.0，字符估算的膨胀无法收敛（真机实测水位虚高到 544%）。
+    // 用「账本活跃消息的 estRaw vs 真实 input」喂 EMA；账本不含 system prompt，
+    // 这部分开销会被 k̂ 一并吸收——对水位预测反而更准。
+    try {
+      const active = wj.ledger.getActiveMessages();
+      if (active.length > 0 && u.input > 0) {
+        const est = wj.estimator.estimate({ messages: active }, { provider, model });
+        wj.estimator.observeUsage({ provider, model, usageInputTokens: u.input, estRaw: est.estRaw });
+      }
+    } catch {}
+  };
+
+  // ===== M3.6：动态窗口感知（跟随实际服务模型自适应）=====
+  // 窗口取值链：宿主注册表 ctx.llm.resolveModelInfo（权威，含 patch 层配置的
+  // contextWindow）→ models.json + 已学习窗口（estimator）→ 128K 兜底。
+  // 换模型即时自适应：每次真实 usage 到达时按 provider/model 异步预热缓存。
+  // M3.6b 自学习：解析成功的窗口持久化到 <数据目录>/models.learned.json，
+  // 下次加载合并进 estimator——别人用任何模型都零配置、自愈、无需发版。
+  const _windowCache = new Map(); // 'provider/model' -> number（解析失败不缓存，下次重试）
+  const mergeLearned = (wj, provider, model, info) => {
+    try {
+      const models = wj.estimator.models;
+      const p = (models[provider] ??= {});
+      p[model] = {
+        ...p[model],
+        ...(typeof info?.context?.contextWindow === 'number' ? { window: info.context.contextWindow } : {}),
+        ...(typeof info?.defaultMaxTokens === 'number' ? { output: info.defaultMaxTokens } : {}),
+      };
+    } catch {}
+  };
+  const persistLearned = (wj, provider, model, info) => {
+    try {
+      const path = join(wj.blocks.dir, 'models.learned.json');
+      let disk = {};
+      try { disk = JSON.parse(readFileSync(path, 'utf8')); } catch {}
+      const m = (disk[provider] ??= {});
+      m[model] = {
+        ...(m[model] ?? {}),
+        ...(typeof info?.context?.contextWindow === 'number' ? { window: info.context.contextWindow } : {}),
+        ...(typeof info?.defaultMaxTokens === 'number' ? { output: info.defaultMaxTokens } : {}),
+      };
+      writeFileSync(path, JSON.stringify(disk, null, 2), 'utf8');
+    } catch (e) {
+      plugin.pushLog('warn', `M3.6：学习窗口落盘失败：${e.message}`);
+    }
+  };
+  const loadLearned = (wj) => {
+    try {
+      const disk = JSON.parse(readFileSync(join(wj.blocks.dir, 'models.learned.json'), 'utf8'));
+      for (const [provider, models] of Object.entries(disk)) {
+        const p = (wj.estimator.models[provider] ??= {});
+        Object.assign(p, models);
+      }
+    } catch {}
+  };
+  const warmupModelWindow = (wj, provider, model) => {
+    if (!provider) return;
+    const key = `${provider}/${model ?? ''}`;
+    if (_windowCache.has(key)) return;
+    _windowCache.set(key, NaN); // 占位防并发重复解析
+    try {
+      const llm = ctx.llm;
+      if (!llm || typeof llm.resolveModelInfo !== 'function') {
+        _windowCache.delete(key);
+        return;
+      }
+      Promise.resolve()
+        .then(() => llm.resolveModelInfo(provider, model ?? ''))
+        .then((info) => {
+          const w = info?.context?.contextWindow;
+          if (typeof w === 'number' && w > 0) {
+            _windowCache.set(key, w);
+            if (wj) { mergeLearned(wj, provider, model ?? '', info); persistLearned(wj, provider, model ?? '', info); }
+            plugin.pushLog('log', `M3.6：模型窗口已解析 ${key} = ${w}`);
+          } else {
+            _windowCache.delete(key); // 注册表没给窗口，留待重试/走兜底
+          }
+        })
+        .catch((err) => {
+          _windowCache.delete(key);
+          plugin.pushLog('warn', `M3.6：模型窗口解析失败 ${key}：${err?.message ?? err}（退回 models.json/兜底）`);
+        });
+    } catch (e) {
+      _windowCache.delete(key);
+      plugin.pushLog('warn', `M3.6：窗口解析调用异常：${e.message}`);
+    }
   };
 
   // ===== M3.5：真实上下文接管（桥接宿主原生 compaction 服务）=====
@@ -250,16 +362,30 @@ export function apply(ctx, config = {}) {
   let _compactUnavailableWarned = false;
   const tryHostCompaction = (session, startSeq, endSeq) => {
     try {
-      const svc = ctx.compaction;
+      // inject 已声明 'compaction'，正常走属性访问；万一访问控制仍拦截，退回契约可选路径 ctx.get
+      let svc = null;
+      try {
+        svc = ctx.compaction;
+      } catch {
+        if (typeof ctx.get === 'function') svc = ctx.get('compaction');
+      }
       if (!svc || typeof svc.compactRegion !== 'function') {
         if (!_compactUnavailableWarned) {
           _compactUnavailableWarned = true;
-          plugin.pushLog('warn', 'M3.5：宿主 compaction 服务不可用（ctx.compaction 缺失），真实上下文暂不会收缩');
+          plugin.pushLog('warn', 'M3.5：宿主 compaction 服务不可用（inject 后仍取不到实现），真实上下文暂不会收缩');
         }
-        return;
+        return null;
       }
-      Promise.resolve()
-        .then(() => svc.compactRegion(startSeq, endSeq, session))
+      // 返回 promise 供手动路径 await：宿主 compactRegion 硬编码 whole-surface 稳定性，
+      // 工具结果消息若落在摘要期间必然触发 "session surface changed"（2026-11-14 实测），
+      // 所以手动折叠必须等压缩完成后再返回工具结果。
+      return Promise.resolve()
+        .then(() => {
+          // 宿主契约（2026-11-14 真机实测）：第三参是 agent 包装 { session, options }，
+          // 不是裸 Session——宿主内部走 agent.session.surface，裸传必抛 reading 'surface'。
+          const agent = session && typeof session === 'object' ? { session, options: {} } : undefined;
+          return svc.compactRegion(startSeq, endSeq, agent);
+        })
         .then((res) => {
           plugin.pushLog('log', `M3.5：宿主原生压缩完成（seq ${startSeq}→${endSeq}）${res ? JSON.stringify(res).slice(0, 120) : ''}`);
         })
@@ -270,6 +396,7 @@ export function apply(ctx, config = {}) {
       plugin.pushLog('warn', `M3.5：宿主压缩调用异常：${e.message}`);
     }
   };
+  plugin.tryHostCompaction = tryHostCompaction; // 手动折叠路径复用同一桥接
 
   ctx.on('session/event', (a0, a1) => {
     // 宿主签名：'session/event'(session, event) —— a0 是 Session 对象（有 .id），
@@ -279,6 +406,7 @@ export function apply(ctx, config = {}) {
     const sessionId = ev.sessionId ?? a0?.id ?? 'default';
     try {
       const { wj } = plugin.getOrCreate(sessionId);
+      plugin._lastHostSession = a0; // M3.5：手动折叠桥接用的宿主 session 引用（最近一次事件流）
 
       // 宿主 SessionEventMap 的真实词汇（没有 'message'/'step'）：
       //   user/message      → data 就是 UserMessage 本体
@@ -313,20 +441,27 @@ export function apply(ctx, config = {}) {
         } catch {}
 
         const est = wj.estimator.estimate({ messages: byTime }, { provider, model });
-        const window = est.window && est.window > 0 ? est.window : CONTEXT_WINDOW;
+        // M3.6：窗口三级取值——宿主注册表（动态预热缓存）→ models.json → 128K 兜底
+        const hostWindow = _windowCache.get(`${provider}/${model ?? ''}`);
+        const window = (typeof hostWindow === 'number' && hostWindow > 0)
+          ? hostWindow
+          : (est.window && est.window > 0 ? est.window : CONTEXT_WINDOW);
         // 用 estFinal（k̂ 校准 + 5% 偏置）做水位，比 estRaw 更保守
         const usageRatio = est.estFinal / window;
 
         if (usageRatio >= FORCE_FOLD_THRESHOLD) {
-          plugin.pushLog('warn', `🚨 水位达到 ${(usageRatio * 100).toFixed(1)}%！正在强制执行后台保护性折叠...`);
+          plugin.pushLog('warn', `🚨 水位达到 ${(usageRatio * 100).toFixed(1)}%（模型 ${provider || '?'}/${model || '?'}，窗口 ${window}）！正在强制执行后台保护性折叠...`);
           const toFold = byTime.slice(0, byTime.length - TAIL_RETENTION);
           try {
             // 关键：按显式 id 列表折叠。传 range 端点在 UUID id 下会按字典序
             // 折出一段随机邻域，保尾 20 条完全不成立。
             const n = toFold.length;
+            const summary = `【万卷引擎自动折叠】水位已达 ${(usageRatio * 100).toFixed(1)}%，最老的 ${n} 条消息已折叠为本摘要；如需原文可用 wj_decompress 恢复。`;
             const blockId = wj.compressor.compress({
               ids: toFold.map((m) => m.id),
-              summary: `【万卷引擎自动折叠】水位已达 ${(usageRatio * 100).toFixed(1)}%，最老的 ${n} 条消息已折叠为本摘要；如需原文可用 wj_decompress 恢复。`,
+              summary,
+              // 摘要自身的 token 成本（此前漏传，块元数据 sumTok 恒为 0）
+              sumTok: wj.estimator.estimate({ messages: [{ bytes: Buffer.byteLength(summary), cls: 'text' }] }, { provider, model }).estRaw,
             });
             plugin.pushLog('log', `✅ 自动折叠完成：块 ${blockId}，账本释放 ${n} 条消息。`);
             // M3.5：账本折完，桥接宿主原生压缩，把真实会话日志的同段区间也收掉
@@ -354,4 +489,6 @@ export function apply(ctx, config = {}) {
       plugin.pushLog('warn', `tool register fail ${t.name}: ${e.message}`);
     }
   }
+
+  if (plugin.wj) loadLearned(plugin.wj); // M3.6b：启动时合并已学习的模型窗口
 }

@@ -7,6 +7,6 @@
     "claude-3-5":        { "window": 200000, "output": 8192, "khatPrior": 0.99, "unitPrice": 1 }
   },
   "nvmine": {
-    "z-ai/glm-5.3-flash": { "window": 200000, "output": 8192, "khatPrior": 1.0, "unitPrice": 1 }
+    "z-ai/glm-5.3-flash": { "window": 1000000, "output": 131072, "khatPrior": 1.0, "unitPrice": 1 }
   }
 }

@@ -294,7 +294,8 @@ test('M3.5：折叠后桥接宿主 compaction（compactRegion 以 seq 区间调�
     assert.equal(compactionCalls.length, 1);
     // 区间 = 被折 5 条消息的 seq 跨度（u01..u05 → seq 1..5）
     assert.deepEqual(compactionCalls[0].slice(0, 2), [1, 5]);
-    assert.ok(compactionCalls[0][2], 'session/agent 占位已传入');
+    // 宿主契约：第三参必须是 agent 包装 { session, options }（裸 Session 会抛 reading 'surface'）
+    assert.ok(compactionCalls[0][2]?.session, 'agent 包装应含 session');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -355,5 +356,127 @@ test('日志环：pushLog 截断 30 条，wj_report 附最近日志（含自动�
     assert.ok(text.includes('✅ 自动折叠完成'), '应包含折叠成功记录');
     assert.ok(text.includes('M3.5：宿主原生压缩完成'), '应包含桥接成功记录');
     assert.ok(!text.includes('测试日志 6'), '更早的日志应已被挤出/不显示');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('M3.6：窗口跟随宿主注册表——小窗口触发折叠，缓存命中只解析一次', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    let resolveCalls = 0;
+    ctx.llm = {
+      resolveModelInfo: async () => {
+        resolveCalls += 1;
+        return { context: { contextWindow: 100000 } }; // 故意给小窗口，验证覆盖生效
+      },
+    };
+    apply(ctx, { dir, shadowMode: false });
+
+    // 25 条重消息（estFinal≈157710），窗口被宿主覆盖为 100000 → 水位 157% → 折叠
+    for (let i = 1; i <= 25; i++) {
+      eventHandlers['session/event']({
+        type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 6300 },
+      });
+    }
+    // 一条带 usage 的 assistant 消息：写诊断记录（供水位取 provider/model）+ 触发窗口预热
+    eventHandlers['session/event']({
+      type: 'assistant/message', sessionId: 's1', seq: 26, time: 2000,
+      data: {
+        message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'nvmine', model: 'glm' }, content: [] },
+        usage: { inputTokens: 1000, cacheReadTokens: 500 },
+      },
+    });
+    await new Promise((r) => setImmediate(r)); // 等窗口预热落缓存
+    assert.equal(resolveCalls, 1);
+
+    eventHandlers['session/event']({
+      type: 'turn/end', sessionId: 's1', seq: 99, time: 9999,
+      data: { turn: 1, reason: { kind: 'completed' } },
+    });
+    const plugin = ctx._wj;
+    const wj = plugin.getOrCreate('s1').wj;
+    assert.equal(wj.ledger.blocks.size, 1, '小窗口下应触发折叠');
+    assert.ok(plugin.logs.some((l) => l.msg.includes('窗口 100000')), '水位日志应标注覆盖后的窗口');
+
+    // 再来一轮：缓存命中，不重复解析
+    eventHandlers['session/event']({
+      type: 'user/message', sessionId: 's1', seq: 100, time: 10000,
+      data: { id: 'u100', role: 'user', content: 'x', tok: 100 },
+    });
+    eventHandlers['session/event']({
+      type: 'turn/end', sessionId: 's1', seq: 101, time: 10001,
+      data: { turn: 2, reason: { kind: 'completed' } },
+    });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(resolveCalls, 1, '同模型第二次不应重复解析');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('M3.6b：解析成功的窗口自学习落盘，下次加载合并进 estimator', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { readFileSync: rf } = await import('node:fs');
+    // 第一阶段：llm 服务解析窗口 888888 → 应落盘 models.learned.json
+    const { ctx, eventHandlers } = freshCtx(dir);
+    ctx.llm = { resolveModelInfo: async () => ({ context: { contextWindow: 888888 }, defaultMaxTokens: 4096 }) };
+    apply(ctx, { dir, shadowMode: false });
+    eventHandlers['session/event']({
+      type: 'assistant/message', sessionId: 's1', seq: 1, time: 1000,
+      data: {
+        message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'nvmine', model: 'glm' }, content: [] },
+        usage: { inputTokens: 1000, cacheReadTokens: 0 },
+      },
+    });
+    await new Promise((r) => setImmediate(r));
+    const learned = JSON.parse(rf(join(dir, 'models.learned.json'), 'utf8'));
+    assert.equal(learned.nvmine.glm.window, 888888);
+    assert.equal(learned.nvmine.glm.output, 4096);
+
+    // 第二阶段：全新加载（无 llm 服务）→ 已学习窗口应合并进 estimator
+    const { ctx: ctx2, eventHandlers: eh2 } = freshCtx(dir); // freshCtx 没有 llm
+    apply(ctx2, { dir, shadowMode: false });
+    const wj2 = ctx2._wj.getOrCreate('s2').wj;
+    assert.equal(wj2.estimator.models.nvmine.glm.window, 888888, '启动时应合并已学习窗口');
+    const est = wj2.estimator.estimate(
+      { messages: [{ tok: 10, cls: 'text' }] },
+      { provider: 'nvmine', model: 'glm' },
+    );
+    assert.equal(est.window, 888888, 'estimate 应使用已学习窗口');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('M3.5：手动 wj_compress 同样桥接宿主 compaction（seq 区间）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers, registered } = freshCtx(dir);
+    const compactionCalls = [];
+    ctx.compaction = {
+      compactRegion: async (start, end, agent) => {
+        compactionCalls.push([start, end, agent]);
+        return { ok: true };
+      },
+    };
+    apply(ctx, { dir, shadowMode: false });
+
+    // 8 条消息带 seq；事件流顺手记录宿主 session 引用（a0 即事件对象）
+    for (let i = 1; i <= 8; i++) {
+      eventHandlers['session/event']({
+        type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 10 },
+      });
+    }
+
+    const compress = registered.find((d) => d.name === 'wj_compress');
+    const out = await compress.handler({ range: ['u01', 'u05'], summary: '手动折叠测试摘要' });
+    assert.ok(!out.isError, out.content?.[0]?.text);
+
+    const { wj } = ctx._wj.getOrCreate('s1');
+    assert.equal(wj.ledger.blocks.size, 1, '手动折叠应产生一个块');
+
+    await new Promise((r) => setImmediate(r)); // 桥接 fire-and-forget
+    assert.equal(compactionCalls.length, 1, '手动折叠应触发一次桥接');
+    assert.deepEqual(compactionCalls[0].slice(0, 2), [1, 5], '区间 = 被折消息的 seq 跨度');
+    assert.ok(compactionCalls[0][2]?.session, 'agent 包装应含 session');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
