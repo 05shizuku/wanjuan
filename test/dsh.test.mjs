@@ -634,3 +634,45 @@ test('v0.6.4：turn/end 自动补桥——不与折叠桥接重复、限流、�
     assert.equal(calls, 1, '10 分钟限流内不应重复补桥');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('M4：宿主突变吸收——同 id 内容变化走 mut 事件（幂等 + tok 更新 + 重放一致）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const emit = (content) => eventHandlers['session/event']({
+      type: 'user/message', sessionId: 's1', seq: 1, time: 1000,
+      data: { id: 'u1', role: 'user', content, tok: 10 },
+    });
+    emit('你好');
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    assert.equal(wj.ledger.messages.size, 1);
+    emit('你好（已被宿主改写）');
+    const m = wj.ledger.messages.get('u1');
+    assert.ok(JSON.stringify(m.ev.content).includes('改写'), '账本应吸收突变后的内容');
+    assert.ok(m.ev.mutatedAt, '应记录 mutatedAt');
+    assert.equal(m.ev.tok, 5, '突变后 tok 应按新内容重估（10 字 → estimateTok=5）');
+    // 幂等：相同内容重复投递不再追加 mut
+    const before = wj.store.replay().events.length;
+    emit('你好（已被宿主改写）');
+    assert.equal(wj.store.replay().events.length, before, '相同内容不应追加事件');
+    // 重放一致：全新 Ledger 实例重放后内容一致
+    const { createWanjuan } = await import('../src/index.mjs');
+    const wj2 = createWanjuan({ dir });
+    assert.ok(JSON.stringify(wj2.ledger.messages.get('u1').ev.content).includes('改写'), '重放后突变保持');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('M4：重启恢复——首个会话事件即触发补扫（限流兜底）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    assert.equal(ctx._wj._recoveryKicked, undefined, 'apply 时尚未触发');
+    eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: 1, time: 1000,
+      data: { id: 'u1', role: 'user', content: 'hi', tok: 1 } });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(ctx._wj._recoveryKicked, true, '首个会话事件应踢脚恢复扫描');
+    assert.ok(ctx._wj._lastAutoReconcile > 0, '自动补桥限流时间戳应更新');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

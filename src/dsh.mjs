@@ -52,8 +52,21 @@ function normalizeUsage(usage) {
 
 function recordOne(wj, message, at, seq) {
   if (!message) return;
+  const id = message.id ?? nextMsgId();
+  // M4：宿主突变吸收——同一 id 重复投递且内容变化时走 mut 事件（追加，绝不改写历史）
+  const existing = wj.ledger.messages.get(id);
+  if (existing && existing.status === 'active' && message.content !== undefined) {
+    let oldC = null, newC = null;
+    try { oldC = JSON.stringify(existing.ev.content ?? null); newC = JSON.stringify(message.content ?? null); } catch {}
+    if (oldC !== null && newC !== null && oldC !== newC) {
+      try {
+        wj.ledger.recordMut({ id, at: at ?? Date.now(), bytes: Buffer.byteLength(newC), content: message.content, tok: estimateTok(message.content) });
+        return;
+      } catch {}
+    }
+  }
   wj.ledger.recordMsg({
-    id: message.id ?? nextMsgId(),
+    id,
     tok: message.tok ?? estimateTok(message.content),
     content: message.content,
     role: message.role,
@@ -152,6 +165,7 @@ export class WanjuanPlugin {
       const st0 = this._bridgeStatus?.[b.id]?.status;
       if (st0 === 'ok') { out.push(`${b.id}: 已打通（seq ${start}→${end}），跳过`); continue; }
       if (st0 === 'skip') { out.push(`${b.id}: 已终态（${(this._bridgeStatus[b.id].error ?? '').slice(0, 60)}），跳过`); continue; }
+      if (st0 === 'pending') { out.push(`${b.id}: 桥接进行中，跳过`); continue; }
       const p = this.tryHostCompaction(this._lastHostSession, start, end, b.id);
       if (p) await p;
       const st = this._bridgeStatus?.[b.id]?.status ?? '未知';
@@ -449,6 +463,9 @@ export function apply(ctx, config = {}) {
       // 返回 promise 供手动路径 await：宿主 compactRegion 硬编码 whole-surface 稳定性，
       // 工具结果消息若落在摘要期间必然触发 "session surface changed"（2026-11-14 实测），
       // 所以手动折叠必须等压缩完成后再返回工具结果。
+      // v0.6.5：发起即标 pending——补桥扫描据此跳过 in-flight 的块，杜绝重复压缩
+      // （崩溃残留的 pending 无终态标记，下轮自然重试）
+      markBridge(blockId, 'pending');
       // v0.6.3：起点拆散 tool-call/result 对时，回退到最近 user 消息（步骤起点恒为平衡边界）
       const walkToUserStart = (sess, from) => {
         try {
@@ -526,6 +543,11 @@ export function apply(ctx, config = {}) {
     try {
       const { wj } = plugin.getOrCreate(sessionId);
       plugin._lastHostSession = a0; // M3.5：手动折叠桥接用的宿主 session 引用（最近一次事件流）
+      if (!plugin._recoveryKicked) {
+        // M4：重启恢复——首个会话事件即补扫历史欠账（10 分钟限流器兜底，不额外发压）
+        plugin._recoveryKicked = true;
+        Promise.resolve().then(() => plugin._autoReconcile?.()).catch(() => {});
+      }
 
       // 宿主 SessionEventMap 的真实词汇（没有 'message'/'step'）：
       //   user/message      → data 就是 UserMessage 本体

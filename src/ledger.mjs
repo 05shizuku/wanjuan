@@ -29,6 +29,7 @@ export class Ledger {
       const m = this.messages.get(ev.id);
       if (m) {
         m.ev = { ...m.ev, bytes: ev.bytes, content: ev.content };
+        if (ev.tok !== undefined) m.ev.tok = ev.tok; // M4：突变后 token 估算同步更新，水位不漂移
         m.ev.mutatedAt = ev.at;
       }
     } else if (ev.k === 'fold') {
@@ -115,10 +116,10 @@ export class Ledger {
     return ev;
   }
 
-  recordMut({ id, at = Date.now(), bytes, content }) {
+  recordMut({ id, at = Date.now(), bytes, content, tok }) {
     const m = this.messages.get(id);
     if (!m) throw new InvariantError('归属唯一', `mut 目标消息 ${id} 不存在`);
-    const ev = { k: 'mut', id, at, bytes, content };
+    const ev = { k: 'mut', id, at, bytes, content, ...(tok !== undefined ? { tok } : {}) };
     this.store.append(ev);
     this._apply(ev);
     return ev;
