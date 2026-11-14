@@ -23,6 +23,7 @@
 | M3.5 真实接管 | ✅ 2026-11-14 真机闭环 | 折叠后桥接宿主原生 `ctx.compaction.compactRegion`，真实日志区间替换成宿主 checkpoint 摘要节点 |
 | M3.6 动态窗口 | ✅ | 窗口三级取值：宿主注册表 `resolveModelInfo` → models.json → 128K；换模型即时自适应 |
 | M3.6b 窗口自学习 | ✅ | 解析成功的窗口落盘 `<dir>/models.learned.json`，重启合并进 estimator，零配置自愈 |
+| M3.7 补桥对账 | ✅ | `host-bridge.json` 记录每块桥接状态；`wj_reconcile` 对「账本已折、宿主未折」的历史块补发 `compactRegion`，修复白折错位 |
 
 ### M3 的两个关键修正
 
@@ -48,7 +49,7 @@
 | ③ whole-surface 稳定性 | 摘要期间表面变化即弃（实测：工具结果消息落进摘要期） | 手动路径 **await 宿主摘要完成**再返回工具结果 |
 | ④ 净收益检查 | `summary is not smaller than the shadowed content`——宿主拒绝越压越大 | 跨度要足够大（宿主 checkpoint 模板摘要 ~1.2K token 起步） |
 
-另有两处边界细节：region 起点必须是 user 消息（否则拆散 tool-call/result 对）；终点所在 step 必须已闭合。宿主压缩失败为**软失败**：告警入日志环，账本折叠照常生效。
+另有两处边界细节：region 起点必须是 user 消息（否则拆散 tool-call/result 对）；终点所在 step 必须已闭合。宿主压缩失败为**软失败**：告警入日志环，账本折叠照常生效——历史欠账由 `wj_reconcile` 补桥清理（含第五条实测契约：宿主拒绝净膨胀的摘要，`summary is not smaller than the shadowed content`，跨度需远大于 ~1.2K token）。
 
 ### M3.5 为什么桥接宿主 compaction，而不是自己改请求
 
@@ -65,6 +66,7 @@
 | 工具 | 作用 |
 |---|---|
 | `wj_compress` | 把指定消息折叠为摘要（`ids` 显式集合优先，`range` 二选一；内置 KEEP/DROP 哲学） |
+| `wj_reconcile` | 补桥：对宿主压缩未打通的历史块补发 `compactRegion`，消除「账本折了、真实上下文还在」的错位 |
 | `wj_decompress` | 恢复折叠块原文 |
 | `wj_search` | 在折叠块中检索 |
 | `wj_report` | 磁盘账本报告 + **最近日志环**（水位告警、折叠结果、桥接成败一目了然） |

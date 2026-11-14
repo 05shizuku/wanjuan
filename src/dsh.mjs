@@ -109,11 +109,34 @@ export class WanjuanPlugin {
         if (m.status === 'folded' && m.blockId === newBlock.id && typeof m.ev.seq === 'number') seqs.push(m.ev.seq);
       }
       if (seqs.length > 0) {
-        const p = this.tryHostCompaction(this._lastHostSession, Math.min(...seqs), Math.max(...seqs));
+        const p = this.tryHostCompaction(this._lastHostSession, Math.min(...seqs), Math.max(...seqs), newBlock.id);
         if (p) await p; // 等宿主压缩完成再返回——工具结果消息必须落在压缩之后，表面稳定性才成立
       }
     }
     return '✅ 已折叠';
+  }
+
+  // v0.6.2 补桥：对「账本已折、宿主未折」的历史块补发 compactRegion，
+  // 修复审查指出的「白折」错位（水位低估、真实上下文仍堆满老消息）。
+  async _toolReconcile() {
+    if (this.shadowMode) return '影子模式：不执行补桥。';
+    if (!this.tryHostCompaction || !this.wj) return '桥接未初始化（config.dir 未设置？）。';
+    const out = [];
+    for (const b of this.wj.ledger.listBlocks()) {
+      const seqs = [];
+      for (const m of this.wj.ledger.messages.values()) {
+        if (m.status === 'folded' && m.blockId === b.id && typeof m.ev.seq === 'number') seqs.push(m.ev.seq);
+      }
+      if (seqs.length === 0) { out.push(`${b.id}: 跳过（无 seq 锚，宿主无法定位区间）`); continue; }
+      const start = Math.min(...seqs), end = Math.max(...seqs);
+      if (this._bridgeStatus?.[b.id]?.status === 'ok') { out.push(`${b.id}: 已打通（seq ${start}→${end}），跳过`); continue; }
+      const p = this.tryHostCompaction(this._lastHostSession, start, end, b.id);
+      if (p) await p;
+      const st = this._bridgeStatus?.[b.id]?.status ?? '未知';
+      const err = this._bridgeStatus?.[b.id]?.error;
+      out.push(`${b.id}: seq ${start}→${end} → ${st}${err ? '（' + err.slice(0, 90) + '）' : ''}`);
+    }
+    return out.length ? out.join('\n') : '没有需要补桥的块。';
   }
 }
 
@@ -170,6 +193,13 @@ function buildTools(plugin) {
       },
       ['summary'],
       (args) => plugin._toolCompress(args)
+    ),
+    makeTool(
+      'wj_reconcile',
+      '补桥：对账本已折叠但宿主原生压缩未打通的历史块，补发 compactRegion。修复「账本折了、真实上下文还在」的错位。',
+      {},
+      [],
+      () => plugin._toolReconcile()
     ),
     makeTool(
       'wj_decompress',
@@ -360,7 +390,17 @@ export function apply(ctx, config = {}) {
   // 唯一合法的「动刀」入口是 ctx.compaction.compactRegion(startSeq, endSeq, agent)：
   // 成功后真实会话日志的那段区间被替换成一个摘要节点，模型可见、缓存责任归宿主。
   let _compactUnavailableWarned = false;
-  const tryHostCompaction = (session, startSeq, endSeq) => {
+  // 桥接状态持久化（host-bridge.json）：账本已折、宿主未折的块由 wj_reconcile 补桥
+  const markBridge = (blockId, status, error) => {
+    if (!blockId || !plugin.wj) return;
+    try {
+      const rec = { status, at: Date.now(), ...(error ? { error: String(error).slice(0, 200) } : {}) };
+      plugin._bridgeStatus = plugin._bridgeStatus ?? {};
+      plugin._bridgeStatus[blockId] = rec;
+      writeFileSync(join(plugin.wj.blocks.dir, 'host-bridge.json'), JSON.stringify(plugin._bridgeStatus, null, 2), 'utf8');
+    } catch {}
+  };
+  const tryHostCompaction = (session, startSeq, endSeq, blockId) => {
     try {
       // inject 已声明 'compaction'，正常走属性访问；万一访问控制仍拦截，退回契约可选路径 ctx.get
       let svc = null;
@@ -387,9 +427,11 @@ export function apply(ctx, config = {}) {
           return svc.compactRegion(startSeq, endSeq, agent);
         })
         .then((res) => {
+          markBridge(blockId, 'ok');
           plugin.pushLog('log', `M3.5：宿主原生压缩完成（seq ${startSeq}→${endSeq}）${res ? JSON.stringify(res).slice(0, 120) : ''}`);
         })
         .catch((err) => {
+          markBridge(blockId, 'failed', err?.message ?? err);
           plugin.pushLog('warn', `M3.5：宿主压缩失败：${err?.message ?? err}`);
         });
     } catch (e) {
@@ -397,6 +439,8 @@ export function apply(ctx, config = {}) {
     }
   };
   plugin.tryHostCompaction = tryHostCompaction; // 手动折叠路径复用同一桥接
+  // 启动时加载桥接状态（wj_reconcile 依据它跳过已打通的块）
+  try { plugin._bridgeStatus = JSON.parse(readFileSync(join(plugin.wj.blocks.dir, 'host-bridge.json'), 'utf8')); } catch { plugin._bridgeStatus = {}; }
 
   ctx.on('session/event', (a0, a1) => {
     // 宿主签名：'session/event'(session, event) —— a0 是 Session 对象（有 .id），
@@ -467,14 +511,17 @@ export function apply(ctx, config = {}) {
             // M3.5：账本折完，桥接宿主原生压缩，把真实会话日志的同段区间也收掉
             const seqs = toFold.map((m) => m.seq).filter((s) => typeof s === 'number');
             if (seqs.length > 0) {
-              tryHostCompaction(a0, Math.min(...seqs), Math.max(...seqs));
+              tryHostCompaction(a0, Math.min(...seqs), Math.max(...seqs), blockId);
             }
           } catch (err) {
             plugin.pushLog('error', `自动折叠失败: ${err.message}`);
           }
         } else if (usageRatio >= 0.80) {
-          // 只是警告（Nudge），留给下一个 turn 模型自己决定
-          plugin.pushLog('warn', `⚠️ 水位达到 ${(usageRatio * 100).toFixed(1)}%，建议模型主动调用 wj_compress。`);
+          // Nudge（M3 两段式第一段）：点名可折区间，模型可直接照做
+          const cand = byTime.slice(0, byTime.length - TAIL_RETENTION);
+          const cseqs = cand.map((m) => m.seq).filter((x) => typeof x === 'number');
+          const span = cseqs.length ? `（seq ${Math.min(...cseqs)}→${Math.max(...cseqs)}，共 ${cand.length} 条）` : `（共 ${cand.length} 条）`;
+          plugin.pushLog('warn', `⚠️ 水位达到 ${(usageRatio * 100).toFixed(1)}%，建议主动调用 wj_compress 折叠最老消息${span}。`);
         }
       }
     } catch (e) {

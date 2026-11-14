@@ -28,12 +28,13 @@ function freshCtx(dir) {
   return { ctx, registered, eventHandlers, waterHandlers, infos, warns };
 }
 
-test('apply：注册 4 个工具（wj_ 前缀防撞宿主），compress 描述含 KEEP/DROP 且带 output', () => {
+test('apply：注册 5 个工具（wj_ 前缀防撞宿主），compress 描述含 KEEP/DROP 且带 output', () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
     const { ctx, registered } = freshCtx(dir);
     apply(ctx, { dir });
-    assert.equal(registered.length, 4);
+    assert.equal(registered.length, 5);
+    assert.ok(registered.some((d) => d.name === 'wj_reconcile'), '应有 wj_reconcile 补桥工具');
     const compress = registered.find((d) => d.name === 'wj_compress');
     assert.ok(compress.description.includes('必须丢弃'));
     // 宿主契约：工具必须带 output { schema, render }
@@ -478,5 +479,61 @@ test('M3.5：手动 wj_compress 同样桥接宿主 compaction（seq 区间）', 
     assert.equal(compactionCalls.length, 1, '手动折叠应触发一次桥接');
     assert.deepEqual(compactionCalls[0].slice(0, 2), [1, 5], '区间 = 被折消息的 seq 跨度');
     assert.ok(compactionCalls[0][2]?.session, 'agent 包装应含 session');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.6.2 补桥：wj_reconcile 对未打通的历史块补发 compactRegion 并落状态', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers, registered } = freshCtx(dir);
+    const compactionCalls = [];
+    ctx.compaction = { compactRegion: async (a, b, c) => { compactionCalls.push([a, b]); return { ok: true }; } };
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 6; i++) {
+      eventHandlers['session/event']({
+        type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 10 },
+      });
+    }
+    const { wj } = ctx._wj.getOrCreate('s1');
+    wj.compressor.compress({ ids: ['u01', 'u02', 'u03'], summary: '块一摘要' });
+    wj.compressor.compress({ ids: ['u04', 'u05', 'u06'], summary: '块二摘要' });
+    const reconcile = registered.find((d) => d.name === 'wj_reconcile');
+    const out1 = await reconcile.handler({});
+    assert.ok(!out1.isError, out1.content?.[0]?.text);
+    assert.equal(compactionCalls.length, 2, '两个未打通块都应补发');
+    assert.deepEqual(compactionCalls[0], [1, 3]);
+    assert.deepEqual(compactionCalls[1], [4, 6]);
+    const { readFileSync: rf } = await import('node:fs');
+    const bridge = JSON.parse(rf(join(dir, 'host-bridge.json'), 'utf8'));
+    assert.equal(bridge[Object.keys(bridge)[0]].status, 'ok', '桥接状态应落盘');
+    const out2 = await reconcile.handler({});
+    assert.equal(compactionCalls.length, 2, '已打通的块第二次应跳过');
+    assert.ok(out2.content[0].text.includes('已打通'), '报告应标注已打通');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.6.2 Nudge：80% 告警点名可折区间（seq 跨度 + 条数）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    // estFinal ≈ (4×25000 + 21×10) × 1.05 ≈ 105331 / 128000 ≈ 82.3%（80~95% 区间）
+    for (let i = 1; i <= 25; i++) {
+      eventHandlers['session/event']({
+        type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: i <= 4 ? 25000 : 10 },
+      });
+    }
+    eventHandlers['session/event']({
+      type: 'turn/end', sessionId: 's1', seq: 99, time: 9999,
+      data: { turn: 1, reason: { kind: 'completed' } },
+    });
+    const warn = ctx._wj.logs.find((l) => l.msg.includes('建议主动调用 wj_compress'));
+    assert.ok(warn, '应产生 Nudge 告警');
+    assert.ok(warn.msg.includes('seq 1→'), '应点名起始 seq');
+    assert.ok(warn.msg.includes('共 5 条'), '应点名可折条数');
+    assert.ok(!wjFolds(ctx, 's1'), '80% 只提醒不折叠');
+    function wjFolds(c, sid) { return c._wj.getOrCreate(sid).wj.ledger.blocks.size; }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
