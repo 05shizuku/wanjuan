@@ -537,3 +537,53 @@ test('v0.6.2 Nudge：80% 告警点名可折区间（seq 跨度 + 条数）', asy
     function wjFolds(c, sid) { return c._wj.getOrCreate(sid).wj.ledger.blocks.size; }
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('v0.6.3：usage 入档带 est（estBy>0、归因不再 unattributed）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    eventHandlers['session/event']({
+      type: 'user/message', sessionId: 's1', seq: 1, time: 1000,
+      data: { id: 'u1', role: 'user', content: '你好', tok: 100 },
+    });
+    eventHandlers['session/event']({
+      type: 'assistant/message', sessionId: 's1', seq: 2, time: 1001,
+      data: {
+        message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'nvmine', model: 'glm' }, content: [] },
+        usage: { inputTokens: 500, cacheReadTokens: 200 },
+      },
+    });
+    const recs = ctx._wj.getOrCreate('s1').wj.diagnoser.readAll();
+    assert.equal(recs.length, 1);
+    assert.ok(recs[0].estBy > 0, 'estBy 应为估算值而非 0');
+    assert.ok(recs[0].khat > 0, 'khat 应入档');
+    // M1 设计如此：classifyMiss 只产 new/unattributed（P2-5，完整归因属后续里程碑）
+    assert.ok(['new', 'unattributed'].includes(recs[0].missKind), 'missKind 应为合法词汇');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.6.3：起点拆散 pair 时自动回退到 user 消息重试', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers, registered } = freshCtx(dir);
+    const calls = [];
+    ctx.compaction = {
+      compactRegion: async (start, end) => {
+        if (start === 3) throw new Error("compactRegion: start seq 3 is not a balanced boundary (would split a step's tool-call/result pair)");
+        calls.push([start, end]);
+        return { ok: true };
+      },
+    };
+    apply(ctx, { dir, shadowMode: false });
+    // 模拟宿主 session：surface 节点 1..5，node 1 是 user 消息
+    ctx._wj._lastHostSession = {
+      surface: { nodes: [1, 2, 3, 4, 5] },
+      eventAt: (seq) => ({ type: seq === 1 ? 'user/message' : 'assistant/message' }),
+    };
+    ctx._wj.tryHostCompaction(ctx._wj._lastHostSession, 3, 5, 'bx');
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(calls, [[1, 5]], '应回退到 user 消息起点重试');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('起点回退 3→1')), '应记录回退日志');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});

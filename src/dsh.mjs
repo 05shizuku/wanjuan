@@ -283,13 +283,23 @@ export function apply(ctx, config = {}) {
       cached: u.cached,
       cached_tokens: u.cached,
     };
+    // 先估算再落记录：estBy/khat/calibrating 入档，classifyMiss 才能归因（v0.6.3 修复 unattributed 空转）
+    let est = null;
+    try {
+      const active = wj.ledger.getActiveMessages();
+      if (active.length > 0 && u.input > 0) {
+        est = wj.estimator.estimate({ messages: active }, { provider, model });
+      }
+    } catch {}
     try {
       wj.diagnoser.record({
         usage: usageObj,
-        input: u.input,
-        cached: u.cached,
         provider,
         model,
+        est: est ?? undefined,
+        khat: est?.khat,
+        calibrating: est?.calibrating,
+        degraded: wj.estimator.getDegraded(),
       });
     } catch (e) {
       plugin.pushLog('warn', `diagnoser.record fail: ${e.message}`);
@@ -299,9 +309,7 @@ export function apply(ctx, config = {}) {
     // 用「账本活跃消息的 estRaw vs 真实 input」喂 EMA；账本不含 system prompt，
     // 这部分开销会被 k̂ 一并吸收——对水位预测反而更准。
     try {
-      const active = wj.ledger.getActiveMessages();
-      if (active.length > 0 && u.input > 0) {
-        const est = wj.estimator.estimate({ messages: active }, { provider, model });
+      if (est && u.input > 0) {
         wj.estimator.observeUsage({ provider, model, usageInputTokens: u.input, estRaw: est.estRaw });
       }
     } catch {}
@@ -419,12 +427,39 @@ export function apply(ctx, config = {}) {
       // 返回 promise 供手动路径 await：宿主 compactRegion 硬编码 whole-surface 稳定性，
       // 工具结果消息若落在摘要期间必然触发 "session surface changed"（2026-11-14 实测），
       // 所以手动折叠必须等压缩完成后再返回工具结果。
+      // v0.6.3：起点拆散 tool-call/result 对时，回退到最近 user 消息（步骤起点恒为平衡边界）
+      const walkToUserStart = (sess, from) => {
+        try {
+          const nodes = sess?.surface?.nodes;
+          if (!Array.isArray(nodes)) return null;
+          const idx = nodes.indexOf(from);
+          if (idx <= 0) return null;
+          for (let i = idx - 1; i >= 0 && idx - i <= 20; i--) {
+            const ev = sess.eventAt?.(nodes[i]);
+            if (String(ev?.type ?? '').includes('user')) return nodes[i];
+          }
+        } catch {}
+        return null;
+      };
       return Promise.resolve()
-        .then(() => {
+        .then(async () => {
           // 宿主契约（2026-11-14 真机实测）：第三参是 agent 包装 { session, options }，
           // 不是裸 Session——宿主内部走 agent.session.surface，裸传必抛 reading 'surface'。
           const agent = session && typeof session === 'object' ? { session, options: {} } : undefined;
-          return svc.compactRegion(startSeq, endSeq, agent);
+          let start = startSeq;
+          for (let attempt = 0; ; attempt++) {
+            try {
+              const res = await svc.compactRegion(start, endSeq, agent);
+              if (attempt > 0) plugin.pushLog('log', `M3.5：起点回退 ${startSeq}→${start} 后重试成功`);
+              return res;
+            } catch (err) {
+              const msg = String(err?.message ?? err);
+              if (!msg.includes('not a balanced boundary') || !msg.includes('start seq') || attempt >= 3) throw err;
+              const prev = walkToUserStart(session, start);
+              if (prev === null || prev >= start) throw err;
+              start = prev;
+            }
+          }
         })
         .then((res) => {
           markBridge(blockId, 'ok');
