@@ -8,4 +8,4 @@
       name: 'wanjuan/dsh'
       config:
         dir: '.wanjuan'
-        shadowMode: true   # M1 强制影子：compress 工具只返回提示，不真的 fold
+        shadowMode: false   # M1 强制影子：compress 工具只返回提示，不真的 fold

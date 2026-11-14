@@ -28,19 +28,24 @@ function freshCtx(dir) {
   return { ctx, registered, eventHandlers, waterHandlers, infos, warns };
 }
 
-test('apply：注册 4 个工具，compress 描述含 KEEP/DROP', () => {
+test('apply：注册 4 个工具（wj_ 前缀防撞宿主），compress 描述含 KEEP/DROP 且带 output', () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
     const { ctx, registered } = freshCtx(dir);
     apply(ctx, { dir });
     assert.equal(registered.length, 4);
-    const compress = registered.find((d) => d.name === 'compress');
+    const compress = registered.find((d) => d.name === 'wj_compress');
     assert.ok(compress.description.includes('必须丢弃'));
+    // 宿主契约：工具必须带 output { schema, render }
+    assert.ok(compress.output && compress.output.schema && typeof compress.output.render === 'function');
+    assert.ok(registered.every((d) => d.output && d.output.schema && typeof d.output.render === 'function'));
     assert.ok(!registered.some((d) => d.name === 'wj_status'));
+    // 真机契约：使用 parameters 字段
+    assert.ok(compress.parameters && compress.parameters.type === 'object');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('apply：session/event 消息入账', () => {
+test('apply：session/event 消息入账（真实宿主词汇 user/message + assistant/message）', () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
     const { ctx, eventHandlers } = freshCtx(dir);
@@ -48,81 +53,88 @@ test('apply：session/event 消息入账', () => {
     const handler = eventHandlers['session/event'];
     assert.equal(typeof handler, 'function');
 
-    handler({ type: 'message', sessionId: 's1', message: { role: 'user', content: '你好' } });
-    handler({ type: 'message', sessionId: 's1', message: { role: 'assistant', content: 'hello' } });
+    // 宿主契约：user/message 的 data 就是 UserMessage 本体；assistant/message 的消息在 data.message
+    handler({
+      type: 'user/message', sessionId: 's1', seq: 1, time: 1000,
+      data: { id: 'u1', role: 'user', content: [{ type: 'text', text: '你好' }] },
+    });
+    handler({
+      type: 'assistant/message', sessionId: 's1', seq: 2, time: 2000,
+      data: {
+        turn: 1, step: 1,
+        message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' }, content: [{ type: 'text', text: 'hello' }] },
+        stream: [],
+      },
+    });
 
     const { wj } = ctx._wj.getOrCreate('s1');
     assert.equal(wj.ledger.messages.size, 2);
-    const contents = [...wj.ledger.messages.values()].map(m => m.ev.content).sort();
-    assert.deepEqual(contents, ['hello', '你好']);
+    // 按消息 ID 排序（a1 < u1），避免 localeCompare 的 collation 在中文上不稳定
+    const entries = [...wj.ledger.messages.values()]
+      .map(m => [m.ev.id, m.ev.content])
+      .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
+    assert.deepEqual(entries.map(e => e[1]), [
+      [{ type: 'text', text: 'hello' }],
+      [{ type: 'text', text: '你好' }],
+    ]);
+    // 时间锚来自事件的 time 字段
+    const byId = new Map([...wj.ledger.messages.values()].map(m => [m.ev.id, m.ev]));
+    assert.equal(byId.get('u1').at, 1000);
+    assert.equal(byId.get('a1').at, 2000);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('apply：session/event step 批量入账', () => {
+test('apply：session/event tool/result 入账', () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
     const { ctx, eventHandlers } = freshCtx(dir);
     apply(ctx, { dir });
     eventHandlers['session/event']({
-      type: 'step', sessionId: 's1',
-      messages: [
-        { role: 'user', content: 'a' },
-        { role: 'assistant', content: 'b' },
-      ]
+      type: 'tool/result', sessionId: 's1', seq: 3, time: 3000,
+      data: {
+        turn: 1, step: 2,
+        message: { id: 't1', role: 'tool', toolCallId: 'c1', source: { kind: 'tool', callId: 'c1' }, content: [{ type: 'text', text: 'result-a' }] },
+      },
     });
     const { wj } = ctx._wj.getOrCreate('s1');
-    assert.equal(wj.ledger.messages.size, 2);
+    assert.equal(wj.ledger.messages.size, 1);
+    const m = wj.ledger.messages.get('t1');
+    assert.equal(m.status, 'active');
+    // 账本 schema 不存 role（那是 cls 的职责域），断言内容与时间锚即可
+    assert.deepEqual(m.ev.content, [{ type: 'text', text: 'result-a' }]);
+    assert.equal(m.ev.at, 3000);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('apply：llm/stream waterfall 包流拿 usage（async iterable 尾部）', async () => {
+test('apply：session/event assistant/message 采集 usage（真实驼峰 TokenUsage）', () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
-    const { ctx, waterHandlers } = freshCtx(dir);
+    const { ctx, eventHandlers } = freshCtx(dir);
     apply(ctx, { dir });
-    const handler = waterHandlers['llm/stream'];
-    assert.equal(typeof handler, 'function');
-
-    // 模拟 async iterable stream，最后 chunk 带 usage
-    const fakeStream = (async function* () {
-      yield { delta: 'hi' };
-      yield { delta: ' there' };
-      yield { delta: '', usage: { input_tokens: 1000, cached: 500 } };
-    })();
-
-    const request = {
-      sessionId: 's1', provider: 'deepseek', model: 'deepseek-chat',
-      messages: [{ cls: 'text', tok: 1000 }],
-    };
-    const result = await handler(request, async () => fakeStream);
-
-    // 消费流
-    const chunks = [];
-    for await (const c of result) chunks.push(c);
-    assert.equal(chunks.length, 3);
-
-    // 检查 diagnoser
+    eventHandlers['session/event']({
+      type: 'assistant/message',
+      sessionId: 's1',
+      seq: 2,
+      time: 2000,
+      data: {
+        turn: 1, step: 1,
+        message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' }, content: [{ type: 'text', text: 'hi' }] },
+        stream: [],
+        usage: { inputTokens: 1000, outputTokens: 200, cacheReadTokens: 500 },
+      },
+    });
     const { wj } = ctx._wj.getOrCreate('s1');
     assert.equal(wj.diagnoser.size(), 1);
     const rec = wj.diagnoser.readAll()[0];
-    assert.equal(rec.input, 1000);
+    assert.ok(rec);
+    // 关键回归：驼峰 TokenUsage 必须映射到 input/cached，不允许再落成 0。
+    // 语义对齐：inputTokens 是未命中部分，input = inputTokens + cacheReadTokens
+    // = 1000 + 500 = 1500（总提示）；cached = 500；missTok = input - cached = 1000。
+    assert.equal(rec.input, 1500);
     assert.equal(rec.cached, 500);
-  } finally { rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('apply：llm/stream 直接返回带 usage 的对象', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
-  try {
-    const { ctx, waterHandlers } = freshCtx(dir);
-    apply(ctx, { dir });
-    const handler = waterHandlers['llm/stream'];
-
-    const request = { sessionId: 's1', provider: 'deepseek', model: 'deepseek-chat', messages: [] };
-    const result = await handler(request, async () => ({ usage: { input_tokens: 200, cached: 100 } }));
-    assert.ok(result.usage);
-
-    const { wj } = ctx._wj.getOrCreate('s1');
-    assert.equal(wj.diagnoser.size(), 1);
+    assert.equal(rec.missTok, 1000);
+    assert.equal(rec.provider, 'deepseek');
+    assert.equal(rec.model, 'deepseek-chat');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -134,7 +146,6 @@ test('WanjuanPlugin：影子模式 compress 被拒', async () => {
     p.wj.ledger.recordMsg({ id: 'm1', tok: 10, content: 'x' });
     const r = await p._toolCompress({ range: ['m1', 'm1'], summary: 's' });
     assert.ok(r.includes('影子模式'));
-    // 账本里消息仍是 active（未真的 fold）
     assert.equal(p.wj.ledger.messages.get('m1').status, 'active');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
