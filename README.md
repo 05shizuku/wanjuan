@@ -25,6 +25,7 @@
 | M3.6b 窗口自学习 | ✅ | 解析成功的窗口落盘 `<dir>/models.learned.json`，重启合并进 estimator，零配置自愈 |
 | M3.7 补桥对账 | ✅ | `host-bridge.json` 记录每块桥接状态；`wj_reconcile` 对「账本已折、宿主未折」的历史块补发 `compactRegion`，修复白折错位 |
 | M3.8 校准入档 + 边界回退 | ✅ | 真实 usage 入档带 `estBy/khat/calibrating`（校准可观测）；起点拆散 tool-call/result 对时自动回退到最近 user 消息重试 |
+| M3.9 自动补桥 + 日志审计 | ✅ | `turn/end` 限流触发补桥（排队在折叠桥接后，失败分终态/瞬态，终态不重试）；日志落盘 `wanjuan.log.jsonl`（256KB 轮转） |
 
 ### M3 的两个关键修正
 
@@ -78,13 +79,13 @@
 - **事件溯源账本**：`msg / mut / fold / evict / unfold / promote`，坏行告警、断电保护、多会话隔离。
 - **三段式估算**：`est_raw → × khat → × 1.05 偏置`，引入贝叶斯先验，真实 usage 按模型 EMA 校准 k̂。
 - **动态窗口感知（M3.6）**：从宿主模型注册表实时解析 `contextWindow`，换模型零配置自适应；解析结果自学习落盘，重启后兜底链依然精确。
-- **日志环**：Electron 主进程的 console 在 Windows 下不可见，插件内存保留最近 30 条日志，`wj_report` 直接展示。
-- **防弹测试**：145 个自动化测试用例（含大量失败注入），`node --test` 全绿。
+- **日志环 + 落盘审计**：内存保留最近 30 条（`wj_report` 展示），同时落盘 `wanjuan.log.jsonl`（256KB 轮转留尾 100 行，`logToFile: false` 可关），重启不丢。
+- **防弹测试**：147 个自动化测试用例（含大量失败注入），`node --test` 全绿。
 
 ## 🚀 跑起来看看
 
 ```bash
-# 运行测试（预期 145 个用例全绿）
+# 运行测试（预期 147 个用例全绿）
 npm test
 ```
 

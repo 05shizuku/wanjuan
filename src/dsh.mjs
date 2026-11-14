@@ -3,7 +3,7 @@
 //  - 不注册 ctx.on('llm/stream')。
 //  - 工具定义使用 parameters 字段。
 //  - render 签名修正为 (_args, value) => value，防止宿主把 args 误当返回值处理导致 content.some 崩溃。
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { createWanjuan, PHILOSOPHY_KEEP_DROP } from './index.mjs';
 
@@ -67,6 +67,7 @@ export class WanjuanPlugin {
     this.config = config;
     this.dir = config.dir;
     this.shadowMode = !!config.shadowMode;
+    this.logToFile = config.logToFile !== false; // v0.6.4：日志默认落盘（256KB 轮转），便于事后审计
     this._sessions = new Map();
     this.wj = config.dir ? createWanjuan({ dir: config.dir }) : null;
     // 日志环：Electron 主进程的 console 在 Windows 双击启动时不可见，
@@ -80,6 +81,24 @@ export class WanjuanPlugin {
     // 原 console 行为保留：终端启动时仍然实时可见
     const fn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
     try { fn(`[wanjuan] ${msg}`); } catch {}
+    this._appendLogFile(level, msg);
+  }
+
+  // v0.6.4：日志落盘到 <数据目录>/wanjuan.log.jsonl，超 256KB 轮转保留最后 100 行
+  _appendLogFile(level, msg) {
+    if (!this.logToFile || !this.wj) return;
+    try {
+      const path = join(this.wj.blocks.dir, 'wanjuan.log.jsonl');
+      const line = JSON.stringify({ t: Date.now(), level, msg: String(msg) }) + '\n';
+      try {
+        if (statSync(path).size > 262144) {
+          const tail = readFileSync(path, 'utf8').trim().split('\n').slice(-100);
+          writeFileSync(path, tail.join('\n') + '\n' + line, 'utf8');
+          return;
+        }
+      } catch {}
+      appendFileSync(path, line, 'utf8');
+    } catch {}
   }
 
   getOrCreate(sessionId) {
@@ -121,6 +140,7 @@ export class WanjuanPlugin {
   async _toolReconcile() {
     if (this.shadowMode) return '影子模式：不执行补桥。';
     if (!this.tryHostCompaction || !this.wj) return '桥接未初始化（config.dir 未设置？）。';
+    if (!this._lastHostSession) return '跳过（尚无宿主 session 引用，等首个会话事件后可用）。';
     const out = [];
     for (const b of this.wj.ledger.listBlocks()) {
       const seqs = [];
@@ -129,7 +149,9 @@ export class WanjuanPlugin {
       }
       if (seqs.length === 0) { out.push(`${b.id}: 跳过（无 seq 锚，宿主无法定位区间）`); continue; }
       const start = Math.min(...seqs), end = Math.max(...seqs);
-      if (this._bridgeStatus?.[b.id]?.status === 'ok') { out.push(`${b.id}: 已打通（seq ${start}→${end}），跳过`); continue; }
+      const st0 = this._bridgeStatus?.[b.id]?.status;
+      if (st0 === 'ok') { out.push(`${b.id}: 已打通（seq ${start}→${end}），跳过`); continue; }
+      if (st0 === 'skip') { out.push(`${b.id}: 已终态（${(this._bridgeStatus[b.id].error ?? '').slice(0, 60)}），跳过`); continue; }
       const p = this.tryHostCompaction(this._lastHostSession, start, end, b.id);
       if (p) await p;
       const st = this._bridgeStatus?.[b.id]?.status ?? '未知';
@@ -466,14 +488,32 @@ export function apply(ctx, config = {}) {
           plugin.pushLog('log', `M3.5：宿主原生压缩完成（seq ${startSeq}→${endSeq}）${res ? JSON.stringify(res).slice(0, 120) : ''}`);
         })
         .catch((err) => {
-          markBridge(blockId, 'failed', err?.message ?? err);
-          plugin.pushLog('warn', `M3.5：宿主压缩失败：${err?.message ?? err}`);
+          const msg = String(err?.message ?? err);
+          // v0.6.4 失败分类：终态不重试（自动补桥才不会每轮空耗一次 LLM 摘要）
+          if (msg.includes('not found in surface')) markBridge(blockId, 'skip', '区间已不在宿主表面（早已压缩或锚点失效），视为对齐');
+          else if (msg.includes('summary is not smaller')) markBridge(blockId, 'skip', msg);
+          else if (msg.includes('not a balanced boundary')) markBridge(blockId, 'skip', msg);
+          else markBridge(blockId, 'failed', msg);
+          plugin.pushLog('warn', `M3.5：宿主压缩失败：${msg}`);
         });
     } catch (e) {
       plugin.pushLog('warn', `M3.5：宿主压缩调用异常：${e.message}`);
     }
   };
   plugin.tryHostCompaction = tryHostCompaction; // 手动折叠路径复用同一桥接
+  // v0.6.4：自动补桥（10 分钟限流）。turn/end 时排队执行；候选只含未达终态的块。
+  plugin._autoReconcile = () => {
+    const now = Date.now();
+    if (now - (plugin._lastAutoReconcile ?? 0) < 10 * 60 * 1000) return Promise.resolve('限流跳过');
+    plugin._lastAutoReconcile = now;
+    return Promise.resolve()
+      .then(() => plugin._toolReconcile())
+      .then((r) => {
+        if (r && !r.includes('没有需要补桥') && !r.startsWith('跳过') && !r.includes('已终态')) plugin.pushLog('log', `自动补桥：\n${r}`);
+        return r;
+      })
+      .catch(() => '');
+  };
   // 启动时加载桥接状态（wj_reconcile 依据它跳过已打通的块）
   try { plugin._bridgeStatus = JSON.parse(readFileSync(join(plugin.wj.blocks.dir, 'host-bridge.json'), 'utf8')); } catch { plugin._bridgeStatus = {}; }
 
@@ -527,6 +567,7 @@ export function apply(ctx, config = {}) {
           : (est.window && est.window > 0 ? est.window : CONTEXT_WINDOW);
         // 用 estFinal（k̂ 校准 + 5% 偏置）做水位，比 estRaw 更保守
         const usageRatio = est.estFinal / window;
+        let foldBridge = null; // 本轮折叠的宿主桥接 promise（供自动补桥排队）
 
         if (usageRatio >= FORCE_FOLD_THRESHOLD) {
           plugin.pushLog('warn', `🚨 水位达到 ${(usageRatio * 100).toFixed(1)}%（模型 ${provider || '?'}/${model || '?'}，窗口 ${window}）！正在强制执行后台保护性折叠...`);
@@ -546,7 +587,7 @@ export function apply(ctx, config = {}) {
             // M3.5：账本折完，桥接宿主原生压缩，把真实会话日志的同段区间也收掉
             const seqs = toFold.map((m) => m.seq).filter((s) => typeof s === 'number');
             if (seqs.length > 0) {
-              tryHostCompaction(a0, Math.min(...seqs), Math.max(...seqs), blockId);
+              foldBridge = tryHostCompaction(a0, Math.min(...seqs), Math.max(...seqs), blockId);
             }
           } catch (err) {
             plugin.pushLog('error', `自动折叠失败: ${err.message}`);
@@ -558,6 +599,8 @@ export function apply(ctx, config = {}) {
           const span = cseqs.length ? `（seq ${Math.min(...cseqs)}→${Math.max(...cseqs)}，共 ${cand.length} 条）` : `（共 ${cand.length} 条）`;
           plugin.pushLog('warn', `⚠️ 水位达到 ${(usageRatio * 100).toFixed(1)}%，建议主动调用 wj_compress 折叠最老消息${span}。`);
         }
+        // v0.6.4：自动补桥——本轮若有折叠桥接则排队在其后，避免宿主并发压缩冲突
+        Promise.resolve(foldBridge).then(() => plugin._autoReconcile?.()).catch(() => {});
       }
     } catch (e) {
       plugin.pushLog('warn', `session/event ${ev.type} fail: ${e.message}`);

@@ -587,3 +587,50 @@ test('v0.6.3：起点拆散 pair 时自动回退到 user 消息重试', async ()
     assert.ok(ctx._wj.logs.some((l) => l.msg.includes('起点回退 3→1')), '应记录回退日志');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
+
+test('v0.6.4：日志落盘 wanjuan.log.jsonl（超 256KB 轮转保留尾 100 行）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const plugin = ctx._wj;
+    plugin.pushLog('warn', '落盘测试α');
+    const { readFileSync: rf, writeFileSync: wf } = await import('node:fs');
+    const logPath = join(dir, 'wanjuan.log.jsonl');
+    let text = rf(logPath, 'utf8');
+    assert.ok(text.includes('落盘测试α'), '日志应落盘');
+    // 制造超限文件（300 行 × 1KB ≈ 300KB > 256KB）
+    const big = Array.from({ length: 300 }, (_, i) => JSON.stringify({ t: i, level: 'log', msg: 'x'.repeat(1000) })).join('\n');
+    wf(logPath, big, 'utf8');
+    plugin.pushLog('log', '轮转后新行β');
+    text = rf(logPath, 'utf8');
+    const lines = text.trim().split('\n');
+    assert.ok(lines.length <= 101, `轮转后应 ≤101 行，实际 ${lines.length}`);
+    assert.ok(text.includes('轮转后新行β'), '新行应在轮转后的文件里');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.6.4：turn/end 自动补桥——不与折叠桥接重复、限流、终态跳过', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    let calls = 0;
+    ctx.compaction = { compactRegion: async () => { calls += 1; return { ok: true }; } };
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 25; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: i <= 5 ? 30000 : 10 } });
+    }
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 1, reason: { kind: 'completed' } } });
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls, 1, '折叠桥接 + 链式补桥只应产生一次宿主调用');
+    assert.equal(ctx._wj._bridgeStatus.b1.status, 'ok', '补桥应把块标记为 ok');
+    // 限流：立刻再触发 turn/end（补一条消息让水位分支运行）不应再调宿主
+    eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: 100, time: 10000,
+      data: { id: 'u100', role: 'user', content: 'x', tok: 10 } });
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 101, time: 10001, data: { turn: 2, reason: { kind: 'completed' } } });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls, 1, '10 分钟限流内不应重复补桥');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
