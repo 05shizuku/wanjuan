@@ -485,6 +485,7 @@ export function apply(ctx, config = {}) {
       // v0.6.5：发起即标 pending——补桥扫描据此跳过 in-flight 的块，杜绝重复压缩
       // （崩溃残留的 pending 无终态标记，下轮自然重试）
       markBridge(blockId, 'pending');
+      plugin._bridgeInFlight = (plugin._bridgeInFlight ?? 0) + 1; // M4.4：在途计数（busy 锁错误区分「自因并发」vs「崩溃遗留」）
       // v0.6.3：起点拆散 tool-call/result 对时，回退到最近 user 消息（步骤起点恒为平衡边界）
       const walkToUserStart = (sess, from) => {
         try {
@@ -499,15 +500,50 @@ export function apply(ctx, config = {}) {
         } catch {}
         return null;
       };
+      // M4.4：崩溃遗留锁修复——镜像宿主自身的失败收尾路径（补写补偿 compaction/end）。
+      // 宿主锁语义：未匹配 start 阻塞一切压缩入口；其自愈依赖 session/end-seed，
+      // 崩溃后若不产生 end-seed 则锁到会话终止——这里主动对账解锁。
+      const busyLockRepair = async () => {
+        try {
+          if (!session || typeof session.append !== 'function' || typeof session.eventAt !== 'function') return false;
+          let unmatched = null;
+          for (let q = Number(session.seq) - 1; q >= 0; q -= 1) {
+            const ev = session.eventAt(q);
+            if (!ev) continue;
+            if (ev.type === 'compaction/start') { unmatched = ev; break; }
+            if (ev.type === 'compaction/end') break;
+          }
+          if (!unmatched) return false;
+          session.append('compaction/end', {
+            ...(unmatched.data ?? {}),
+            error: { message: 'wanjuan crash-recovery: compensating end for unmatched compaction/start' },
+          });
+          plugin.pushLog('warn', `M4.4：检测到崩溃遗留压缩锁（seq ${unmatched.seq}），已补写补偿 end 解锁`);
+          return true;
+        } catch (e) {
+          plugin.pushLog('warn', `M4.4：遗留锁修复失败：${e.message}`);
+          return false;
+        }
+      };
+      // v0.6.9 风险四：signal 传入宿主（compactRegion 第 4 参）——超时时 ac.abort 
+      // 真正通知宿主中止摘要，不再空烧 LLM；宿主不认 signal 时 race 仍兜底。
+      const ac = new AbortController();
+      const agent = session && typeof session === 'object' ? { session, options: {} } : undefined;
+      const timeoutMs = Number(config.bridgeTimeoutMs) > 0 ? Number(config.bridgeTimeoutMs) : 180000;
+      let timeoutRej;
+      const timeoutP = new Promise((_, rej) => { timeoutRej = rej; });
+      const bridgeTimer = setTimeout(() => {
+        try { ac.abort(new Error('wanjuan: bridge timeout')); } catch {}
+        timeoutRej(new Error(`M3.5：桥接超时（${Math.round(timeoutMs / 1000)}s，宿主摘要未返回）`));
+      }, timeoutMs);
+      if (bridgeTimer.unref) bridgeTimer.unref();
+      timeoutP.catch(() => {}); // 迟到的拒绝不得成为 unhandledRejection
       const workP = Promise.resolve()
         .then(async () => {
-          // 宿主契约（2026-11-14 真机实测）：第三参是 agent 包装 { session, options }，
-          // 不是裸 Session——宿主内部走 agent.session.surface，裸传必抛 reading 'surface'。
-          const agent = session && typeof session === 'object' ? { session, options: {} } : undefined;
           let start = startSeq;
           for (let attempt = 0; ; attempt++) {
             try {
-              const res = await svc.compactRegion(start, endSeq, agent);
+              const res = await svc.compactRegion(start, endSeq, agent, ac.signal);
               if (attempt > 0) plugin.pushLog('log', `M3.5：起点回退 ${startSeq}→${start} 后重试成功`);
               return res;
             } catch (err) {
@@ -519,33 +555,41 @@ export function apply(ctx, config = {}) {
             }
           }
         });
-        // v0.6.5：桥接超时（默认 180s，config.bridgeTimeoutMs 可调）——宿主摘要挂死时
-        // 手动路径不再永远等待；超时转 failed（瞬态），下轮补桥自动重试，
-        // 宿主若迟到完成则被「not found in surface → skip」自愈。
-        const timeoutMs = Number(config.bridgeTimeoutMs) > 0 ? Number(config.bridgeTimeoutMs) : 180000;
-        let timeoutP;
-        const timer = setTimeout(() => { timeoutP?.reject?.(); }, 0); // 占位防lint，真实实现见下
-        clearTimeout(timer);
-        let timeoutReject;
-        timeoutP = new Promise((_, rej) => {
-          timeoutReject = rej;
-          const t = setTimeout(() => rej(new Error(`M3.5：桥接超时（${Math.round(timeoutMs / 1000)}s，宿主摘要未返回）`)), timeoutMs);
-          if (t.unref) t.unref();
-        });
-        timeoutP.catch(() => {}); // 迟到的拒绝不得成为 unhandledRejection
         return Promise.race([workP, timeoutP])
         .then((res) => {
+          clearTimeout(bridgeTimer);
           markBridge(blockId, 'ok');
           plugin.pushLog('log', `M3.5：宿主原生压缩完成（seq ${startSeq}→${endSeq}）${res ? JSON.stringify(res).slice(0, 120) : ''}`);
         })
-        .catch((err) => {
-          const msg = String(err?.message ?? err);
+        .catch(async (err) => {
+          clearTimeout(bridgeTimer);
+          let msg = String(err?.message ?? err);
+          // v0.6.9 风险一：崩溃遗留压缩锁——无其他在途桥接时补写补偿 end 并重试一次
+          if (msg.includes('compaction lock is already active')) {
+            if ((plugin._bridgeInFlight ?? 0) <= 1) {
+              const repaired = await busyLockRepair();
+              if (repaired) {
+                try {
+                  const res = await svc.compactRegion(startSeq, endSeq, agent, ac.signal);
+                  markBridge(blockId, 'ok');
+                  plugin.pushLog('log', `M3.5：宿主原生压缩完成（遗留锁解锁后重试，seq ${startSeq}→${endSeq}）`);
+                  return;
+                } catch (retryErr) {
+                  msg = String(retryErr?.message ?? retryErr);
+                }
+              }
+            }
+          }
           // v0.6.4 失败分类：终态不重试（自动补桥才不会每轮空耗一次 LLM 摘要）
           if (msg.includes('not found in surface')) markBridge(blockId, 'skip', '区间已不在宿主表面（早已压缩或锚点失效），视为对齐');
           else if (msg.includes('summary is not smaller')) markBridge(blockId, 'skip', msg);
           else if (msg.includes('not a balanced boundary')) markBridge(blockId, 'skip', msg);
           else markBridge(blockId, 'failed', msg);
           plugin.pushLog('warn', `M3.5：宿主压缩失败：${msg}`);
+        })
+        .finally(() => {
+          clearTimeout(bridgeTimer);
+          plugin._bridgeInFlight = Math.max(0, (plugin._bridgeInFlight ?? 1) - 1);
         });
     } catch (e) {
       plugin.pushLog('warn', `M3.5：宿主压缩调用异常：${e.message}`);

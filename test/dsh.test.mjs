@@ -737,6 +737,35 @@ test('M4.3：运行期摊销压缩——turn/end 跨阈值即归并，计数复�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('M4.4：崩溃遗留锁——busy 错误触发补偿 end 解锁并重试成功（signal 透传）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    const sigs = []; const appends = [];
+    ctx.compaction = { compactRegion: async (start, end, agent, signal) => {
+      sigs.push(signal);
+      if (sigs.length === 1) throw new Error('compaction: compaction already in progress; the session compaction lock is already active');
+      return { ok: true };
+    } };
+    apply(ctx, { dir, shadowMode: false });
+    // 模拟宿主 session：日志尾部有未匹配的 compaction/start（崩溃遗留锁）
+    ctx._wj._lastHostSession = {
+      seq: 5,
+      eventAt: (q) => (q === 4 ? { type: 'compaction/start', seq: 4, data: { compactionId: 'c1' } } : { type: 'user/message', seq: q }),
+      append: (type, data) => appends.push([type, data]),
+    };
+    ctx._wj.tryHostCompaction(ctx._wj._lastHostSession, 1, 5, 'bl');
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    assert.equal(sigs.length, 2, '解锁后应重试一次');
+    assert.ok(sigs.every((x) => x && typeof x.aborted === 'boolean'), 'signal 应透传给 compactRegion 第 4 参');
+    assert.equal(appends.length, 1, '应补写恰好一个补偿事件');
+    assert.equal(appends[0][0], 'compaction/end', '补偿事件类型应为 compaction/end');
+    assert.equal(ctx._wj._bridgeStatus.bl.status, 'ok', '重试成功应标记 ok');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('崩溃遗留压缩锁')), '应记录解锁日志');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('M4.1 回归：大量 mut 交织时对数压缩等价性（含幂等、最新值、重放一致）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {
