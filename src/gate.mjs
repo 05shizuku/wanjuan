@@ -9,7 +9,7 @@
 export class Gate {
   constructor({
     baseThreshold = 50_000,
-    highWaterMark = 0.85,
+    highWaterMark = 0.80, // v0.6.19：与 dsh.mjs 内联 80% 提醒线对齐（消除语义分裂）
     criticalWaterMark = 0.95,
     emergencyRatio = 0.45,
   } = {}) {

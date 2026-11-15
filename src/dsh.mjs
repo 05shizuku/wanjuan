@@ -6,6 +6,7 @@
 import { readFileSync, writeFileSync, appendFileSync, statSync, existsSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { createWanjuan, PHILOSOPHY_KEEP_DROP } from './index.mjs';
+import { buildReport } from './report.mjs';
 
 export const name = 'wanjuan';
 // compaction：M3.5 真实上下文接管必需。宿主访问控制要求先声明 inject
@@ -17,8 +18,16 @@ let _seq = 0;
 function nextMsgId() { return `m${++_seq}`; }
 
 function estimateTok(content) {
+  // v0.6.16 P1-1：CJK 1.2 / 其他 0.25——length/2 对中文系统性低估约 2 倍（危险方向：折太晚）。
+  // 口径统一（入账走 estimator）仍属 v0.7；本函数是入账/sumTok 的唯一粗估口径。
   if (typeof content === 'string' && content.length > 0) {
-    return Math.max(1, Math.ceil(content.length / 2));
+    let cjk = 0, other = 0;
+    for (let i = 0; i < content.length; i++) {
+      const code = content.charCodeAt(i);
+      if (code >= 0x4e00 && code <= 0x9fa5) cjk++;
+      else other++;
+    }
+    return Math.max(1, Math.ceil(cjk * 1.2 + other * 0.25));
   }
   if (Array.isArray(content)) {
     // 宿主消息的 content 是 ContentBlock 数组（text/reasoning/tool-call…）
@@ -82,7 +91,8 @@ export class WanjuanPlugin {
     this.shadowMode = !!config.shadowMode;
     this.logToFile = config.logToFile !== false; // v0.6.4：日志默认落盘（256KB 轮转），便于事后审计
     this._sessions = new Map();
-    this.wj = config.dir ? createWanjuan({ dir: config.dir, compactionThreshold: config.compactionThreshold }) : null;
+    this._legacyAdopted = false; // 多会话隔离：首个会话收编根目录旧账本（升级无感），后续会话独立目录
+    this._currentSessionId = null; // 最近活跃会话（工具与桥接状态的归属依据）
     // 日志环：Electron 主进程的 console 在 Windows 双击启动时不可见，
     // 文件日志也不收插件的 console 输出——所以内存留一份最近 30 条，wj_report 展示。
     this.logs = [];
@@ -99,9 +109,9 @@ export class WanjuanPlugin {
 
   // v0.6.4：日志落盘到 <数据目录>/wanjuan.log.jsonl，超 256KB 轮转保留最后 100 行
   _appendLogFile(level, msg) {
-    if (!this.logToFile || !this.wj) return;
+    if (!this.logToFile || !this.dir) return;
     try {
-      const path = join(this.wj.blocks.dir, 'wanjuan.log.jsonl');
+      const path = join(this.dir, 'wanjuan.log.jsonl');
       const line = JSON.stringify({ t: Date.now(), level, msg: String(msg) }) + '\n';
       try {
         if (statSync(path).size > 262144) {
@@ -115,29 +125,57 @@ export class WanjuanPlugin {
   }
 
   getOrCreate(sessionId) {
-    if (!this._sessions.has(sessionId)) {
-      const wj = this.wj ?? createWanjuan({ dir: this.dir, compactionThreshold: this.config?.compactionThreshold });
-      this._sessions.set(sessionId, { wj });
+    const key = String(sessionId ?? 'default');
+    if (!this._sessions.has(key)) {
+      // v0.6.17 多会话隔离：每会话独立账本目录（sessions/<sid>/）。
+      // 首个会话收编根目录旧账本（升级无感，历史延续）；后续会话完全隔离，
+      // 折叠选择不再跨会话混选，桥接 seq 恒为本会话日志位次。
+      const legacyReady = this._legacyAdopted !== true && !existsSync(join(this.dir, 'sessions'));
+      const sid = key.replace(/[^\w.-]/g, '_').slice(0, 80) || 'default';
+      const sessionDir = legacyReady ? this.dir : join(this.dir, 'sessions', sid);
+      if (legacyReady) this._legacyAdopted = true;
+      const wj = createWanjuan({ dir: sessionDir, compactionThreshold: this.config?.compactionThreshold });
+      this._loadLearnedInto(wj); // 模型学习是全局知识，注入每个新会话
+      let bridgeStatus = {};
+      try { bridgeStatus = JSON.parse(readFileSync(join(sessionDir, 'host-bridge.json'), 'utf8')); } catch {}
+      this._sessions.set(key, { wj, sid: sessionDir, bridgeStatus });
     }
-    return this._sessions.get(sessionId);
+    return this._sessions.get(key);
+  }
+
+  // 模型学习是全局知识（不属于会话）：从根目录注入会话 estimator
+  _loadLearnedInto(wj) {
+    try {
+      const disk = JSON.parse(readFileSync(join(this.dir, 'models.learned.json'), 'utf8'));
+      for (const [provider, models] of Object.entries(disk)) {
+        const pp = (wj.estimator.models[provider] ??= {});
+        Object.assign(pp, models);
+      }
+    } catch {}
+  }
+
+  // 工具与桥接状态的归属：最近活跃会话（单线程事件循环下与调用方一致）
+  _currentWj() {
+    return this.getOrCreate(this._currentSessionId ?? 'default').wj;
   }
 
   async _toolCompress(args) {
     if (this.shadowMode) {
       return '影子模式：只提示，不真的折叠。把 shadowMode 设为 false 才生效。';
     }
-    const before = new Set(this.wj.ledger.listBlocks().map((b) => b.id));
-    this.wj.compressor.compress({
+    const wj = this._currentWj();
+    const before = new Set(wj.ledger.listBlocks().map((b) => b.id));
+    wj.compressor.compress({
       ...args,
       // 手动路径也补 sumTok（此前只有自动折叠路径传了）
       sumTok: estimateTok(args.summary ?? ''), // P0-8 + P2：单消息场景 estRaw ≡ tok，直用 estimateTok 不触发 unknown-model degrade
     });
     // M3.5：手动折叠后同样桥接宿主原生压缩（1M 大窗口下自然折叠稀少，
     // 手动路径同时是 M3.5 的实时验证通路）。
-    const newBlock = this.wj.ledger.listBlocks().find((b) => !before.has(b.id));
+    const newBlock = wj.ledger.listBlocks().find((b) => !before.has(b.id));
     if (newBlock && typeof this.tryHostCompaction === 'function') {
       const seqs = [];
-      for (const m of this.wj.ledger.messages.values()) {
+      for (const m of wj.ledger.messages.values()) {
         if (m.status === 'folded' && m.blockId === newBlock.id && typeof m.ev.seq === 'number') seqs.push(m.ev.seq);
       }
       if (seqs.length > 0) {
@@ -152,20 +190,45 @@ export class WanjuanPlugin {
   // 修复审查指出的「白折」错位（水位低估、真实上下文仍堆满老消息）。
   async _toolReconcile() {
     if (this.shadowMode) return '影子模式：不执行补桥。';
-    if (!this.tryHostCompaction || !this.wj) return '桥接未初始化（config.dir 未设置？）。';
+    if (!this.tryHostCompaction || !this.dir) return '桥接未初始化（config.dir 未设置？）。';
     if (!this._lastHostSession) return '跳过（尚无宿主 session 引用，等首个会话事件后可用）。';
+    const srec = this.getOrCreate(this._currentSessionId ?? 'default');
+    const wj = srec.wj;
+    const bridgeStatus = srec.bridgeStatus ?? {};
     const out = [];
-    for (const b of this.wj.ledger.listBlocks()) {
+    // v0.6.16 P1-2：清理超 24h 的 ok 记录，防 host-bridge.json 无限膨胀。
+    // 只清 ok：其重试落在「not found → skip」上，代价为零；skip 是终态，清了会重烧 LLM。
+    try {
+      const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+      let pruned = false;
+      for (const [bid, brec] of Object.entries(bridgeStatus)) {
+        if ((brec.status === 'ok') && (brec.at ?? 0) < cutoff) { delete bridgeStatus[bid]; pruned = true; }
+      }
+      if (pruned) {
+        srec.bridgeStatus = bridgeStatus;
+        const bp = join(srec.sid, 'host-bridge.json');
+        const tp = bp + '.tmp';
+        writeFileSync(tp, JSON.stringify(bridgeStatus, null, 2), 'utf8');
+        renameSync(tp, bp);
+      }
+    } catch {}
+    for (const b of wj.ledger.listBlocks()) {
       const seqs = [];
-      for (const m of this.wj.ledger.messages.values()) {
+      for (const m of wj.ledger.messages.values()) {
         if (m.status === 'folded' && m.blockId === b.id && typeof m.ev.seq === 'number') seqs.push(m.ev.seq);
       }
       if (seqs.length === 0) { out.push(`${b.id}: 跳过（无 seq 锚，宿主无法定位区间）`); continue; }
       const start = Math.min(...seqs), end = Math.max(...seqs);
-      const st0 = this._bridgeStatus?.[b.id]?.status;
+      const st0 = bridgeStatus?.[b.id]?.status;
       if (st0 === 'ok') { out.push(`${b.id}: 已打通（seq ${start}→${end}），跳过`); continue; }
       if (st0 === 'skip') { out.push(`${b.id}: 已终态（${(this._bridgeStatus[b.id].error ?? '').slice(0, 60)}），跳过`); continue; }
-      if (st0 === 'pending') { out.push(`${b.id}: 桥接进行中，跳过`); continue; }
+      if (st0 === 'pending') {
+        // v0.6.16 P0-2：pending 超 3 分钟即僵尸（崩溃/挂起遗留）——按 failed 重试，不再永久跳过。
+        // 同进程内 in-flight 的桥接 at 是新鲜的，仍受保护。
+        const stAt = this._bridgeStatus?.[b.id]?.at ?? 0;
+        if (Date.now() - stAt < 3 * 60 * 1000) { out.push(`${b.id}: 桥接进行中（${Math.round((Date.now() - stAt) / 1000)}s），跳过`); continue; }
+        out.push(`${b.id}: pending 超时（僵尸），按 failed 重试`);
+      }
       const p = this.tryHostCompaction(this._lastHostSession, start, end, b.id);
       if (p) await p;
       const st = this._bridgeStatus?.[b.id]?.status ?? '未知';
@@ -297,9 +360,9 @@ function buildTools(plugin) {
         // v0.6.5：可选深读落盘日志（事故现场不重启也能看）
         let deepLog = '';
         const want = Math.min(Number(args?.logTail) || 0, 200);
-        if (want > 0 && plugin.wj) {
+        if (want > 0 && plugin.dir) {
           try {
-            const lp = join(plugin.wj.blocks.dir, 'wanjuan.log.jsonl');
+            const lp = join(plugin.dir, 'wanjuan.log.jsonl');
             if (existsSync(lp)) {
               const fmtD = (t) => (typeof t === 'number' ? new Date(t).toLocaleTimeString('zh-CN', { hour12: false }) : '?');
               const lines = readFileSync(lp, 'utf8').trim().split('\n').slice(-want);
@@ -309,7 +372,12 @@ function buildTools(plugin) {
             } else deepLog = '\n落盘日志：尚无文件';
           } catch (e) { deepLog = `\n落盘日志读取失败：${e.message}`; }
         }
-        return `万卷报告：requests.jsonl 累计 ${total} 条${span}${warn}。${logTail}${deepLog}`;
+        // v0.6.19：月报接线（buildReport 终于上生产——命中率/责任归属/块统计）
+        let monthly = '';
+        try {
+          monthly = '\r\n\r\n' + buildReport({ dir: wj.dir, ledger: wj.ledger, diagnoser: wj.diagnoser });
+        } catch (e) { monthly = '\r\n\r\n月报生成失败：' + e.message; }
+        return `万卷报告：requests.jsonl 累计 ${total} 条${span}${warn}。${logTail}${deepLog}${monthly}`;
       }
     ),
   ];
@@ -403,7 +471,7 @@ export function apply(ctx, config = {}) {
   };
   const persistLearned = (wj, provider, model, info) => {
     try {
-      const path = join(wj.blocks.dir, 'models.learned.json');
+      const path = join(plugin.dir, 'models.learned.json'); // 模型知识全局，不随会话分片
       let disk = {};
       try { disk = JSON.parse(readFileSync(path, 'utf8')); } catch {}
       const m = (disk[provider] ??= {});
@@ -419,17 +487,9 @@ export function apply(ctx, config = {}) {
       plugin.pushLog('warn', `M3.6：学习窗口落盘失败：${e.message}`);
     }
   };
-  const loadLearned = (wj) => {
-    try {
-      const disk = JSON.parse(readFileSync(join(wj.blocks.dir, 'models.learned.json'), 'utf8'));
-      for (const [provider, models] of Object.entries(disk)) {
-        const p = (wj.estimator.models[provider] ??= {});
-        Object.assign(p, models);
-      }
-    } catch {}
-  };
   const warmupModelWindow = (wj, provider, model) => {
     if (!provider) return;
+    if (_windowCache.size >= 50) _windowCache.clear(); // P2：上限防无限增长（用户模型数有限，清空代价一次重解析）
     const key = `${provider}/${model ?? ''}`;
     const cached = _windowCache.get(key);
     if (cached && Date.now() - cached.at < WINDOW_TTL) return; // 新鲜缓存或 in-flight 占位
@@ -472,14 +532,15 @@ export function apply(ctx, config = {}) {
   let _compactUnavailableWarned = false;
   // 桥接状态持久化（host-bridge.json）：账本已折、宿主未折的块由 wj_reconcile 补桥
   const markBridge = (blockId, status, error) => {
-    if (!blockId || !plugin.wj) return;
+    if (!blockId || !plugin.dir) return;
     try {
+      const srec = plugin.getOrCreate(plugin._currentSessionId ?? 'default');
       const rec = { status, at: Date.now(), ...(error ? { error: String(error).slice(0, 200) } : {}) };
-      plugin._bridgeStatus = plugin._bridgeStatus ?? {};
-      plugin._bridgeStatus[blockId] = rec;
-      const bridgePath = join(plugin.wj.blocks.dir, 'host-bridge.json');
+      srec.bridgeStatus = srec.bridgeStatus ?? {};
+      srec.bridgeStatus[blockId] = rec;
+      const bridgePath = join(srec.sid, 'host-bridge.json');
       const tmpPath = bridgePath + '.tmp';
-      writeFileSync(tmpPath, JSON.stringify(plugin._bridgeStatus, null, 2), 'utf8');
+      writeFileSync(tmpPath, JSON.stringify(srec.bridgeStatus, null, 2), 'utf8');
       renameSync(tmpPath, bridgePath); // 原子替换：多进程下不会读到半截 JSON
     } catch {}
   };
@@ -643,6 +704,11 @@ export function apply(ctx, config = {}) {
     try {
       const { wj } = plugin.getOrCreate(sessionId);
       plugin._lastHostSession = a0; // M3.5：手动折叠桥接用的宿主 session 引用（最近一次事件流）
+      if (plugin._currentSessionId !== sessionId) {
+        // 多会话：切换当前会话，桥接状态随会话切换（每会话独立 host-bridge.json）
+        plugin._currentSessionId = sessionId;
+        plugin._bridgeStatus = plugin.getOrCreate(sessionId).bridgeStatus ?? {};
+      }
       if (!plugin._recoveryKicked) {
         // M4：重启恢复——首个会话事件即补扫历史欠账（10 分钟限流器兜底，不额外发压）
         plugin._recoveryKicked = true;
@@ -673,6 +739,30 @@ export function apply(ctx, config = {}) {
         // ==========================================
         if (plugin.shadowMode || !wj.estimator || typeof wj.estimator.estimate !== 'function') return;
 
+        // M4.6：fingerprint 观察模式——账本活跃 vs 宿主表面重建对比（限流 10 分钟，只读不驱逐）。
+        // 宿主侧若绕过万卷自行压缩（压力触发），此处会看到账本活跃消息从表面消失的漂移。
+        try {
+          const fpNow = Date.now();
+          if (fpNow - (plugin._lastFpProbe ?? 0) > 10 * 60 * 1000) {
+            plugin._lastFpProbe = fpNow;
+            const nodes = a0?.surface?.nodes;
+            if (Array.isArray(nodes) && nodes.length > 0) {
+              const surfaceIds = new Set();
+              for (const sq of nodes) {
+                const sev = a0.eventAt?.(sq);
+                const t = String(sev?.type ?? '');
+                if (!t.includes('user') && !t.includes('assistant') && !t.includes('tool')) continue;
+                const mid = (t.includes('assistant') || t.includes('tool')) ? sev?.data?.message?.id : sev?.data?.id;
+                if (mid) surfaceIds.add(mid);
+              }
+              const actives = wj.ledger.getActiveMessages();
+              const missing = actives.filter((m) => !surfaceIds.has(m.id));
+              if (missing.length > 0) {
+                plugin.pushLog('warn', `指纹观察：账本活跃 ${actives.length} 条中 ${missing.length} 条不在宿主表面（宿主侧可能已自行压缩）——观察模式，暂不自动驱逐`);
+              }
+            }
+          }
+        } catch {}
         // M4.3：追加事件跨阈值 → 运行期摊销对数压缩（0000 卷即检查点，启动永不重压大账本）。
         // 放在水位早退之前：少量消息的 turn/end 也要能触发归并。
         try {
@@ -759,5 +849,4 @@ export function apply(ctx, config = {}) {
     }
   }
 
-  if (plugin.wj) loadLearned(plugin.wj); // M3.6b：启动时合并已学习的模型窗口
 }

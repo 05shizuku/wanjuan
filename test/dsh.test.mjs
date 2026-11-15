@@ -158,11 +158,11 @@ test('WanjuanPlugin：shadowMode=false 时 compress 真执行', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
     const p = new WanjuanPlugin({ config: { dir, shadowMode: false } });
-    p.wj = (await import('../src/index.mjs')).createWanjuan({ dir });
-    p.wj.ledger.recordMsg({ id: 'm1', tok: 10, content: 'x' });
+    const wj = p._currentWj(); // default 会话（收编根目录），与 _toolCompress 同源
+    wj.ledger.recordMsg({ id: 'm1', tok: 10, content: 'x' });
     const r = await p._toolCompress({ range: ['m1', 'm1'], summary: 's' });
     assert.ok(r.includes('✅'));
-    assert.equal(p.wj.ledger.messages.get('m1').status, 'folded');
+    assert.equal(wj.ledger.messages.get('m1').status, 'folded');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -651,7 +651,7 @@ test('M4：宿主突变吸收——同 id 内容变化走 mut 事件（幂等 + 
     const m = wj.ledger.messages.get('u1');
     assert.ok(JSON.stringify(m.ev.content).includes('改写'), '账本应吸收突变后的内容');
     assert.ok(m.ev.mutatedAt, '应记录 mutatedAt');
-    assert.equal(m.ev.tok, 5, '突变后 tok 应按新内容重估（10 字 → estimateTok=5）');
+    assert.equal(m.ev.tok, 11, '突变后 tok 应按 CJK 口径重估（8 中文×1.2 + 2 标点×0.25 → 11）');
     // 幂等：相同内容重复投递不再追加 mut
     const before = wj.store.replay().events.length;
     emit('你好（已被宿主改写）');
@@ -739,6 +739,62 @@ test('M4.3：运行期摊销压缩——turn/end 跨阈值即归并，计数复�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('P0-2：pending 超 3 分钟即僵尸——reconcile 按 failed 重试而非永久跳过', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers, registered } = freshCtx(dir);
+    let calls = 0;
+    ctx.compaction = { compactRegion: async () => { calls += 1; return { ok: true }; } };
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 3; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 10 } });
+    }
+    // 伪造崩溃遗留：真实块 b1（先折叠）+ pending 状态且 at 是 10 分钟前
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    wj.compressor.compress({ ids: ['u01', 'u02'], summary: '块摘要' });
+    ctx._wj.getOrCreate('s1').bridgeStatus = { b1: { status: 'pending', at: Date.now() - 10 * 60 * 1000 } };
+    ctx._wj._currentSessionId = 's1';
+    ctx._wj._bridgeStatus = ctx._wj.getOrCreate('s1').bridgeStatus;
+    ctx._wj._lastHostSession = { id: 's1' };
+    const reconcile = registered.find((d) => d.name === 'wj_reconcile');
+    await reconcile.handler({});
+    assert.equal(calls, 1, '僵尸 pending 应被重试（修复前永久跳过）');
+    assert.equal(ctx._wj.getOrCreate('s1').bridgeStatus.b1.status, 'ok', '重试成功应转 ok');
+    // 新鲜 pending（in-flight）仍受保护：重置为 pending + 当前时间，reconcile 再跑不新增调用
+    ctx._wj.getOrCreate('s1').bridgeStatus.b1 = { status: 'pending', at: Date.now() };
+    await reconcile.handler({});
+    assert.equal(calls, 1, '新鲜 pending 不应被重试');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('P1-2：超 24h 的 ok 记录被清理（防 host-bridge.json 膨胀）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers, registered } = freshCtx(dir);
+    let calls = 0;
+    ctx.compaction = { compactRegion: async () => { calls += 1; return { ok: true }; } };
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 3; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 10 } });
+    }
+    // 旧 ok（25h 前）+ 新 ok（刚刚）：旧 ok 应被清理并重试，新 ok 保留
+    ctx._wj._currentSessionId = 's1';
+    ctx._wj.getOrCreate('s1').bridgeStatus = {
+      bold: { status: 'ok', at: Date.now() - 25 * 60 * 60 * 1000 },
+      bnew: { status: 'ok', at: Date.now() },
+    };
+    ctx._wj._bridgeStatus = ctx._wj.getOrCreate('s1').bridgeStatus;
+    ctx._wj._lastHostSession = { id: 's1' };
+    const reconcile = registered.find((d) => d.name === 'wj_reconcile');
+    await reconcile.handler({});
+    const st = ctx._wj.getOrCreate('s1').bridgeStatus;
+    assert.ok(!('bold' in st) || (st.bold.at ?? Date.now()) > Date.now() - 24 * 60 * 60 * 1000, '旧 ok 应被清理');
+    assert.equal(st.bnew.status, 'ok', '新 ok 应保留');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('M4.4：冷启动探针——首个事件即主动清理崩溃遗留锁（无需等桥接撞锁）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
@@ -792,7 +848,7 @@ test('M4.4：崩溃遗留锁——busy 错误触发补偿 end 解锁并重试成
     assert.ok(sigs.every((x) => x && typeof x.aborted === 'boolean'), 'signal 应透传给 compactRegion 第 4 参');
     assert.equal(appends.length, 1, '应补写恰好一个补偿事件');
     assert.equal(appends[0][0], 'compaction/end', '补偿事件类型应为 compaction/end');
-    assert.equal(ctx._wj._bridgeStatus.bl.status, 'ok', '重试成功应标记 ok');
+    assert.equal(ctx._wj.getOrCreate('default').bridgeStatus.bl.status, 'ok', '重试成功应标记 ok');
     assert.ok(ctx._wj.logs.some((l) => l.msg.includes('崩溃遗留压缩锁')), '应记录解锁日志');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -843,6 +899,62 @@ test('M4.5：bundle patch 纪律——纯 ASCII + 自带 compaction-basic 启用
   assert.ok(y.includes('id: compaction-basic'), '应自带 compaction-basic 启用');
   assert.ok(y.includes('disabled: false'), '应显式 disabled: false');
   assert.ok(y.includes('id: wanjuan-native'), '应挂载 wanjuan 本体');
+});
+
+test('v0.6.19：wj_report 接线 buildReport——月报段真实产出', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers, registered } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: 1, time: 1000,
+      data: { id: 'u1', role: 'user', content: 'x', tok: 10 } });
+    const report = registered.find((d) => d.name === 'wj_report');
+    const out = await report.handler({});
+    const text = out.content[0].text;
+    assert.ok(text.includes('万卷月报'), '应包含 buildReport 产出的月报段');
+    assert.ok(text.includes('总命中率'), '应包含命中率段（归因 M5，数值如实）');
+    assert.ok(text.includes('责任归属'), '应包含责任归属段');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.6.19：store.replay 的 degraded 不再跨次累积', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
+  try {
+    const { Store } = await import('../src/store.mjs');
+    const store = new Store({ dir });
+    const { writeFileSync: wf } = await import('node:fs');
+    wf(join(dir, 'ledger.0001.jsonl'), '{"k":"msg","id":"a"}\n{bad-line\n', 'utf8');
+    store.replay();
+    const first = store.degraded.length;
+    store.replay();
+    store.replay();
+    assert.equal(first, 1, '首次应记录 1 条坏行');
+    assert.equal(store.degraded.length, 1, `重放多次不应累积（实际 ${store.degraded.length}）`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.6.19：fingerprint 观察模式——账本活跃从宿主表面消失时告警（不驱逐）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 3; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 10 } });
+    }
+    // 模拟宿主表面：只有 seq 1 可见（u02/u03 被宿主侧压缩掉了）
+    const fakeSession = {
+      seq: 3,
+      surface: { nodes: [1] },
+      eventAt: (q) => (q === 1 ? { type: 'user/message', data: { id: 'u01' } } : undefined),
+      id: 's1',
+    };
+    eventHandlers['session/event'](fakeSession, { type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 1, reason: { kind: 'completed' } } });
+    const hit = ctx._wj.logs.find((l) => l.msg.includes('指纹观察'));
+    assert.ok(hit, '应产生指纹观察告警');
+    assert.ok(hit.msg.includes('2 条不在宿主表面'), '应指出漂移数量');
+    assert.equal(ctx._wj.getOrCreate('s1').wj.ledger.getActiveMessages().length, 3, '观察模式不驱逐，活跃集不变');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
@@ -1079,8 +1191,8 @@ test('v0.6.5：桥接超时——宿主挂死时转 failed 而非永远等待', 
     apply(ctx, { dir, shadowMode: false, bridgeTimeoutMs: 40 });
     ctx._wj.tryHostCompaction(ctx._wj._lastHostSession ?? { id: 's1' }, 1, 5, 'bt');
     await new Promise((r) => setTimeout(r, 120));
-    assert.equal(ctx._wj._bridgeStatus.bt.status, 'failed', '超时应标记 failed（瞬态，下轮重试）');
-    assert.ok(ctx._wj._bridgeStatus.bt.error.includes('桥接超时'), '错误信息应注明超时');
+    assert.equal(ctx._wj.getOrCreate('default').bridgeStatus.bt.status, 'failed', '超时应标记 failed（瞬态，下轮重试）');
+    assert.ok(ctx._wj.getOrCreate('default').bridgeStatus.bt.error.includes('桥接超时'), '错误信息应注明超时');
     assert.ok(ctx._wj.logs.some((l) => l.msg.includes('桥接超时')), '日志环应记录超时');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

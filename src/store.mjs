@@ -80,6 +80,7 @@ export class Store {
   replay() {
     const files = readdirSync(this.dir).filter((f) => SEG_RE.test(f)).sort();
     const events = [];
+    this.degraded = []; // v0.6.19：每次 replay 重置（此前坏行记录跨次累积膨胀）
     for (const f of files) {
       const text = readFileSync(join(this.dir, f), 'utf8');
       const lines = text.split('\n');
