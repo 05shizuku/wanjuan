@@ -717,13 +717,45 @@ test('M4.1：wj_report logTail 深读落盘日志', async () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('M4.1 回归：大量 mut 交织时对数压缩等价性（含幂等、最新值、重放一致）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
+  try {
+    const { Store } = await import('../src/store.mjs');
+    const { Ledger } = await import('../src/ledger.mjs');
+    const store = new Store({ dir });
+    const ledger = new Ledger({ store });
+    for (let i = 1; i <= 6; i++) ledger.recordMsg({ id: `m${i}`, at: i, tok: 10, seq: i });
+    // 活跃消息 m4 交织两次突变（取最新值）
+    ledger.recordMut({ id: 'm4', at: 100, bytes: 50, content: '第一版突变', tok: 25 });
+    ledger.recordMut({ id: 'm4', at: 200, bytes: 80, content: '第二版突变更长', tok: 40 });
+    // 折叠块内的 m1 也突变（效果应烘进 fold，不影响等价性）
+    ledger.recordMut({ id: 'm1', at: 150, bytes: 30, content: '被折叠后又改', tok: 15 });
+    ledger.recordFold({ block: 'b1', ids: ['m1', 'm2', 'm3'], range: ['m1', 'm3'], srcTok: 30, sumTok: 8, tier: 1, rawRef: 'block.b1.raw.jsonl' });
+    ledger.recordEvict({ ids: ['m5'], why: 'reconcile' });
+    const r = ledger.compactNow();
+    assert.ok(r.after < r.before, `压缩应缩减 ${r.before} → ${r.after}`);
+    // 等价性 1：活跃集正确（m4 活跃、m1-m3 已折、m5 已逐）
+    assert.deepEqual(ledger.getActiveMessages().map((m) => m.id), ['m4', 'm6']);
+    // 等价性 2：交织突变的活跃消息取最新值（内容 + tok）
+    const active4 = ledger.getActiveMessages().find((m) => m.id === 'm4');
+    assert.ok(JSON.stringify(active4.content).includes('第二版'), '应取最新突变内容');
+    assert.equal(active4.tok, 40, 'tok 应为最新突变值');
+    // 等价性 3：重放一致
+    const ledger2 = new Ledger({ store: new Store({ dir }) });
+    assert.deepEqual(ledger2.getActiveMessages().map((m) => m.id), ['m4', 'm6']);
+    const replay4 = ledger2.getActiveMessages().find((m) => m.id === 'm4');
+    assert.ok(JSON.stringify(replay4.content).includes('第二版'), '重放后突变最新值保持');
+    assert.equal(ledger2.getBlock('b1').ids.length, 3, '重放后块保持');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('M4 战役二：窗口缓存 30 分钟 TTL——宿主配置突变可被嗅探', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
     const { ctx, eventHandlers } = freshCtx(dir);
     let resolveCalls = 0;
     ctx.llm = { resolveModelInfo: async () => { resolveCalls += 1; return { context: { contextWindow: 1000000 } }; } };
-    apply(ctx, { dir, shadowMode: false });
+    apply(ctx, { dir, shadowMode: false, windowTtlMs: 50 });
     const emitUsage = () => eventHandlers['session/event']({
       type: 'assistant/message', sessionId: 's1', seq: 1, time: 1000,
       data: { message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'nvmine', model: 'glm' }, content: [] }, usage: { inputTokens: 100, cacheReadTokens: 0 } },
@@ -733,9 +765,8 @@ test('M4 战役二：窗口缓存 30 分钟 TTL——宿主配置突变可被嗅
     emitUsage();
     await new Promise((r) => setImmediate(r));
     assert.equal(resolveCalls, 1, 'TTL 内不重复解析');
-    // 人为让缓存过期（模拟 30 分钟后宿主配置突变）
-    const entry = ctx._wj._windowCache.get('nvmine/glm');
-    entry.at = Date.now() - 31 * 60 * 1000;
+    // 等真实 TTL（50ms）过期后再次投递 → 应重新解析（嗅探配置突变）
+    await new Promise((r) => setTimeout(r, 70));
     emitUsage();
     await new Promise((r) => setImmediate(r));
     assert.equal(resolveCalls, 2, 'TTL 过期后应重新解析（嗅探配置突变）');

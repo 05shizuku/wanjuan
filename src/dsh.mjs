@@ -372,8 +372,8 @@ export function apply(ctx, config = {}) {
   // 换模型即时自适应：每次真实 usage 到达时按 provider/model 异步预热缓存。
   // M3.6b 自学习：解析成功的窗口持久化到 <数据目录>/models.learned.json，
   // 下次加载合并进 estimator——别人用任何模型都零配置、自愈、无需发版。
-  // M4：窗口缓存带 30 分钟 TTL——宿主侧配置突变（改 patch 层窗口）最长 30 分钟内自动嗅探
-  const WINDOW_TTL = 30 * 60 * 1000;
+  // M4：窗口缓存 TTL（默认 30 分钟，config.windowTtlMs 可调）——宿主侧配置突变自动嗅探
+  const WINDOW_TTL = Number(config.windowTtlMs) > 0 ? Number(config.windowTtlMs) : 30 * 60 * 1000;
   const _windowCache = new Map(); // key -> { w, at }（解析失败不缓存 w，下次重试）
   const mergeLearned = (wj, provider, model, info) => {
     try {
