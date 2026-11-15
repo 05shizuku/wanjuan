@@ -221,11 +221,11 @@ export class WanjuanPlugin {
       const start = Math.min(...seqs), end = Math.max(...seqs);
       const st0 = bridgeStatus?.[b.id]?.status;
       if (st0 === 'ok') { out.push(`${b.id}: 已打通（seq ${start}→${end}），跳过`); continue; }
-      if (st0 === 'skip') { out.push(`${b.id}: 已终态（${(this._bridgeStatus[b.id].error ?? '').slice(0, 60)}），跳过`); continue; }
+      if (st0 === 'skip') { out.push(`${b.id}: 已终态（${(bridgeStatus[b.id]?.error ?? '').slice(0, 60)}），跳过`); continue; }
       if (st0 === 'pending') {
         // v0.6.16 P0-2：pending 超 3 分钟即僵尸（崩溃/挂起遗留）——按 failed 重试，不再永久跳过。
         // 同进程内 in-flight 的桥接 at 是新鲜的，仍受保护。
-        const stAt = this._bridgeStatus?.[b.id]?.at ?? 0;
+        const stAt = bridgeStatus?.[b.id]?.at ?? 0;
         if (Date.now() - stAt < 3 * 60 * 1000) { out.push(`${b.id}: 桥接进行中（${Math.round((Date.now() - stAt) / 1000)}s），跳过`); continue; }
         out.push(`${b.id}: pending 超时（僵尸），按 failed 重试`);
       }
@@ -329,7 +329,7 @@ function buildTools(plugin) {
       { logTail: { type: 'number', description: '额外读取 wanjuan.log.jsonl 尾部行数（≤200，缺省 0 只看内存日志环）' } },
       [],
       (args) => {
-        const { wj } = plugin.getOrCreate('default');
+        const wj = plugin._currentWj(); // v0.6.19：跟随当前活跃会话（与 wj_compress 一致）
         if (!wj || !wj.diagnoser || typeof wj.diagnoser.readAll !== 'function') {
           throw new Error('诊断器尚未初始化');
         }
@@ -692,8 +692,8 @@ export function apply(ctx, config = {}) {
       })
       .catch(() => '');
   };
-  // 启动时加载桥接状态（wj_reconcile 依据它跳过已打通的块）
-  try { plugin._bridgeStatus = JSON.parse(readFileSync(join(plugin.wj.blocks.dir, 'host-bridge.json'), 'utf8')); } catch { plugin._bridgeStatus = {}; }
+  // 桥接状态已在 getOrCreate 创建会话时按会话加载（v0.6.19 多会话隔离）
+
 
   ctx.on('session/event', (a0, a1) => {
     // 宿主签名：'session/event'(session, event) —— a0 是 Session 对象（有 .id），
