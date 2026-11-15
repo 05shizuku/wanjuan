@@ -231,8 +231,10 @@ export class WanjuanPlugin {
       }
       const p = this.tryHostCompaction(this._lastHostSession, start, end, b.id, this._currentSessionId ?? 'default');
       if (p) await p;
-      const st = this._bridgeStatus?.[b.id]?.status ?? '未知';
-      const err = this._bridgeStatus?.[b.id]?.error;
+      // v0.6.21 P0：读 srec.bridgeStatus（markBridge 原地修改该记录）——
+      // this._bridgeStatus 在 await 期间可能已被其他会话的事件切换覆盖
+      const st = srec.bridgeStatus?.[b.id]?.status ?? '未知';
+      const err = srec.bridgeStatus?.[b.id]?.error;
       out.push(`${b.id}: seq ${start}→${end} → ${st}${err ? '（' + err.slice(0, 90) + '）' : ''}`);
     }
     return out.length ? out.join('\n') : '没有需要补桥的块。';
@@ -711,9 +713,11 @@ export function apply(ctx, config = {}) {
         plugin._currentSessionId = sessionId;
         plugin._bridgeStatus = plugin.getOrCreate(sessionId).bridgeStatus ?? {};
       }
-      if (!plugin._recoveryKicked) {
-        // M4：重启恢复——首个会话事件即补扫历史欠账（10 分钟限流器兜底，不额外发压）
-        plugin._recoveryKicked = true;
+      // M4：重启恢复——v0.6.21 起按会话独立踢脚：每个会话的首次事件各自触发一次
+      // 冷启动扫描（A 先打开不再遮蔽 B 的遗留锁）
+      const srecEv = plugin.getOrCreate(sessionId);
+      if (!srecEv._recoveryKicked) {
+        srecEv._recoveryKicked = true;
         Promise.resolve().then(async () => {
           // M4.4 冷启动探针：此刻本进程尚无任何压缩在途，发现的未匹配 start 必为崩溃遗留，直接对账解锁
           try { await busyLockRepair(a0); } catch {}

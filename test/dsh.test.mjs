@@ -668,11 +668,17 @@ test('M4：重启恢复——首个会话事件即触发补扫（限流兜底）
   try {
     const { ctx, eventHandlers } = freshCtx(dir);
     apply(ctx, { dir, shadowMode: false });
-    assert.equal(ctx._wj._recoveryKicked, undefined, 'apply 时尚未触发');
+    assert.equal(ctx._wj.getOrCreate('s1')._recoveryKicked, undefined, 'apply 时尚未触发');
     eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: 1, time: 1000,
       data: { id: 'u1', role: 'user', content: 'hi', tok: 1 } });
     await new Promise((r) => setImmediate(r));
-    assert.equal(ctx._wj._recoveryKicked, true, '首个会话事件应踢脚恢复扫描');
+    assert.equal(ctx._wj.getOrCreate('s1')._recoveryKicked, true, '首个会话事件应踢脚恢复扫描（按会话记录）');
+    // 第二个会话独立踢脚：A 的踢脚不遮蔽 B 的遗留锁清理
+    eventHandlers['session/event']({ type: 'user/message', sessionId: 's2', seq: 2, time: 1001,
+      data: { id: 'u2', role: 'user', content: 'hi2', tok: 1 } });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(ctx._wj.getOrCreate('s2')._recoveryKicked, true, 'B 的首次事件应独立踢脚');
+    assert.equal(ctx._wj.getOrCreate('s1')._recoveryKicked, true, 'A 的踢脚状态不受影响');
     assert.ok(ctx._wj._lastAutoReconcile > 0, '自动补桥限流时间戳应更新');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
