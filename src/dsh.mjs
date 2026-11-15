@@ -693,8 +693,12 @@ export function apply(ctx, config = {}) {
             // 折出一段随机邻域，保尾 20 条完全不成立。
             const n = toFold.length;
             const summary = `【万卷引擎自动折叠】水位已达 ${(usageRatio * 100).toFixed(1)}%，最老的 ${n} 条消息已折叠为本摘要；如需原文可用 wj_decompress 恢复。`;
+            // v0.6.12：折叠前算好宿主 seq 跨度，随 fold 事件入账（审计可追溯）
+            const foldSeqs = toFold.map((m) => m.seq).filter((x) => typeof x === 'number');
+            const foldSeqSpan = foldSeqs.length ? [Math.min(...foldSeqs), Math.max(...foldSeqs)] : undefined;
             const blockId = wj.compressor.compress({
               ids: toFold.map((m) => m.id),
+              seqSpan: foldSeqSpan,
               summary,
               // 摘要自身的 token 成本（此前漏传，块元数据 sumTok 恒为 0）
               sumTok: wj.estimator.estimate({ messages: [{ bytes: Buffer.byteLength(summary), cls: 'text' }] }, { provider, model }).estRaw,

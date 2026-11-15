@@ -14,7 +14,7 @@ export class Compressor {
     return `b${this._counter}`;
   }
 
-  compress({ range, ids, summary, topics = [], tier = 1, sumTok = 0 }) {
+  compress({ range, ids, summary, topics = [], tier = 1, sumTok = 0, seqSpan }) {
     const activeMsgs = this.ledger.getActiveMessages();
 
     let toFold;
@@ -55,10 +55,12 @@ export class Compressor {
         id: blockId, tier, range, srcTok, sumTok,
         summary, topics, rawRef, createdAt: Date.now(),
         atRange,
+        ...(seqSpan ? { seqSpan } : {}),
         ...(foldIds ? { ids: foldIds } : {}),
       });
       this.ledger.recordFold({
         block: blockId, range, srcTok, sumTok, tier, rawRef, atRange,
+        ...(seqSpan ? { seqSpan } : {}),
         ...(foldIds ? { ids: foldIds } : {}),
       });
       return blockId;

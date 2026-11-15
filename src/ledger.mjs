@@ -51,6 +51,7 @@ export class Ledger {
         id: ev.block, tier: ev.tier, range: ev.range,
         srcTok: ev.srcTok, sumTok: ev.sumTok,
         rawRef: ev.rawRef, note: ev.note,
+        seqSpan: ev.seqSpan || null,       // v0.6.12：宿主侧 seq 跨度（审计可追溯）
         atRange: ev.atRange || null,       // 时间锚
         ids: ev.ids || null,               // M3：显式 id 集合（UUID 主机的 id 字典序≠时间序）
         children: undefined, promotedInto: undefined,
@@ -139,7 +140,7 @@ export class Ledger {
     return ev;
   }
 
-  recordFold({ block, ids, range, srcTok, sumTok, tier, rawRef, note, atRange }) {
+  recordFold({ block, ids, range, srcTok, sumTok, tier, rawRef, note, atRange, seqSpan }) {
     if (!rawRef) throw new InvariantError('原文可达', `fold ${block} 缺少 rawRef`);
     if (this.pendingCompress !== null && this.pendingCompress !== block) {
       throw new InvariantError('并发唯一', `已有未决 compress ${this.pendingCompress}`);
@@ -159,6 +160,7 @@ export class Ledger {
       if (found === 0) throw new InvariantError('归属唯一', `fold ${block} 的 ids 无活跃消息`);
       const ev = { k: 'fold', block, ids: [...ids], range: [ids[0], ids[ids.length - 1]],
         srcTok, sumTok, tier, rawRef,
+        ...(seqSpan ? { seqSpan } : {}),
         ...(note ? { note } : {}), ...(atRange ? { atRange } : {}) };
       this.store.append(ev);
       this._apply(ev);
@@ -233,8 +235,13 @@ export class Ledger {
     const out = [];
     for (const m of this.getActiveMessages()) out.push({ ...m });
     for (const b of this.blocks.values()) {
+      const seqs = [];
+      for (const m of this.messages.values()) {
+        if (m.status === 'folded' && m.blockId === b.id && typeof m.ev.seq === 'number') seqs.push(m.ev.seq);
+      }
+      const span = seqs.length ? [Math.min(...seqs), Math.max(...seqs)] : (b.seqSpan ?? null); // v0.6.12 审计增强
       out.push({ k: 'fold', block: b.id, tier: b.tier, range: b.range, srcTok: b.srcTok, sumTok: b.sumTok, rawRef: b.rawRef,
-        ...(b.ids ? { ids: b.ids } : {}), ...(b.atRange ? { atRange: b.atRange } : {}), ...(b.note ? { note: b.note } : {}) });
+        ...(b.ids ? { ids: b.ids } : {}), ...(span ? { seqSpan: span } : {}), ...(b.atRange ? { atRange: b.atRange } : {}), ...(b.note ? { note: b.note } : {}) });
     }
     for (const b of this.blocks.values()) {
       if (b.children && b.children.length > 0) {

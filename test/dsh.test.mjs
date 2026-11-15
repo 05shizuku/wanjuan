@@ -795,6 +795,25 @@ test('M4.4：崩溃遗留锁——busy 错误触发补偿 end 解锁并重试成
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.6.12：fold 携带 seqSpan——块保存、对数压缩延续、宿主区间可追溯', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
+  try {
+    const { Store } = await import('../src/store.mjs');
+    const { Ledger } = await import('../src/ledger.mjs');
+    const store = new Store({ dir });
+    const ledger = new Ledger({ store });
+    for (let i = 1; i <= 6; i++) ledger.recordMsg({ id: `m${i}`, at: i, tok: 10, seq: i });
+    ledger.recordFold({ block: 'b1', ids: ['m1', 'm2', 'm3'], range: ['m1', 'm3'], srcTok: 30, sumTok: 8, tier: 1, rawRef: 'block.b1.raw.jsonl', seqSpan: [1, 3] });
+    assert.deepEqual(ledger.getBlock('b1').seqSpan, [1, 3], '块应保存 seqSpan');
+    ledger.compactNow();
+    const ledger2 = new Ledger({ store: new Store({ dir }) });
+    assert.deepEqual(ledger2.getBlock('b1').seqSpan, [1, 3], '对数压缩后 seqSpan 应延续');
+    // 被折叠消息的 msg 事件虽被丢弃，宿主区间仍可从 fold.seqSpan 追溯
+    const evs = ledger2.store.replay().events.filter((e) => e.k === 'fold');
+    assert.deepEqual(evs[0].seqSpan, [1, 3], '极简流 fold 事件应携带宿主区间');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('M4.1 回归：大量 mut 交织时对数压缩等价性（含幂等、最新值、重放一致）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {
