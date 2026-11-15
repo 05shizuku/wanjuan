@@ -1000,6 +1000,24 @@ test('v0.6.21：月报折叠节省——精确压缩率与历史块全额两种�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.6.22：estimateTok 数组分支 CJK 口径——中文 ContentBlock 不再低估', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    // 宿主消息的真实形态：ContentBlock 数组。中文 2 字 → 2×1.2=2.4 → 3（修复前 n/2=1）
+    eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: 1, time: 1000,
+      data: { id: 'u1', role: 'user', content: [{ type: 'text', text: '你好' }] } });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    assert.equal(wj.ledger.messages.get('u1').ev.tok, 3, '数组分支应按 CJK 口径估算（2 字 → 3）');
+    // 工具调用块：name+arguments 按 other 0.25 计
+    eventHandlers['session/event']({ type: 'assistant/message', sessionId: 's1', seq: 2, time: 1001,
+      data: { message: { id: 'a1', role: 'assistant', content: [{ type: 'tool-call', name: 'readfile', arguments: '{"p":1}' }] } } });
+    const a1 = wj.ledger.messages.get('a1').ev;
+    assert.ok(a1.tok >= 1, 'tool-call 块应计入 tok');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {

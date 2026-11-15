@@ -31,13 +31,21 @@ function estimateTok(content) {
   }
   if (Array.isArray(content)) {
     // 宿主消息的 content 是 ContentBlock 数组（text/reasoning/tool-call…）
-    let n = 0;
+    // v0.6.22 P1：数组分支与字符串版同口径（此前 n/2 对中文低估 2-3 倍，
+    // 而宿主消息绝大多数走此分支——账本 tok 系统性偏低的真正主源）
+    let cjk = 0, other = 0;
     for (const b of content) {
       if (!b || typeof b !== 'object') continue;
-      if (typeof b.text === 'string') n += b.text.length;
-      else if (b.type === 'tool-call') n += (b.name ?? '').length + (b.arguments ?? '').length;
+      let text = '';
+      if (typeof b.text === 'string') text = b.text;
+      else if (b.type === 'tool-call') text = (b.name ?? '') + (b.arguments ?? '');
+      for (let i = 0; i < text.length; i++) {
+        const code = text.charCodeAt(i);
+        if (code >= 0x4e00 && code <= 0x9fa5) cjk++;
+        else other++;
+      }
     }
-    return Math.max(1, Math.ceil(n / 2));
+    return Math.max(1, Math.ceil(cjk * 1.2 + other * 0.25));
   }
   return 1;
 }
