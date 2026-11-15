@@ -795,6 +795,53 @@ test('M4.4：崩溃遗留锁——busy 错误触发补偿 end 解锁并重试成
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.6.14：崩溃半行隔离——追加前补 \n，新事件不陪葬', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
+  try {
+    const { Store } = await import('../src/store.mjs');
+    const { Ledger } = await import('../src/ledger.mjs');
+    const { writeFileSync: wf, readFileSync: rf } = await import('node:fs');
+    // 手工制造崩溃现场：一条完整事件 + 一条无换行符的半行 JSON
+    const seg = join(dir, 'ledger.0001.jsonl');
+    wf(seg, '{"k":"msg","id":"m1","tok":5}' + '\n' + '{"k":"msg","id":"m2","to', 'utf8');
+    const store = new Store({ dir });
+    const ledger = new Ledger({ store });
+    ledger.recordMsg({ id: 'm3', at: 3, tok: 5, seq: 3 });
+    const text = rf(seg, 'utf8');
+    const lines = text.trim().split('\n');
+    assert.equal(lines.length, 3, '半行应被隔离，新事件独立成行');
+    const state = new Ledger({ store: new Store({ dir }) });
+    const ids = state.getActiveMessages().map((m) => m.id);
+    assert.ok(ids.includes('m3'), '新事件必须存活（不与半行陪葬）');
+    assert.ok(ids.includes('m1'), '完好的历史事件不受影响');
+    assert.ok(state.store.degraded.length >= 1, '半行应被记为 degraded 并跳过（loud，不静默）');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.6.14：状态文件原子写——无 .tmp 残留，内容完整', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    ctx.compaction = { compactRegion: async () => ({ ok: true }) };
+    ctx.llm = { resolveModelInfo: async () => ({ context: { contextWindow: 1000000 } }) };
+    apply(ctx, { dir, shadowMode: false });
+    // 带 usage 的 assistant 消息：触发窗口学习落盘（models.learned.json）
+    eventHandlers['session/event']({ type: 'assistant/message', sessionId: 's1', seq: 1, time: 1000,
+      data: { message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'nvmine', model: 'glm' }, content: [] }, usage: { inputTokens: 100, cacheReadTokens: 0 } } });
+    await new Promise((r) => setImmediate(r));
+    const { existsSync: ex, readFileSync: rf } = await import('node:fs');
+    assert.ok(ex(join(dir, 'models.learned.json')), 'models.learned.json 应存在');
+    assert.ok(!ex(join(dir, 'models.learned.json.tmp')), '不应残留 .tmp');
+    JSON.parse(rf(join(dir, 'models.learned.json'), 'utf8')); // 必须是完整 JSON
+    // 桥接：markBridge 发起即写 host-bridge.json（pending）
+    ctx._wj.tryHostCompaction(ctx._wj._lastHostSession ?? { id: 's1' }, 1, 5, 'bt');
+    await new Promise((r) => setImmediate(r));
+    assert.ok(ex(join(dir, 'host-bridge.json')), 'host-bridge.json 应存在');
+    assert.ok(!ex(join(dir, 'host-bridge.json.tmp')), '不应残留 .tmp');
+    JSON.parse(rf(join(dir, 'host-bridge.json'), 'utf8')); // 必须是完整 JSON
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('v0.6.12：fold 携带 seqSpan——块保存、对数压缩延续、宿主区间可追溯', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {

@@ -1,7 +1,7 @@
 // src/store.mjs
 import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync,
-         statSync, readdirSync, renameSync } from 'node:fs';
+         statSync, readdirSync, renameSync, openSync, readSync, closeSync } from 'node:fs';
 import { join } from 'node:path';
 
 const FORBIDDEN = new Set(['__proto__', 'constructor', 'prototype']);
@@ -52,6 +52,26 @@ export class Store {
   append(ev) {
     const line = JSON.stringify(ev) + '\n';
     this._rotateIfNeeded(Buffer.byteLength(line));
+    // v0.6.14：崩溃半行隔离——强杀可能留下无换行符的半行 JSON，若直接追加，
+    // 新事件会与半行拼成一行，一坏坏俩。首次追加时检查文件尾字节，非 \n 先补一个，
+    // 把半行隔离成独立坏行（replay 的 try/catch 只丢它一条）。每实例仅查一次。
+    if (this._tailChecked === undefined) {
+      this._tailChecked = true;
+      try {
+        const cur = this._currentSegPath();
+        if (existsSync(cur)) {
+          const st = statSync(cur);
+          if (st.size > 0) {
+            const fd = openSync(cur, 'r');
+            try {
+              const buf = Buffer.alloc(1);
+              readSync(fd, buf, 0, 1, st.size - 1);
+              if (buf[0] !== 0x0A) appendFileSync(cur, '\n', 'utf8');
+            } finally { closeSync(fd); }
+          }
+        }
+      } catch {}
+    }
     appendFileSync(this._currentSegPath(), line, 'utf8');
     return ev;
   }

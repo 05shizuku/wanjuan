@@ -3,7 +3,7 @@
 //  - 不注册 ctx.on('llm/stream')。
 //  - 工具定义使用 parameters 字段。
 //  - render 签名修正为 (_args, value) => value，防止宿主把 args 误当返回值处理导致 content.some 崩溃。
-import { readFileSync, writeFileSync, appendFileSync, statSync, existsSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, statSync, existsSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 import { createWanjuan, PHILOSOPHY_KEEP_DROP } from './index.mjs';
 
@@ -397,7 +397,9 @@ export function apply(ctx, config = {}) {
         ...(typeof info?.context?.contextWindow === 'number' ? { window: info.context.contextWindow } : {}),
         ...(typeof info?.defaultMaxTokens === 'number' ? { output: info.defaultMaxTokens } : {}),
       };
-      writeFileSync(path, JSON.stringify(disk, null, 2), 'utf8');
+      const tmp = path + '.tmp';
+      writeFileSync(tmp, JSON.stringify(disk, null, 2), 'utf8');
+      renameSync(tmp, path); // 原子替换
     } catch (e) {
       plugin.pushLog('warn', `M3.6：学习窗口落盘失败：${e.message}`);
     }
@@ -460,7 +462,10 @@ export function apply(ctx, config = {}) {
       const rec = { status, at: Date.now(), ...(error ? { error: String(error).slice(0, 200) } : {}) };
       plugin._bridgeStatus = plugin._bridgeStatus ?? {};
       plugin._bridgeStatus[blockId] = rec;
-      writeFileSync(join(plugin.wj.blocks.dir, 'host-bridge.json'), JSON.stringify(plugin._bridgeStatus, null, 2), 'utf8');
+      const bridgePath = join(plugin.wj.blocks.dir, 'host-bridge.json');
+      const tmpPath = bridgePath + '.tmp';
+      writeFileSync(tmpPath, JSON.stringify(plugin._bridgeStatus, null, 2), 'utf8');
+      renameSync(tmpPath, bridgePath); // 原子替换：多进程下不会读到半截 JSON
     } catch {}
   };
       // M4.4：崩溃遗留锁修复——镜像宿主自身的失败收尾路径（补写补偿 compaction/end）。
