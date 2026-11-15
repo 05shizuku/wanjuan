@@ -1,12 +1,28 @@
 # wanjuan/dsh.bundle.patch.yml
-# M3.5 阶段：M1 观测 + M3 水位自动折叠 + M3.5 宿主 compaction 桥接。
-# 真挂点：session/event（消息面 + turn/end 水位检查）、ctx.compaction（真实上下文收缩）。
-# 注意：agent/pre-step 只有本轮 UserMessage[]；agent/request 明文禁止改 messages；
-# llm/stream 的 LOOP 请求深度冻结（reconstructability 原则）——不要尝试在瀑布里改写请求历史。
+# NOTE: English-only on purpose. PowerShell 5.1 reads UTF-8 as GBK by default;
+# a user round-tripping this file through a PS script would corrupt Chinese
+# comments. Keep this file pure ASCII.
+#
+# What this bundle does:
+#   1. Mounts the wanjuan plugin (ledger + watermark auto-fold + host bridge).
+#   2. Enables the host compaction service (compaction-basic) that wanjuan's
+#      M3.5 real-context takeover injects into. Without it wanjuan still
+#      records and folds, but the bridge waits for the service.
+#   3. Enables /compact (command-compact) as a manual knob.
+#
+# Host waterfall facts (do NOT try to rewrite request history):
+#   agent/pre-step only carries the current turn's UserMessage[];
+#   agent/request explicitly forbids mutating messages;
+#   llm/stream LOOP requests are deep-frozen (reconstructability).
 
 - insert:
     - id: wanjuan-native
       name: 'wanjuan/dsh'
       config:
         dir: '.wanjuan'
-        shadowMode: false   # false：M3 水位引擎与 M3.5 桥接生效；true 则退回影子提示
+        shadowMode: false   # false: watermark engine + bridge active; true = shadow hints only
+
+# Enable the host compaction service wanjuan depends on (override, not insert:
+# these entries already exist in the host bundle, disabled by default).
+- { id: compaction-basic, disabled: false }
+- { id: command-compact, disabled: false }

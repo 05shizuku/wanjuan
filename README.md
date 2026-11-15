@@ -80,6 +80,8 @@ flowchart TB
 - **日志环 + 落盘审计**：内存 30 条（`wj_report` 展示）+ 落盘 `wanjuan.log.jsonl`（256KB 轮转留尾 100 行），重启不丢。
 - **账本对数压缩**：等价极简流 + 旧卷归档，月度会话的启动重放延迟有界，原文可达不变式始终成立。
 - **桥接超时兜底**：宿主摘要挂死 180s（`bridgeTimeoutMs` 可调）转瞬态失败，不永久阻塞手动路径。
+- **自包含依赖**：bundle patch 自动启用宿主 `compaction-basic`（纯 ASCII patch 文件，防编码事故），安装即完整。
+- **启动环境探针**：压缩服务缺失时启动即大字报警，绝不静默待机。
 - **防弹测试**：166 个自动化测试用例（含大量失败注入），`node --test` 全绿。
 
 ## 🧩 已知未接线（预留模块）
@@ -128,7 +130,7 @@ cd wanjuan && npm test        # 预期 166 个用例全绿
 ```
 
 1. **数据目录**：`dsh.bundle.patch.yml` 已自带 `dir: .wanjuan`，通常零配置
-2. **启用宿主压缩**：patch 层加一行 `{ id: compaction-basic, disabled: false }`（缺失时万卷优雅降级为只折账本）
+2. **启用宿主压缩**：零操作——v0.6.18 起 bundle patch 自带 `compaction-basic` 启用；若你的环境仍缺失，才需在 patch 层手动加 `{ id: compaction-basic, disabled: false }`
 3. **验收**：正常聊天几轮后对模型说「调 wj_report」——看到请求遥测与日志环即接入成功；水位到线时会出现 `自动折叠完成` / `宿主原生压缩完成` 的成对日志
 4. **出问题时**：`wj_report { logTail: 100 }` 深读落盘日志，事故现场不用重启
 

@@ -319,6 +319,21 @@ export function apply(ctx, config = {}) {
   const plugin = new WanjuanPlugin({ config });
   ctx._wj = plugin;
 
+  // M4.5：启动环境探针——压缩服务缺失时大声告知，避免静默待机
+  try {
+    const hasCompaction = ctx.compaction && typeof ctx.compaction.compactRegion === 'function';
+    if (!hasCompaction) {
+      plugin.pushLog('warn', [
+        '══════════════════════════════════════════════════════════',
+        '⚠️ [万卷] 未检测到宿主 compaction 服务！',
+        '   影响：记账与折叠正常，但真实上下文接管（桥接）待机。',
+        '   解决：本 bundle 的 patch 已自动启用 compaction-basic；若仍缺失，',
+        '        请在 profile patch 层加 { id: compaction-basic, disabled: false }。',
+        '══════════════════════════════════════════════════════════',
+      ].join('\n'));
+    }
+  } catch {}
+
   // ===== M3 水位配置 =====
   const CONTEXT_WINDOW = 128000;     // 兜底窗口（模型未知时；优先用 estimator 的 est.window）
   const FORCE_FOLD_THRESHOLD = 0.95; // 强折阈值：95%

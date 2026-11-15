@@ -817,6 +817,34 @@ test('P1-A：水位分母减 output reserve——与 estimator.fits 语义对齐
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('M4.5：启动环境探针——压缩服务缺失时大字报警', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx } = freshCtx(dir); // 无 compaction
+    apply(ctx, { dir, shadowMode: false });
+    const hit = ctx._wj.logs.find((l) => l.msg.includes('未检测到宿主 compaction 服务'));
+    assert.ok(hit, '应有大字报警');
+    assert.ok(hit.msg.includes('真实上下文接管'), '报警应说明影响范围');
+    // 有 compaction 服务时不报警
+    const dir2 = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+    try {
+      const { ctx: ctx2 } = freshCtx(dir2);
+      ctx2.compaction = { compactRegion: async () => ({ ok: true }) };
+      apply(ctx2, { dir: dir2, shadowMode: false });
+      assert.ok(!ctx2._wj.logs.some((l) => l.msg.includes('未检测到宿主 compaction 服务')), '服务齐备不应报警');
+    } finally { rmSync(dir2, { recursive: true, force: true }); }
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('M4.5：bundle patch 纪律——纯 ASCII + 自带 compaction-basic 启用', async () => {
+  const { readFileSync: rf } = await import('node:fs');
+  const y = rf('dsh.bundle.patch.yml', 'utf8');
+  assert.ok(!/[^ -]/.test(y), 'patch 文件必须纯 ASCII（防 PowerShell GBK 乱码）');
+  assert.ok(y.includes('id: compaction-basic'), '应自带 compaction-basic 启用');
+  assert.ok(y.includes('disabled: false'), '应显式 disabled: false');
+  assert.ok(y.includes('id: wanjuan-native'), '应挂载 wanjuan 本体');
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {
