@@ -32,6 +32,12 @@ export function buildReport({ dir, ledger, diagnoser }) {
   lines.push(`活跃消息：${active.length} 条，共 ${tok(activeTok)} tok`);
   lines.push(`块总数：${blocks.length}（tier-1=${tiers[1]} tier-2=${tiers[2]} tier-3=${tiers[3]}）`);
   lines.push(`叶子块：${leaves.length}，srcTok=${tok(leafSrcTok)}，sumTok=${tok(leafSumTok)}`);
+  // v0.6.21：折叠节省估算（观察期核心数据）——原文本应发送的 token 减去摘要实际占用
+  if (leafSrcTok > 0) {
+    const saved = Math.max(0, leafSrcTok - leafSumTok);
+    const pctTxt = `压缩率 ${((saved / leafSrcTok) * 100).toFixed(1)}%`;
+    lines.push(`折叠节省：≈${tok(saved)} tok（${tok(leafSrcTok)} → ${tok(leafSumTok)}，${pctTxt}）`);
+  }
   return lines.join('\n');
 }
 

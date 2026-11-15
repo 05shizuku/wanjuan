@@ -179,7 +179,7 @@ export class WanjuanPlugin {
         if (m.status === 'folded' && m.blockId === newBlock.id && typeof m.ev.seq === 'number') seqs.push(m.ev.seq);
       }
       if (seqs.length > 0) {
-        const p = this.tryHostCompaction(this._lastHostSession, Math.min(...seqs), Math.max(...seqs), newBlock.id);
+        const p = this.tryHostCompaction(this._lastHostSession, Math.min(...seqs), Math.max(...seqs), newBlock.id, this._currentSessionId ?? 'default');
         if (p) await p; // 等宿主压缩完成再返回——工具结果消息必须落在压缩之后，表面稳定性才成立
       }
     }
@@ -229,7 +229,7 @@ export class WanjuanPlugin {
         if (Date.now() - stAt < 3 * 60 * 1000) { out.push(`${b.id}: 桥接进行中（${Math.round((Date.now() - stAt) / 1000)}s），跳过`); continue; }
         out.push(`${b.id}: pending 超时（僵尸），按 failed 重试`);
       }
-      const p = this.tryHostCompaction(this._lastHostSession, start, end, b.id);
+      const p = this.tryHostCompaction(this._lastHostSession, start, end, b.id, this._currentSessionId ?? 'default');
       if (p) await p;
       const st = this._bridgeStatus?.[b.id]?.status ?? '未知';
       const err = this._bridgeStatus?.[b.id]?.error;
@@ -309,7 +309,7 @@ function buildTools(plugin) {
       },
       ['blockId'],
       (args) => {
-        const { wj } = plugin.getOrCreate(args.sessionId ?? 'default');
+        const wj = plugin._currentWj(); // 模型不知道 sessionId，跟随当前活跃会话
         return wj.restorer.decompress(args.blockId, args.mode ?? 'context');
       }
     ),
@@ -319,7 +319,7 @@ function buildTools(plugin) {
       { query: { type: 'string', description: '检索词' } },
       ['query'],
       (args) => {
-        const { wj } = plugin.getOrCreate(args.sessionId ?? 'default');
+        const wj = plugin._currentWj(); // 模型不知道 sessionId，跟随当前活跃会话
         return wj.restorer.search(args.query);
       }
     ),
@@ -531,10 +531,12 @@ export function apply(ctx, config = {}) {
   // 成功后真实会话日志的那段区间被替换成一个摘要节点，模型可见、缓存责任归宿主。
   let _compactUnavailableWarned = false;
   // 桥接状态持久化（host-bridge.json）：账本已折、宿主未折的块由 wj_reconcile 补桥
-  const markBridge = (blockId, status, error) => {
+  const markBridge = (sid, blockId, status, error) => {
+    // v0.6.20：sid 由发起方锁定——异步回调完成时 _currentSessionId 可能已切换，
+    // 猜当前会话会把 A 的状态写进 B 的 host-bridge.json（竞态推演属实）
     if (!blockId || !plugin.dir) return;
     try {
-      const srec = plugin.getOrCreate(plugin._currentSessionId ?? 'default');
+      const srec = plugin.getOrCreate(sid ?? 'default');
       const rec = { status, at: Date.now(), ...(error ? { error: String(error).slice(0, 200) } : {}) };
       srec.bridgeStatus = srec.bridgeStatus ?? {};
       srec.bridgeStatus[blockId] = rec;
@@ -570,7 +572,7 @@ export function apply(ctx, config = {}) {
         }
       };
 
-  const tryHostCompaction = (session, startSeq, endSeq, blockId) => {
+  const tryHostCompaction = (session, startSeq, endSeq, blockId, sid) => {
     try {
       // inject 已声明 'compaction'，正常走属性访问；万一访问控制仍拦截，退回契约可选路径 ctx.get
       let svc = null;
@@ -591,7 +593,7 @@ export function apply(ctx, config = {}) {
       // 所以手动折叠必须等压缩完成后再返回工具结果。
       // v0.6.5：发起即标 pending——补桥扫描据此跳过 in-flight 的块，杜绝重复压缩
       // （崩溃残留的 pending 无终态标记，下轮自然重试）
-      markBridge(blockId, 'pending');
+      markBridge(sid, blockId, 'pending');
       plugin._bridgeInFlight = (plugin._bridgeInFlight ?? 0) + 1; // M4.4：在途计数（busy 锁错误区分「自因并发」vs「崩溃遗留」）
       // v0.6.3：起点拆散 tool-call/result 对时，回退到最近 user 消息（步骤起点恒为平衡边界）
       const walkToUserStart = (sess, from) => {
@@ -640,7 +642,7 @@ export function apply(ctx, config = {}) {
         return Promise.race([workP, timeoutP])
         .then((res) => {
           clearTimeout(bridgeTimer);
-          markBridge(blockId, 'ok');
+          markBridge(sid, blockId, 'ok');
           plugin.pushLog('log', `M3.5：宿主原生压缩完成（seq ${startSeq}→${endSeq}）${res ? JSON.stringify(res).slice(0, 120) : ''}`);
         })
         .catch(async (err) => {
@@ -653,7 +655,7 @@ export function apply(ctx, config = {}) {
               if (repaired) {
                 try {
                   const res = await svc.compactRegion(startSeq, endSeq, agent, ac.signal);
-                  markBridge(blockId, 'ok');
+                  markBridge(sid, blockId, 'ok');
                   plugin.pushLog('log', `M3.5：宿主原生压缩完成（遗留锁解锁后重试，seq ${startSeq}→${endSeq}）`);
                   return;
                 } catch (retryErr) {
@@ -663,10 +665,10 @@ export function apply(ctx, config = {}) {
             }
           }
           // v0.6.4 失败分类：终态不重试（自动补桥才不会每轮空耗一次 LLM 摘要）
-          if (msg.includes('not found in surface')) markBridge(blockId, 'skip', '区间已不在宿主表面（早已压缩或锚点失效），视为对齐');
-          else if (msg.includes('summary is not smaller')) markBridge(blockId, 'skip', msg);
-          else if (msg.includes('not a balanced boundary')) markBridge(blockId, 'skip', msg);
-          else markBridge(blockId, 'failed', msg);
+          if (msg.includes('not found in surface')) markBridge(sid, blockId, 'skip', '区间已不在宿主表面（早已压缩或锚点失效），视为对齐');
+          else if (msg.includes('summary is not smaller')) markBridge(sid, blockId, 'skip', msg);
+          else if (msg.includes('not a balanced boundary')) markBridge(sid, blockId, 'skip', msg);
+          else markBridge(sid, blockId, 'failed', msg);
           plugin.pushLog('warn', `M3.5：宿主压缩失败：${msg}`);
         })
         .finally(() => {
@@ -821,7 +823,7 @@ export function apply(ctx, config = {}) {
             // M3.5：账本折完，桥接宿主原生压缩，把真实会话日志的同段区间也收掉
             const seqs = toFold.map((m) => m.seq).filter((s) => typeof s === 'number');
             if (seqs.length > 0) {
-              foldBridge = tryHostCompaction(a0, Math.min(...seqs), Math.max(...seqs), blockId);
+              foldBridge = tryHostCompaction(a0, Math.min(...seqs), Math.max(...seqs), blockId, sessionId);
             }
           } catch (err) {
             plugin.pushLog('error', `自动折叠失败: ${err.message}`);

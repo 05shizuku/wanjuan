@@ -824,6 +824,25 @@ test('M4.4：冷启动探针——首个事件即主动清理崩溃遗留锁（�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.6.20：桥接竞态——完成回调写入发起时会话，不受会话切换污染', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    ctx.compaction = { compactRegion: async () => ({ ok: true }) };
+    apply(ctx, { dir, shadowMode: false });
+    // 模拟：A 发起桥接后，用户切到 B（_currentSessionId 已变）
+    const fakeSessionA = { id: 'session-A', seq: 5, eventAt: () => undefined };
+    ctx._wj._currentSessionId = 'session-B'; // 竞态现场：完成时当前会话已是 B
+    ctx._wj.tryHostCompaction(fakeSessionA, 1, 5, 'bx', 'session-A'); // 发起时锁定 sid=A
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    const statusA = ctx._wj.getOrCreate('session-A').bridgeStatus;
+    const statusB = ctx._wj.getOrCreate('session-B').bridgeStatus ?? {};
+    assert.equal(statusA.bx.status, 'ok', 'A 的块状态应写进 A 的会话记录');
+    assert.ok(!('bx' in statusB), 'B 的会话记录不应被 A 的状态污染');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('M4.4：崩溃遗留锁——busy 错误触发补偿 end 解锁并重试成功（signal 透传）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
@@ -957,6 +976,24 @@ test('v0.6.19：fingerprint 观察模式——账本活跃从宿主表面消失�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.6.21：月报折叠节省——精确压缩率与历史块全额两种形态', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
+  try {
+    const { Store } = await import('../src/store.mjs');
+    const { Ledger } = await import('../src/ledger.mjs');
+    const { buildReport } = await import('../src/report.mjs');
+    const ledger = new Ledger({ store: new Store({ dir }) });
+    for (let i = 1; i <= 3; i++) ledger.recordMsg({ id: `m${i}`, at: i, tok: 10, seq: i });
+    ledger.recordFold({ block: 'b1', ids: ['m1', 'm2'], range: ['m1', 'm2'], srcTok: 100, sumTok: 8, tier: 1, rawRef: 'block.b1.raw.jsonl' });
+    const r1 = buildReport({ dir, ledger, diagnoser: { summarize: () => ({ total: 0, hitRate: 0, coreHitRate: 0, byOwner: { host: 0, upstream: 0, wanjuan: 0, unattributed: 0 } }) } });
+    assert.ok(r1.includes('折叠节省：≈92 tok（100 → 8，压缩率 92.0%）'), '精确压缩率形态');
+    // 历史块 sumTok=0：按全额计并如实标注
+    ledger.recordFold({ block: 'b2', ids: ['m3'], range: ['m3', 'm3'], srcTok: 50, sumTok: 0, tier: 1, rawRef: 'block.b2.raw.jsonl' });
+    const r2 = buildReport({ dir, ledger, diagnoser: { summarize: () => ({ total: 0, hitRate: 0, coreHitRate: 0, byOwner: { host: 0, upstream: 0, wanjuan: 0, unattributed: 0 } }) } });
+    assert.ok(r2.includes('≈142 tok（150 → 8，压缩率 94.7%）'), '聚合节省应如实计算（150 → 8）');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {
@@ -1062,7 +1099,7 @@ test('v0.6.14：状态文件原子写——无 .tmp 残留，内容完整', asyn
     assert.ok(!ex(join(dir, 'models.learned.json.tmp')), '不应残留 .tmp');
     JSON.parse(rf(join(dir, 'models.learned.json'), 'utf8')); // 必须是完整 JSON
     // 桥接：markBridge 发起即写 host-bridge.json（pending）
-    ctx._wj.tryHostCompaction(ctx._wj._lastHostSession ?? { id: 's1' }, 1, 5, 'bt');
+    ctx._wj.tryHostCompaction(ctx._wj._lastHostSession ?? { id: 's1' }, 1, 5, 'bt', 's1');
     await new Promise((r) => setImmediate(r));
     assert.ok(ex(join(dir, 'host-bridge.json')), 'host-bridge.json 应存在');
     assert.ok(!ex(join(dir, 'host-bridge.json.tmp')), '不应残留 .tmp');
