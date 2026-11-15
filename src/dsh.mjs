@@ -130,7 +130,7 @@ export class WanjuanPlugin {
     this.wj.compressor.compress({
       ...args,
       // 手动路径也补 sumTok（此前只有自动折叠路径传了）
-      sumTok: this.wj.estimator.estimate({ messages: [{ bytes: Buffer.byteLength(args.summary ?? ''), cls: 'text' }] }, { provider: '', model: '' }).estRaw,
+      sumTok: this.wj.estimator.estimate({ messages: [{ tok: estimateTok(args.summary ?? ''), cls: 'text' }] }, { provider: '', model: '' }).estRaw, // P0-8：estimate 只读 tok，bytes 恒 0
     });
     // M3.5：手动折叠后同样桥接宿主原生压缩（1M 大窗口下自然折叠稀少，
     // 手动路径同时是 M3.5 的实时验证通路）。
@@ -706,7 +706,7 @@ export function apply(ctx, config = {}) {
               seqSpan: foldSeqSpan,
               summary,
               // 摘要自身的 token 成本（此前漏传，块元数据 sumTok 恒为 0）
-              sumTok: wj.estimator.estimate({ messages: [{ bytes: Buffer.byteLength(summary), cls: 'text' }] }, { provider, model }).estRaw,
+              sumTok: wj.estimator.estimate({ messages: [{ tok: estimateTok(summary), cls: 'text' }] }, { provider, model }).estRaw, // P0-8：estimate 只读 tok，bytes 恒 0
             });
             plugin.pushLog('log', `✅ 自动折叠完成：块 ${blockId}，账本释放 ${n} 条消息。`);
             // M3.5：账本折完，桥接宿主原生压缩，把真实会话日志的同段区间也收掉

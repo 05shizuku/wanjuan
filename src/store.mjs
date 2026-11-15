@@ -149,7 +149,9 @@ export class Store {
   compact(events) {
     const body = events.map((ev) => JSON.stringify(ev) + '\n').join('');
     writeFileSync(this._segPath(0), body, 'utf8');
-    const adir = join(this.dir, 'archive');
+    // v0.6.15 P0-6：每次压缩独立时间戳子目录——Windows renameSync 目标存在即抛
+    // EEXIST，旧方案二次压缩必现并无限失败循环；新方案重名根除，且各次归档互不混淆
+    const adir = join(this.dir, 'archive', String(Date.now()));
     if (!existsSync(adir)) mkdirSync(adir, { recursive: true });
     for (const f of readdirSync(this.dir).filter((x) => SEG_RE.test(x) && x !== 'ledger.0000.jsonl')) {
       renameSync(join(this.dir, f), join(adir, f));

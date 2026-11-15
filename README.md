@@ -11,7 +11,7 @@ flowchart TB
     A["DSH 会话事件<br/>user/message · assistant/message · tool/result"] --> B["万卷账本<br/>append-only JSONL · 突变走 mut 吸收"]
     B --> C{"turn/end 水位检查<br/>estFinal ÷ 窗口（动态解析）"}
     C -- "≥95%" --> D["自动折叠<br/>显式 ids · 保尾 20 条 · seqSpan 入档"]
-    C -- "≥80%" --> E["Nudge：点名可折区间"]
+    C -- "≥80%" --> E["提醒（日志）：点名可折区间"]
     D --> F["桥接宿主 compactRegion<br/>signal 可中止 · 超时兜底 · 崩溃锁自愈"]
     F --> G["宿主 checkpoint 摘要节点<br/>真实上下文同步收缩"]
     D --> H["补桥对账 wj_reconcile<br/>终态/瞬态分类 · 冷启动探针"]
@@ -22,10 +22,10 @@ flowchart TB
 
 在长上下文场景中，最大的噩梦不是「截断」，而是「缓存全灭」。万卷直面宿主环境的泥泞：
 
-- **拒绝背锅（责任隔离）**：宿主每轮重写 persona 导致缓存失效？万卷的请求遥测带 `missKind` 归因分类（宿主违约 / 上游盲区 / 自身缺陷各归其位），责任边界可审计。
+- **拒绝背锅（责任隔离）**：请求遥测带 `missKind` 归因框架（`overrideMissKind` 注入口已预留）；当前版本如实产出 `new / unattributed`，完整归因 M5 交付，不虚报命中率。
 - **自我愈合（锚点吸收）**：宿主偷偷改了历史？万卷不在历史中重写，而是追加 `mut` 事件吸收突变，让账本真正收敛，告别死循环。
 - **绝对容错（断电保护）**：写到一半断电导致账本坏行？跳过坏行并大声告警；下次追加前自动隔离崩溃半行（补换行符），新事件绝不陪葬。状态文件（桥接状态/自学习窗口）原子写，多进程下不读半截。
-- **并发安全（目录隔离）**：多窗口同时聊天？按 Session ID 严格隔离账本，互不干涉。
+- **聚合账本（单库多会话）**：多窗口的会话事件汇入同一账本（按宿主 seq 记录日志位次），进程内单线程串行追加无写冲突；跨进程隔离依赖 profile 隔离。
 
 ## 🏗 里程碑（M1 → M4.4）
 
@@ -80,7 +80,22 @@ flowchart TB
 - **日志环 + 落盘审计**：内存 30 条（`wj_report` 展示）+ 落盘 `wanjuan.log.jsonl`（256KB 轮转留尾 100 行），重启不丢。
 - **账本对数压缩**：等价极简流 + 旧卷归档，月度会话的启动重放延迟有界，原文可达不变式始终成立。
 - **桥接超时兜底**：宿主摘要挂死 180s（`bridgeTimeoutMs` 可调）转瞬态失败，不永久阻塞手动路径。
-- **防弹测试**：162 个自动化测试用例（含大量失败注入），`node --test` 全绿。
+- **防弹测试**：166 个自动化测试用例（含大量失败注入），`node --test` 全绿。
+
+## 🧩 已知未接线（预留模块）
+
+以下模块代码在库内、有测试保护，但尚未接入生产路径（DESIGN 规划的 L2 决策层与 L0 遥测，实现覆盖约六成）：
+
+| 模块 | 现状 | 计划 |
+|---|---|---|
+| `fingerprint` | 有测试（15 项）、未接线 | M2 对账：账本 vs 宿主投影指纹核对 |
+| `gate` | 有测试（2 项）、未接线 | L2 决策层；阈值与 dsh 内联值（0.80/0.95）对齐后接入 |
+| `nudge`（NudgeManager 类） | 有测试（10 项）、未接线 | 80% 提醒现由日志实现（点名区间），类接入后更结构化 |
+| `report.buildReport` | 有测试（5 项）、未接线 | 月报聚合；`wj_report` 现为轻量实时报告 |
+| `Observer` | 有测试（7 项）、未接线 | 与 Diagnoser 两套遥测待合并 |
+| `snapshot.json` | 接口预留 | M4.3 摊销压缩已以更简方式覆盖 |
+
+`classifyMiss` 归因分类当前只产出 `new / unattributed`（`overrideMissKind` 注入口已预留），完整归因 **M5 交付**。
 
 ## 📁 数据文件一览
 
@@ -99,7 +114,7 @@ flowchart TB
 ```bash
 # 获取代码并自检
 git clone https://github.com/05shizuku/wanjuan.git
-cd wanjuan && npm test        # 预期 162 个用例全绿
+cd wanjuan && npm test        # 预期 166 个用例全绿
 
 # 挂进 DSH profile（junction/软链到 profile 的 node_modules）
 # Windows: mklink /J "<profile>\node_modules\wanjuan" "<本仓库>"

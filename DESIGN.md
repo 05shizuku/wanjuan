@@ -1,5 +1,7 @@
 # 万卷（wanjuan）设计文档 v0.2.1
 
+> **状态注记（2026-11-15，v0.6.15）**：本文是设计意图稿，实现覆盖约六成——事件溯源账本、折叠/恢复、估算、M3.5 宿主接管与 M4 自愈已落地并有测试；L2 决策层（gate/nudge）、L0 遥测（Observer/fingerprint）、月报（buildReport）为预留未接线模块，详见 README「已知未接线」。
+
 **Amikar设计的一个上下文压缩管理器。**
 日期：2026-11-13 · 状态：设计稿 v0.2.1 · 目标宿主：DeepSeek Harness（DSH desktop/next）
 

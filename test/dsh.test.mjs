@@ -695,7 +695,9 @@ test('M4.1：账本对数压缩——等价极简流 + 旧卷归档 + 重放一�
     const { existsSync: ex, readdirSync: rd } = await import('node:fs');
     assert.ok(ex(join(dir, 'ledger.0000.jsonl')), '压缩流应写为 0000 卷');
     assert.ok(ex(join(dir, 'archive')), '旧卷应归档');
-    assert.ok(rd(join(dir, 'archive')).some((f) => f.startsWith('ledger.')), '归档里应有旧账本卷');
+    const arcDirs = rd(join(dir, 'archive'));
+    assert.ok(arcDirs.length >= 1, 'archive 应有按时间戳的归档子目录');
+    assert.ok(rd(join(dir, 'archive', arcDirs[0])).some((f) => f.startsWith('ledger.')), '归档子目录内应有旧账本卷');
     const ledger2 = new Ledger({ store: new Store({ dir }) });
     assert.deepEqual(ledger2.getActiveMessages().map((m) => m.id), ['m6', 'm7', 'm8'], '重放后活跃集一致');
     assert.equal(ledger2.getBlock('b1').id, 'b1', '重放后块一致');
@@ -792,6 +794,72 @@ test('M4.4：崩溃遗留锁——busy 错误触发补偿 end 解锁并重试成
     assert.equal(appends[0][0], 'compaction/end', '补偿事件类型应为 compaction/end');
     assert.equal(ctx._wj._bridgeStatus.bl.status, 'ok', '重试成功应标记 ok');
     assert.ok(ctx._wj.logs.some((l) => l.msg.includes('崩溃遗留压缩锁')), '应记录解锁日志');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('P0-5：已折叠消息重投递不再污染日志', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
+  try {
+    const { Store } = await import('../src/store.mjs');
+    const { Ledger } = await import('../src/ledger.mjs');
+    const ledger = new Ledger({ store: new Store({ dir }) });
+    for (let i = 1; i <= 3; i++) ledger.recordMsg({ id: `m${i}`, at: i, tok: 10, seq: i });
+    ledger.recordFold({ block: 'b1', ids: ['m1', 'm2'], range: ['m1', 'm2'], srcTok: 20, sumTok: 5, tier: 1, rawRef: 'block.b1.raw.jsonl' });
+    const before = ledger.store.replay().events.length;
+    // 宿主重投递一条已折叠消息：P0-5 修复前会重复 append 污染日志
+    ledger.recordMsg({ id: 'm1', at: 999, tok: 99, seq: 999 });
+    assert.equal(ledger.store.replay().events.length, before, '重投递不应追加事件');
+    assert.deepEqual(ledger.getActiveMessages().map((m) => m.id), ['m3'], '活跃集不变');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('P0-6：Windows 二次对数压缩不再 EEXIST（时间戳归档子目录）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
+  try {
+    const { Store } = await import('../src/store.mjs');
+    const { Ledger } = await import('../src/ledger.mjs');
+    const ledger = new Ledger({ store: new Store({ dir }) });
+    for (let i = 1; i <= 4; i++) ledger.recordMsg({ id: `m${i}`, at: i, tok: 10, seq: i });
+    ledger.compactNow();
+    // 二次压缩前又有新追加 → dir 下出现新的 ledger.0001+，旧方案 Windows 必现 EEXIST
+    ledger.recordMsg({ id: 'm9', at: 9, tok: 10, seq: 9 });
+    ledger.compactNow();
+    const { readdirSync: rd, existsSync: ex } = await import('node:fs');
+    const arc = rd(join(dir, 'archive'));
+    assert.ok(arc.length >= 2, '两次压缩应产生两个时间戳归档子目录');
+    assert.ok(ex(join(dir, 'ledger.0000.jsonl')), '压缩流正常');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('P0-7：ids 路径 fold 的 unfold 精确展开（乱序 ids 不再静默空转）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
+  try {
+    const { Store } = await import('../src/store.mjs');
+    const { Ledger } = await import('../src/ledger.mjs');
+    const ledger = new Ledger({ store: new Store({ dir }) });
+    for (let i = 1; i <= 4; i++) ledger.recordMsg({ id: `m${i}`, at: i, tok: 10, seq: i });
+    // 乱序 ids（UUID 主机常态）：range 端点 [m3, m1] 字典序倒挂
+    ledger.recordFold({ block: 'b1', ids: ['m3', 'm1', 'm2'], range: ['m3', 'm1'], srcTok: 30, sumTok: 8, tier: 1, rawRef: 'block.b1.raw.jsonl' });
+    assert.deepEqual(ledger.getActiveMessages().map((m) => m.id), ['m4'], '折叠生效');
+    ledger.recordUnfold({ block: 'b1', why: 'context' });
+    assert.deepEqual(ledger.getActiveMessages().map((m) => m.id), ['m1', 'm2', 'm3', 'm4'], 'unfold 应精确展开全部块内消息（修复前静默空转）');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('P0-8：手动折叠 sumTok 生产路径非零（estimate 只读 tok）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 4; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `消息${i}`.repeat(30), tok: 10 } });
+    }
+    const compress = (await import('../src/dsh.mjs'), ctx);
+    await ctx._wj._toolCompress({ ids: ['u01', 'u02', 'u03'], summary: '一段足够长的摘要文本用来验证 sumTok 估算非零，长度必须超过两个字符。' });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    const meta = JSON.parse((await import('node:fs')).readFileSync(join(dir, 'block.b1.json'), 'utf8'));
+    assert.ok(meta.sumTok > 0, `sumTok 应非零（实际 ${meta.sumTok}，修复前恒 0）`);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

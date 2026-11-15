@@ -84,11 +84,23 @@ export class Ledger {
     } else if (ev.k === 'unfold') {
       const b = this.blocks.get(ev.block);
       if (b) {
-        const [start, end] = b.range;
-        for (const [id, m] of this.messages) {
-          if (id >= start && id <= end && m.status === 'folded' && m.blockId === ev.block) {
-            m.status = 'active';
-            m.blockId = undefined;
+        if (Array.isArray(b.ids)) {
+          // v0.6.15 P0-7：ids 精确展开——ids 路径 fold 的 range 端点未按字典序排序，
+          // 旧区间扫描会静默空转（start > end 匹配为零），与 fold 的 ids 语义对称
+          for (const id of b.ids) {
+            const m = this.messages.get(id);
+            if (m && m.status === 'folded' && m.blockId === ev.block) {
+              m.status = 'active';
+              m.blockId = undefined;
+            }
+          }
+        } else {
+          const [start, end] = b.range;
+          for (const [id, m] of this.messages) {
+            if (id >= start && id <= end && m.status === 'folded' && m.blockId === ev.block) {
+              m.status = 'active';
+              m.blockId = undefined;
+            }
           }
         }
         this.blocks.delete(ev.block);
@@ -122,7 +134,8 @@ export class Ledger {
 
   recordMsg({ id, at = 0, bytes = 0, tok = 0, cls = 'text', gen = 0, content, seq }) {
     const existing = this.messages.get(id);
-    if (existing && existing.status === 'active') return existing.ev;
+    // v0.6.15 P0-5：已存在（含已折叠/已驱逐）一律不再落事件——宿主重投递不污染日志
+    if (existing) return existing.ev;
     const ev = { k: 'msg', id, at, bytes, tok, cls, gen };
     if (content !== undefined) ev.content = content;
     if (seq !== undefined) ev.seq = seq;  // M3.5：宿主会话日志序号，用于 compactRegion 区间映射
