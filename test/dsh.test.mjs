@@ -717,6 +717,50 @@ test('M4.1：wj_report logTail 深读落盘日志', async () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('M4 战役二：窗口缓存 30 分钟 TTL——宿主配置突变可被嗅探', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    let resolveCalls = 0;
+    ctx.llm = { resolveModelInfo: async () => { resolveCalls += 1; return { context: { contextWindow: 1000000 } }; } };
+    apply(ctx, { dir, shadowMode: false });
+    const emitUsage = () => eventHandlers['session/event']({
+      type: 'assistant/message', sessionId: 's1', seq: 1, time: 1000,
+      data: { message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'nvmine', model: 'glm' }, content: [] }, usage: { inputTokens: 100, cacheReadTokens: 0 } },
+    });
+    emitUsage();
+    await new Promise((r) => setImmediate(r));
+    emitUsage();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(resolveCalls, 1, 'TTL 内不重复解析');
+    // 人为让缓存过期（模拟 30 分钟后宿主配置突变）
+    const entry = ctx._wj._windowCache.get('nvmine/glm');
+    entry.at = Date.now() - 31 * 60 * 1000;
+    emitUsage();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(resolveCalls, 2, 'TTL 过期后应重新解析（嗅探配置突变）');
+    assert.equal(ctx._wj._windowCache.get('nvmine/glm').w, 1000000, '刷新后窗口更新');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('M4 战役三：compactionThreshold 可配——超阈值重启即压缩', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
+  try {
+    const { Store } = await import('../src/store.mjs');
+    const { Ledger } = await import('../src/ledger.mjs');
+    const store1 = new Store({ dir });
+    const ledger1 = new Ledger({ store: store1, compactionThreshold: 5 });
+    for (let i = 1; i <= 8; i++) ledger1.recordMsg({ id: `m${i}`, at: i, tok: 10, seq: i });
+    ledger1.recordFold({ block: 'b1', ids: ['m1', 'm2'], range: ['m1', 'm2'], srcTok: 20, sumTok: 5, tier: 1, rawRef: 'block.b1.raw.jsonl' });
+    // 重启（新 Ledger 实例，阈值 5 < 9 事件）→ 构造期自动压缩
+    const ledger2 = new Ledger({ store: new Store({ dir }), compactionThreshold: 5 });
+    const { existsSync: ex } = await import('node:fs');
+    assert.ok(ex(join(dir, 'ledger.0000.jsonl')), '超阈值重启应触发对数压缩');
+    assert.ok(ledger2._lastReplayEventCount <= 7, `重放事件数应有界（实际 ${ledger2._lastReplayEventCount}）`);
+    assert.deepEqual(ledger2.getActiveMessages().map((m) => m.id), ['m3', 'm4', 'm5', 'm6', 'm7', 'm8'], '活跃集保持');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('v0.6.5：requests.jsonl 超 5MB 轮转保留尾 2000 行', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {

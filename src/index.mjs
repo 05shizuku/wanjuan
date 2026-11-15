@@ -43,11 +43,12 @@ export function createWanjuan({
   sampleEvery,
   gateOptions,
   nudgeOptions,
+  compactionThreshold,
 } = {}) {
   if (!dir) throw new Error('createWanjuan: dir 必填');
   
   const store = new Store({ dir, snapshotBudget, segBytes });
-  const ledger = new Ledger({ store });
+  const ledger = new Ledger({ store, compactionThreshold });
   const estimator = new Estimator({ models });
   const observer = new Observer({ estimator });
   const fingerprinter = new Fingerprinter({ ledger, sampleEvery });

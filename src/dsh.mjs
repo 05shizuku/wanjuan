@@ -82,7 +82,7 @@ export class WanjuanPlugin {
     this.shadowMode = !!config.shadowMode;
     this.logToFile = config.logToFile !== false; // v0.6.4：日志默认落盘（256KB 轮转），便于事后审计
     this._sessions = new Map();
-    this.wj = config.dir ? createWanjuan({ dir: config.dir }) : null;
+    this.wj = config.dir ? createWanjuan({ dir: config.dir, compactionThreshold: config.compactionThreshold }) : null;
     // 日志环：Electron 主进程的 console 在 Windows 双击启动时不可见，
     // 文件日志也不收插件的 console 输出——所以内存留一份最近 30 条，wj_report 展示。
     this.logs = [];
@@ -116,7 +116,7 @@ export class WanjuanPlugin {
 
   getOrCreate(sessionId) {
     if (!this._sessions.has(sessionId)) {
-      const wj = this.wj ?? createWanjuan({ dir: this.dir });
+      const wj = this.wj ?? createWanjuan({ dir: this.dir, compactionThreshold: this.config?.compactionThreshold });
       this._sessions.set(sessionId, { wj });
     }
     return this._sessions.get(sessionId);
@@ -372,7 +372,9 @@ export function apply(ctx, config = {}) {
   // 换模型即时自适应：每次真实 usage 到达时按 provider/model 异步预热缓存。
   // M3.6b 自学习：解析成功的窗口持久化到 <数据目录>/models.learned.json，
   // 下次加载合并进 estimator——别人用任何模型都零配置、自愈、无需发版。
-  const _windowCache = new Map(); // 'provider/model' -> number（解析失败不缓存，下次重试）
+  // M4：窗口缓存带 30 分钟 TTL——宿主侧配置突变（改 patch 层窗口）最长 30 分钟内自动嗅探
+  const WINDOW_TTL = 30 * 60 * 1000;
+  const _windowCache = new Map(); // key -> { w, at }（解析失败不缓存 w，下次重试）
   const mergeLearned = (wj, provider, model, info) => {
     try {
       const models = wj.estimator.models;
@@ -412,8 +414,10 @@ export function apply(ctx, config = {}) {
   const warmupModelWindow = (wj, provider, model) => {
     if (!provider) return;
     const key = `${provider}/${model ?? ''}`;
-    if (_windowCache.has(key)) return;
-    _windowCache.set(key, NaN); // 占位防并发重复解析
+    const cached = _windowCache.get(key);
+    if (cached && Date.now() - cached.at < WINDOW_TTL) return; // 新鲜缓存或 in-flight 占位
+    const staleW = cached && Number.isFinite(cached.w) ? cached.w : NaN; // 刷新期间沿用旧值，水位不抖动
+    _windowCache.set(key, { w: staleW, at: Date.now() });
     try {
       const llm = ctx.llm;
       if (!llm || typeof llm.resolveModelInfo !== 'function') {
@@ -425,7 +429,7 @@ export function apply(ctx, config = {}) {
         .then((info) => {
           const w = info?.context?.contextWindow;
           if (typeof w === 'number' && w > 0) {
-            _windowCache.set(key, w);
+            _windowCache.set(key, { w, at: Date.now() });
             if (wj) { mergeLearned(wj, provider, model ?? '', info); persistLearned(wj, provider, model ?? '', info); }
             plugin.pushLog('log', `M3.6：模型窗口已解析 ${key} = ${w}`);
           } else {
@@ -548,6 +552,7 @@ export function apply(ctx, config = {}) {
     }
   };
   plugin.tryHostCompaction = tryHostCompaction; // 手动折叠路径复用同一桥接
+  plugin._windowCache = _windowCache; // 测试与诊断挂钩
   // v0.6.4：自动补桥（10 分钟限流）。turn/end 时排队执行；候选只含未达终态的块。
   plugin._autoReconcile = () => {
     const now = Date.now();
@@ -613,7 +618,8 @@ export function apply(ctx, config = {}) {
 
         const est = wj.estimator.estimate({ messages: byTime }, { provider, model });
         // M3.6：窗口三级取值——宿主注册表（动态预热缓存）→ models.json → 128K 兜底
-        const hostWindow = _windowCache.get(`${provider}/${model ?? ''}`);
+        const wEntry = _windowCache.get(`${provider}/${model ?? ''}`);
+        const hostWindow = wEntry && Number.isFinite(wEntry.w) ? wEntry.w : undefined;
         const window = (typeof hostWindow === 'number' && hostWindow > 0)
           ? hostWindow
           : (est.window && est.window > 0 ? est.window : CONTEXT_WINDOW);

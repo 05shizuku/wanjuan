@@ -9,7 +9,8 @@ export class InvariantError extends Error {
 }
 
 export class Ledger {
-  constructor({ store }) {
+  constructor({ store, compactionThreshold = COMPACTION_THRESHOLD }) {
+    this._compactionThreshold = compactionThreshold; // M4：阈值可配（不同会话规模自选）
     this.store = store;
     this.messages = new Map();
     this.blocks = new Map();
@@ -17,7 +18,7 @@ export class Ledger {
     this.degraded = [];
     this._replay();
     // M4.1：账本自压缩——事件超阈值时生成等价极简流并归档旧卷（重放延迟有界）
-    if (this._lastReplayEventCount > COMPACTION_THRESHOLD) {
+    if (this._lastReplayEventCount > this._compactionThreshold) {
       try { this.compactNow(); } catch { this._degrade('compact-fail'); }
     }
   }
