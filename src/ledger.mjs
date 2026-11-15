@@ -16,6 +16,13 @@ export class Ledger {
     this.blocks = new Map();
     this.pendingCompress = null;
     this.degraded = [];
+    // M4.3：运行期追加计数——turn/end 跨阈值时摊销式压缩，启动永不重压大账本
+    this._appendsSinceCompact = 0;
+    const rawAppend = this.store.append.bind(this.store);
+    this.store.append = (ev) => {
+      this._appendsSinceCompact += 1;
+      return rawAppend(ev);
+    };
     this._replay();
     // M4.1：账本自压缩——事件超阈值时生成等价极简流并归档旧卷（重放延迟有界）
     if (this._lastReplayEventCount > this._compactionThreshold) {
@@ -246,6 +253,7 @@ export class Ledger {
     this.blocks.clear();
     this.degraded.length = 0;
     this._replay();
+    this._appendsSinceCompact = 0;
     return { before, after: events.length };
   }
 

@@ -604,6 +604,15 @@ export function apply(ctx, config = {}) {
         // ==========================================
         if (plugin.shadowMode || !wj.estimator || typeof wj.estimator.estimate !== 'function') return;
 
+        // M4.3：追加事件跨阈值 → 运行期摊销对数压缩（0000 卷即检查点，启动永不重压大账本）。
+        // 放在水位早退之前：少量消息的 turn/end 也要能触发归并。
+        try {
+          if (wj.ledger._appendsSinceCompact > (wj.ledger._compactionThreshold ?? 5000)) {
+            plugin.pushLog('log', `账本自压缩：${wj.ledger._appendsSinceCompact} 个事件归并为等价极简流`);
+            wj.ledger.compactNow();
+          }
+        } catch {}
+
         // 注意：Estimator 没有 estRaw 方法（那是 estimate() 返回值的字段）；
         // 且宿主消息 id 是 UUID，字典序≠时间序（2026-11-14 实测），必须按 at 排出真实时间序。
         const activeMsgs = wj.ledger.getActiveMessages();

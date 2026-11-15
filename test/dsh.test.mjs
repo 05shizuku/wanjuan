@@ -717,6 +717,26 @@ test('M4.1：wj_report logTail 深读落盘日志', async () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('M4.3：运行期摊销压缩——turn/end 跨阈值即归并，计数复位', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false, compactionThreshold: 3 });
+    for (let i = 1; i <= 5; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 10 } });
+    }
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    assert.ok(wj.ledger._appendsSinceCompact >= 5, `追加计数应累计（实际 ${wj.ledger._appendsSinceCompact}）`);
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 1, reason: { kind: 'completed' } } });
+    assert.equal(wj.ledger._appendsSinceCompact, 0, '跨阈值压缩后计数应复位');
+    const { existsSync: ex } = await import('node:fs');
+    assert.ok(ex(join(dir, 'ledger.0000.jsonl')), '运行期应写出 0000 检查点卷');
+    assert.deepEqual(wj.ledger.getActiveMessages().map((m) => m.id), ['u01', 'u02', 'u03', 'u04', 'u05'], '运行期压缩后活跃集不变');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('账本自压缩')), '应记录自压缩日志');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('M4.1 回归：大量 mut 交织时对数压缩等价性（含幂等、最新值、重放一致）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {
