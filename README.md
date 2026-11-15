@@ -6,11 +6,11 @@
 
 **万卷** 是一个为 LLM 宿主（如 DeepSeek Harness）设计的**上下文压缩内核**。纯原生 Node.js ESM（>= 20），零第三方依赖，以事件溯源（Event Sourcing）与「前缀纪律」为根基，解决长对话场景下的窗口爆炸与 KV 缓存失效问题。
 
-**万卷是一套自运转系统**：折叠自动、桥接自动、补桥自动、校准自动、学习自动、恢复自动、突变吸收自动、崩溃自愈自动——你正常聊天，它自己工作。
+**万卷是一套自运转系统**：折叠自动、桥接自动、补桥自动、校准自动、学习自动、恢复自动、突变吸收自动、崩溃自愈自动、多会话自动隔离、账本自动压缩——你正常聊天，它自己工作。
 
 ```mermaid
 flowchart TB
-    A["DSH 会话事件<br/>user/message · assistant/message · tool/result"] --> B["万卷账本<br/>append-only JSONL · 突变走 mut 吸收"]
+    A["DSH 会话事件（多窗口）<br/>user/message · assistant/message · tool/result"] --> B["每会话独立账本<br/>append-only JSONL · 突变走 mut 吸收"]
     B --> C{"turn/end 水位检查<br/>estFinal ÷ 窗口（动态解析）"}
     C -- "≥95%" --> D["自动折叠<br/>显式 ids · 保尾 20 条 · seqSpan 入档"]
     C -- "≥80%" --> E["提醒（日志）：点名可折区间"]
@@ -36,6 +36,7 @@ flowchart TB
 | **M1–M3 观测与折叠** | 全词汇入账 + 四工具 + 两段式水位引擎（80% 点名区间提醒 / 95% 自动折叠保尾 20 条，UUID 主机走显式 ids） |
 | **M3.5–M3.9 真实接管** | 桥接宿主 `compactRegion`（五层真机契约）+ 动态窗口与自学习 + 校准入档 + 自动补桥（终态/瞬态分类）+ 日志落盘审计 |
 | **M4 自愈** | 重启恢复 · `mut` 突变吸收 · 摊销对数压缩（启动重放有界）· 突变嗅探（TTL）· 崩溃遗留锁自愈（冷启动主动探针 + busy 反应式双通道）· `signal` 信号中止 |
+| **M4.5+ 多会话与精度** | 多会话隔离（每会话独立账本目录，首会话收编旧账本升级无感）· `estimateTok` CJK 口径（字符串/ContentBlock 数组同源，中文不再低估 2-3 倍）· bundle 自带 `compaction-basic` 启用（纯 ASCII patch）· 启动环境探针 · 折叠节省估算 |
 
 ### M3 的两个关键修正
 
