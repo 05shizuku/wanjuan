@@ -97,6 +97,13 @@ flowchart TB
 
 `classifyMiss` 归因分类当前只产出 `new / unattributed`（`overrideMissKind` 注入口已预留），完整归因 **M5 交付**。
 
+## ⚠️ 已知局限（如实披露）
+
+- **消息入账 tok 为粗估**：`estimateTok` 用「字符数 ÷ 2」，中文会话下账本 tok 系统性低估（约 2 倍）；k̂ 校准会部分吸收，但中文/英文混合会话的水位仍有偏差。口径统一（精细 CJK 估算 + 入账走 estimator）计划于 **v0.7**。
+- **归因分类未完成**：`missKind` 当前只产出 `new / unattributed`，完整归因 M5 交付。
+- **output reserve 与窗口不同源**：窗口动态解析自宿主注册表，output 来自 models.json/学习文件（未知模型兜底 8192）——大窗口下 reserve 偏保守（折叠偏早方向，安全）。
+- **多会话共享单账本**：多窗口事件汇入同一账本；跨进程/会话强隔离未实现。
+
 ## 📁 数据文件一览
 
 | 文件 | 内容 | 增长策略 |

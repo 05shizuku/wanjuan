@@ -687,7 +687,11 @@ export function apply(ctx, config = {}) {
           ? hostWindow
           : (est.window && est.window > 0 ? est.window : CONTEXT_WINDOW);
         // 用 estFinal（k̂ 校准 + 5% 偏置）做水位，比 estRaw 更保守
-        const usageRatio = est.estFinal / window;
+        // P1-A：分母减去 output reserve，与 estimator.fits 语义对齐（否则折叠偏晚约 output×0.95）
+        // 已知边界：est.output 与 window 不同源（output 静态来自 models.json/学习文件，window 动态解析自宿主注册表）——
+        // 未知模型 output 兜底 8192，对大窗口偏保守（折叠偏早方向，安全）
+        const usable = Math.max(1, window - (est.output ?? 0));
+        const usageRatio = est.estFinal / usable;
         let foldBridge = null; // 本轮折叠的宿主桥接 promise（供自动补桥排队）
 
         if (usageRatio >= FORCE_FOLD_THRESHOLD) {

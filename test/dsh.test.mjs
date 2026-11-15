@@ -797,6 +797,26 @@ test('M4.4：崩溃遗留锁——busy 错误触发补偿 end 解锁并重试成
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('P1-A：水位分母减 output reserve——与 estimator.fits 语义对齐', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    // deepseek-chat：window 200000 / output 8192 / khatPrior 0.97 → usable 191808，95% 线 = 182218
+    // 30 × 6100 tok → estRaw 183000，estFinal = ceil(183000×0.97×1.05) = 186386：
+    // usage 180000 → k̂ ≈ 0.974 → estFinal ≈ 187116：旧口径 93.6%（不折），新口径 97.6%（折叠）
+    for (let i = 1; i <= 30; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 6100 } });
+    }
+    eventHandlers['session/event']({ type: 'assistant/message', sessionId: 's1', seq: 31, time: 2000,
+      data: { message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' }, content: [] }, usage: { inputTokens: 180000, cacheReadTokens: 0 } } }); // usage 需符合场景量级（≈整段上下文），否则 k̂ 被拉崩
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 1, reason: { kind: 'completed' } } });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    assert.equal(wj.ledger.blocks.size, 1, 'output reserve 计入后应在 95% 线正确折叠');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {
