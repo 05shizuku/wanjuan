@@ -463,6 +463,32 @@ export function apply(ctx, config = {}) {
       writeFileSync(join(plugin.wj.blocks.dir, 'host-bridge.json'), JSON.stringify(plugin._bridgeStatus, null, 2), 'utf8');
     } catch {}
   };
+      // M4.4：崩溃遗留锁修复——镜像宿主自身的失败收尾路径（补写补偿 compaction/end）。
+      // 宿主锁语义：未匹配 start 阻塞一切压缩入口；其自愈依赖 session/end-seed，
+      // 崩溃后若不产生 end-seed 则锁到会话终止——这里主动对账解锁。
+      const busyLockRepair = async (sess) => {
+        try {
+          if (!sess || typeof sess.append !== 'function' || typeof sess.eventAt !== 'function') return false;
+          let unmatched = null;
+          for (let q = Number(sess.seq) - 1; q >= 0; q -= 1) {
+            const ev = sess.eventAt(q);
+            if (!ev) continue;
+            if (ev.type === 'compaction/start') { unmatched = ev; break; }
+            if (ev.type === 'compaction/end') break;
+          }
+          if (!unmatched) return false;
+          sess.append('compaction/end', {
+            ...(unmatched.data ?? {}),
+            error: { message: 'wanjuan crash-recovery: compensating end for unmatched compaction/start' },
+          });
+          plugin.pushLog('warn', `M4.4：检测到崩溃遗留压缩锁（seq ${unmatched.seq}），已补写补偿 end 解锁`);
+          return true;
+        } catch (e) {
+          plugin.pushLog('warn', `M4.4：遗留锁修复失败：${e.message}`);
+          return false;
+        }
+      };
+
   const tryHostCompaction = (session, startSeq, endSeq, blockId) => {
     try {
       // inject 已声明 'compaction'，正常走属性访问；万一访问控制仍拦截，退回契约可选路径 ctx.get
@@ -499,31 +525,6 @@ export function apply(ctx, config = {}) {
           }
         } catch {}
         return null;
-      };
-      // M4.4：崩溃遗留锁修复——镜像宿主自身的失败收尾路径（补写补偿 compaction/end）。
-      // 宿主锁语义：未匹配 start 阻塞一切压缩入口；其自愈依赖 session/end-seed，
-      // 崩溃后若不产生 end-seed 则锁到会话终止——这里主动对账解锁。
-      const busyLockRepair = async () => {
-        try {
-          if (!session || typeof session.append !== 'function' || typeof session.eventAt !== 'function') return false;
-          let unmatched = null;
-          for (let q = Number(session.seq) - 1; q >= 0; q -= 1) {
-            const ev = session.eventAt(q);
-            if (!ev) continue;
-            if (ev.type === 'compaction/start') { unmatched = ev; break; }
-            if (ev.type === 'compaction/end') break;
-          }
-          if (!unmatched) return false;
-          session.append('compaction/end', {
-            ...(unmatched.data ?? {}),
-            error: { message: 'wanjuan crash-recovery: compensating end for unmatched compaction/start' },
-          });
-          plugin.pushLog('warn', `M4.4：检测到崩溃遗留压缩锁（seq ${unmatched.seq}），已补写补偿 end 解锁`);
-          return true;
-        } catch (e) {
-          plugin.pushLog('warn', `M4.4：遗留锁修复失败：${e.message}`);
-          return false;
-        }
       };
       // v0.6.9 风险四：signal 传入宿主（compactRegion 第 4 参）——超时时 ac.abort 
       // 真正通知宿主中止摘要，不再空烧 LLM；宿主不认 signal 时 race 仍兜底。
@@ -567,7 +568,7 @@ export function apply(ctx, config = {}) {
           // v0.6.9 风险一：崩溃遗留压缩锁——无其他在途桥接时补写补偿 end 并重试一次
           if (msg.includes('compaction lock is already active')) {
             if ((plugin._bridgeInFlight ?? 0) <= 1) {
-              const repaired = await busyLockRepair();
+              const repaired = await busyLockRepair(session);
               if (repaired) {
                 try {
                   const res = await svc.compactRegion(startSeq, endSeq, agent, ac.signal);
@@ -625,7 +626,11 @@ export function apply(ctx, config = {}) {
       if (!plugin._recoveryKicked) {
         // M4：重启恢复——首个会话事件即补扫历史欠账（10 分钟限流器兜底，不额外发压）
         plugin._recoveryKicked = true;
-        Promise.resolve().then(() => plugin._autoReconcile?.()).catch(() => {});
+        Promise.resolve().then(async () => {
+          // M4.4 冷启动探针：此刻本进程尚无任何压缩在途，发现的未匹配 start 必为崩溃遗留，直接对账解锁
+          try { await busyLockRepair(a0); } catch {}
+          return plugin._autoReconcile?.();
+        }).catch(() => {});
       }
 
       // 宿主 SessionEventMap 的真实词汇（没有 'message'/'step'）：

@@ -737,6 +737,35 @@ test('M4.3：运行期摊销压缩——turn/end 跨阈值即归并，计数复�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('M4.4：冷启动探针——首个事件即主动清理崩溃遗留锁（无需等桥接撞锁）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    const appends = [];
+    // 模拟宿主 session：日志尾部有未匹配 compaction/start（上次崩溃遗留）
+    const fakeSession = {
+      seq: 5,
+      eventAt: (q) => (q === 4 ? { type: 'compaction/start', seq: 4, data: { compactionId: 'c9' } } : { type: 'user/message', seq: q }),
+      append: (type, data) => appends.push([type, data]),
+      id: 's1',
+    };
+    apply(ctx, { dir, shadowMode: false });
+    // 首个事件以 (session, event) 双参投递——踢脚探针应直接对账解锁
+    eventHandlers['session/event'](fakeSession, { type: 'user/message', sessionId: 's1', seq: 5, time: 1000,
+      data: { id: 'u1', role: 'user', content: 'hi', tok: 1 } });
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    assert.equal(appends.length, 1, '冷启动探针应补写补偿 end');
+    assert.equal(appends[0][0], 'compaction/end');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('崩溃遗留压缩锁')), '应记录解锁日志');
+    // 第二次事件不再重复探针（_recoveryKicked 已置位）
+    eventHandlers['session/event'](fakeSession, { type: 'user/message', sessionId: 's1', seq: 6, time: 1001,
+      data: { id: 'u2', role: 'user', content: 'hi2', tok: 1 } });
+    await new Promise((r) => setImmediate(r));
+    assert.equal(appends.length, 1, '探针只跑一次');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('M4.4：崩溃遗留锁——busy 错误触发补偿 end 解锁并重试成功（signal 透传）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
