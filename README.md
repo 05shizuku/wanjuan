@@ -22,7 +22,7 @@ flowchart TB
 
 在长上下文场景中，最大的噩梦不是「截断」，而是「缓存全灭」。万卷直面宿主环境的泥泞：
 
-- **拒绝背锅（责任隔离）**：宿主每轮重写 persona 导致缓存失效？万卷的报告输出「总命中率」与「核心命中率」，精准剥离宿主违约与上游盲区。
+- **拒绝背锅（责任隔离）**：宿主每轮重写 persona 导致缓存失效？万卷的请求遥测带 `missKind` 归因分类（宿主违约 / 上游盲区 / 自身缺陷各归其位），责任边界可审计。
 - **自我愈合（锚点吸收）**：宿主偷偷改了历史？万卷不在历史中重写，而是追加 `mut` 事件吸收突变，让账本真正收敛，告别死循环。
 - **绝对容错（断电保护）**：写到一半断电导致账本坏行？跳过坏行并大声告警，绝不让一行错误拖垮整个会话。
 - **并发安全（目录隔离）**：多窗口同时聊天？按 Session ID 严格隔离账本，互不干涉。
@@ -92,28 +92,23 @@ flowchart TB
 | `models.learned.json` | 自学习窗口（跨重启） | 每模型一条，极小 |
 | `host-bridge.json` | 每块宿主桥接状态 | 每块一条，极小 |
 | `wanjuan.log.jsonl` | 审计日志 | 256KB 轮转留尾 100 行 |
-| `snapshot.json` | 预留快照接口 | 未启用 |
+| `snapshot.json` | 预留快照接口 | 未启用（M4.3 摊销压缩已以更简方式覆盖该需求） |
 
-## 🚀 跑起来看看
-
-```bash
-npm test   # 预期 160 个用例全绿
-```
-
-## 🚀 快速开始（Quick Start）
+## 🧭 快速开始（Quick Start）
 
 ```bash
-# 1. 获取代码
+# 获取代码并自检
 git clone https://github.com/05shizuku/wanjuan.git
 cd wanjuan && npm test        # 预期 160 个用例全绿
 
-# 2. 挂进 DSH profile（junction/软链到 profile 的 node_modules）
-#    Windows: mklink /J "<profile>\node_modules\wanjuan" "<本仓库>"
+# 挂进 DSH profile（junction/软链到 profile 的 node_modules）
+# Windows: mklink /J "<profile>\node_modules\wanjuan" "<本仓库>"
 ```
 
-3. **配置数据目录**：`dsh.bundle.patch.yml` 已自带 `dir: .wanjuan`，通常零配置
-4. **启用宿主压缩**：patch 层加一行 `{ id: compaction-basic, disabled: false }`（缺失时万卷优雅降级为只折账本）
-5. **验收**：正常聊天几轮后对模型说「调 wj_report」——看到请求遥测与日志环即接入成功；水位到线时会出现 `自动折叠完成` / `宿主原生压缩完成` 的成对日志
+1. **数据目录**：`dsh.bundle.patch.yml` 已自带 `dir: .wanjuan`，通常零配置
+2. **启用宿主压缩**：patch 层加一行 `{ id: compaction-basic, disabled: false }`（缺失时万卷优雅降级为只折账本）
+3. **验收**：正常聊天几轮后对模型说「调 wj_report」——看到请求遥测与日志环即接入成功；水位到线时会出现 `自动折叠完成` / `宿主原生压缩完成` 的成对日志
+4. **出问题时**：`wj_report { logTail: 100 }` 深读落盘日志，事故现场不用重启
 
 ## 📦 作为 DSH 插件接入
 
