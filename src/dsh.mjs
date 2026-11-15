@@ -130,7 +130,7 @@ export class WanjuanPlugin {
     this.wj.compressor.compress({
       ...args,
       // 手动路径也补 sumTok（此前只有自动折叠路径传了）
-      sumTok: this.wj.estimator.estimate({ messages: [{ tok: estimateTok(args.summary ?? ''), cls: 'text' }] }, { provider: '', model: '' }).estRaw, // P0-8：estimate 只读 tok，bytes 恒 0
+      sumTok: estimateTok(args.summary ?? ''), // P0-8 + P2：单消息场景 estRaw ≡ tok，直用 estimateTok 不触发 unknown-model degrade
     });
     // M3.5：手动折叠后同样桥接宿主原生压缩（1M 大窗口下自然折叠稀少，
     // 手动路径同时是 M3.5 的实时验证通路）。
