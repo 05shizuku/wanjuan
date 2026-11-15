@@ -6,16 +6,16 @@
 
 **万卷是一套自运转系统**：折叠自动、桥接自动、补桥自动、校准自动、学习自动、恢复自动、突变吸收自动、崩溃自愈自动——你正常聊天，它自己工作。
 
-```text
-会话事件 ──▶ 账本（append-only）──▶ 水位估算 ──▶ ≥95% 自动折叠（保尾 20 条）
-   │              │                                   │
-   │              │                                   ▼
-   │              │                        桥接宿主 compactRegion
-   │              │                        （signal 可中止 · 超时兜底）
-   │              ▼                                   │
-   └──▶ 突变吸收(mut) ──▶ 补桥对账(wj_reconcile) ◀────┘
-                             ▲
-        重启恢复 / 自动补桥 / 崩溃锁自愈 / 终态收敛 / 账本摊销压缩
+```mermaid
+flowchart TB
+    A["DSH 会话事件<br/>user/message · assistant/message · tool/result"] --> B["万卷账本<br/>append-only JSONL · 突变走 mut 吸收"]
+    B --> C{"turn/end 水位检查<br/>estFinal ÷ 窗口（动态解析）"}
+    C -- "≥95%" --> D["自动折叠<br/>显式 ids · 保尾 20 条 · seqSpan 入档"]
+    C -- "≥80%" --> E["Nudge：点名可折区间"]
+    D --> F["桥接宿主 compactRegion<br/>signal 可中止 · 超时兜底 · 崩溃锁自愈"]
+    F --> G["宿主 checkpoint 摘要节点<br/>真实上下文同步收缩"]
+    D --> H["补桥对账 wj_reconcile<br/>终态/瞬态分类 · 冷启动探针"]
+    B --> I["摊销对数压缩<br/>ledger.0000 检查点 · archive 归档"]
 ```
 
 ## 💡 核心理念：每个 Bug 都有归宿
@@ -99,6 +99,21 @@
 ```bash
 npm test   # 预期 160 个用例全绿
 ```
+
+## 🚀 快速开始（Quick Start）
+
+```bash
+# 1. 获取代码
+git clone https://github.com/05shizuku/wanjuan.git
+cd wanjuan && npm test        # 预期 160 个用例全绿
+
+# 2. 挂进 DSH profile（junction/软链到 profile 的 node_modules）
+#    Windows: mklink /J "<profile>\node_modules\wanjuan" "<本仓库>"
+```
+
+3. **配置数据目录**：`dsh.bundle.patch.yml` 已自带 `dir: .wanjuan`，通常零配置
+4. **启用宿主压缩**：patch 层加一行 `{ id: compaction-basic, disabled: false }`（缺失时万卷优雅降级为只折账本）
+5. **验收**：正常聊天几轮后对模型说「调 wj_report」——看到请求遥测与日志环即接入成功；水位到线时会出现 `自动折叠完成` / `宿主原生压缩完成` 的成对日志
 
 ## 📦 作为 DSH 插件接入
 
