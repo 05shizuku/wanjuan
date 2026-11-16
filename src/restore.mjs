@@ -20,7 +20,8 @@ export class Restorer {
       for (const childId of block.children) {
         allMsgs.push(...this.decompress(childId, mode));
       }
-      return allMsgs;
+      // v0.6.25：聚合后按 seq 升序——子块各自有序不代表拼接有序
+      return allMsgs.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
     }
 
     const rawMsgs = this.blocks.readRaw(blockId);
@@ -28,7 +29,8 @@ export class Restorer {
     if (mode === 'context') {
       // 让账本跟上宿主（尾部追加后这些消息重新 active）
       this.ledger.recordUnfold({ block: blockId, why: 'context' });
-      return rawMsgs;
+      // v0.6.25：按 seq 升序返回——readRaw 按写入顺序读出，模型必须看到时间线连贯的历史
+      return rawMsgs.sort((a, b) => (a.seq ?? 0) - (b.seq ?? 0));
     } else if (mode === 'file') {
       // 修：rawRef 是文件名（block.b1.raw.jsonl），正确路径在 blocks.dir 下
       return join(this.blocks.dir, block.rawRef || `block.${blockId}.raw.jsonl`);

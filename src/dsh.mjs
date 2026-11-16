@@ -254,7 +254,8 @@ export class WanjuanPlugin {
       // this._bridgeStatus 在 await 期间可能已被其他会话的事件切换覆盖
       const st = srec.bridgeStatus?.[b.id]?.status ?? '未知';
       const err = srec.bridgeStatus?.[b.id]?.error;
-      out.push(`${b.id}: seq ${start}→${end} → ${st}${err ? '（' + err.slice(0, 90) + '）' : ''}`);
+      // v0.6.25：截断放宽到 300，宿主拒绝原因（如 context length exceeded 的具体数值）可直接定位
+      out.push(`${b.id}: seq ${start}→${end} → ${st}${err ? '（' + err.slice(0, 300) + '）' : ''}`);
     }
     return out.length ? out.join('\n') : '没有需要补桥的块。';
   }
@@ -336,7 +337,7 @@ function buildTools(plugin) {
     ),
     makeTool(
       'wj_search',
-      '在折叠块中检索。',
+      '在折叠块中检索（注意：仅支持子串/连续短语匹配，暂不支持多词分词 AND 检索；检索范围为块摘要与主题，原文请用 wj_decompress）。',
       { query: { type: 'string', description: '检索词' } },
       ['query'],
       (args) => {

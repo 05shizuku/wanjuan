@@ -32,6 +32,8 @@ export function buildReport({ dir, ledger, diagnoser }) {
   lines.push(`活跃消息：${active.length} 条，共 ${tok(activeTok)} tok`);
   lines.push(`块总数：${blocks.length}（tier-1=${tiers[1]} tier-2=${tiers[2]} tier-3=${tiers[3]}）`);
   lines.push(`叶子块：${leaves.length}，srcTok=${tok(leafSrcTok)}，sumTok=${tok(leafSumTok)}`);
+  // v0.6.25：说明残留块文件的性质（原文可达兜底，非垃圾）
+  if (blocks.length > leaves.length) lines.push(`（另有 ${blocks.length - leaves.length} 个历史块元数据留存磁盘，原文归档可 wj_search/wj_decompress 取回，不计入活跃统计）`);
   // v0.6.21：折叠节省估算（观察期核心数据）——原文本应发送的 token 减去摘要实际占用
   if (leafSrcTok > 0) {
     const saved = Math.max(0, leafSrcTok - leafSumTok);

@@ -1046,6 +1046,26 @@ test('v0.6.22：estimateTok 数组分支 CJK 口径——中文 ContentBlock 不
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.6.25：decompress 按 seq 升序返回——raw 写入顺序乱也不乱时间线', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
+  try {
+    const { createWanjuan } = await import('../src/index.mjs');
+    const wj = createWanjuan({ dir });
+    for (let i = 1; i <= 3; i++) wj.ledger.recordMsg({ id: `m${i}`, at: i, tok: 10, seq: i });
+    wj.compressor.compress({ ids: ['m1', 'm2', 'm3'], summary: '测试块' });
+    const block = wj.ledger.listBlocks().find((b) => !b.promotedInto);
+    // 模拟 raw 写入顺序 ≠ seq 顺序（倒转行序）
+    const { readFileSync: rf, writeFileSync: wf } = await import('node:fs');
+    const rawPath = join(dir, `block.${block.id}.raw.jsonl`);
+    const lines = rf(rawPath, 'utf8').trim().split('\n');
+    wf(rawPath, lines.reverse().join('\n') + '\n', 'utf8');
+    const msgs = wj.restorer.decompress(block.id, 'context');
+    const seqs = msgs.map((m) => m.seq ?? 0);
+    assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b), '返回必须按 seq 升序');
+    assert.equal(msgs.length, 3, '原文三条都应返回');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {
