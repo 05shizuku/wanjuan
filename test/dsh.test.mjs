@@ -1070,8 +1070,10 @@ test('v0.6.26：classifyMiss 全量击穿无分歧点 → provider-miss（上游
   const { classifyMiss } = await import('../src/diagnose.mjs');
   // 全量击穿（cached=0）+ 无分歧点 + missTok>10K → provider-miss
   assert.equal(classifyMiss({ usage: { input_tokens: 50000, cached: 0 } }), 'provider-miss');
-  // missTok 小（冷启动小请求）→ 不误判
-  assert.equal(classifyMiss({ usage: { input_tokens: 5000, cached: 0 } }), 'unattributed');
+  // v0.6.27：门槛 1K——5K 全量击穿应判 provider-miss（此前 9K 击穿漏报的教训）
+  assert.equal(classifyMiss({ usage: { input_tokens: 5000, cached: 0 } }), 'provider-miss');
+  // 1K 以下小请求 → 不误判
+  assert.equal(classifyMiss({ usage: { input_tokens: 800, cached: 0 } }), 'unattributed');
   // 有分歧点（正常追加导致的 miss）→ 不误判
   assert.equal(classifyMiss({ usage: { input_tokens: 50000, cached: 0 }, divergeAt: 123 }), 'unattributed');
   // 部分 cached（缓存仍在，只是没全中）→ 不误判

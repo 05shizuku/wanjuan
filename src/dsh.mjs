@@ -108,7 +108,8 @@ export class WanjuanPlugin {
 
   pushLog(level, msg) {
     // v0.6.26：带上当前会话前缀（前 8 位），多会话下日志不再跨会话混流
-    const sid = this._currentSessionId ? String(this._currentSessionId).slice(0, 8) : 'root';
+    // 宿主会话 ID 形如 session-xxxx——剔除前缀再取 8 位，否则前缀恒为 [session-]
+    const sid = this._currentSessionId ? String(this._currentSessionId).replace('session-', '').slice(0, 8) : 'root';
     const prefixedMsg = `[${sid}] ${msg}`;
     this.logs.push({ t: Date.now(), level, msg: prefixedMsg });
     if (this.logs.length > 30) this.logs.shift();
@@ -232,7 +233,7 @@ export class WanjuanPlugin {
       const start = Math.min(...seqs), end = Math.max(...seqs);
       const st0 = bridgeStatus?.[b.id]?.status;
       if (st0 === 'ok') { out.push(`${b.id}: 已打通（seq ${start}→${end}），跳过`); continue; }
-      if (st0 === 'skip') { out.push(`${b.id}: 已终态（${(bridgeStatus[b.id]?.error ?? '').slice(0, 60)}），跳过`); continue; }
+      if (st0 === 'skip') { out.push(`${b.id}: 已终态（${(bridgeStatus[b.id]?.error ?? '').slice(0, 300)}），跳过`); continue; }
       if (st0 === 'pending') {
         // v0.6.16 P0-2：pending 超 3 分钟即僵尸（崩溃/挂起遗留）——按 failed 重试，不再永久跳过。
         // 同进程内 in-flight 的桥接 at 是新鲜的，仍受保护。

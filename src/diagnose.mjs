@@ -19,9 +19,9 @@ export function classifyMiss({ usage, est, divergeAt = null }) {
   if (typeof usage.cached !== 'number') return 'unattributed';
   const missTok = Math.max(0, usage.input_tokens - usage.cached);
   if (missTok === 0) return 'new';
-  // v0.6.26：全量击穿且无分歧点（cached=0、无分歧、missTok>10K）——疑似上游驱逐缓存，
-  // 单列 provider-miss（进 upstream 责任桶），不再混入 unattributed
-  if (usage.cached === 0 && !divergeAt && missTok > 10000) return 'provider-miss';
+  // v0.6.27：门槛 10K → 1K（真机数据：6 个 ~9K 的新击穿全掉进了 unattributed）——
+  // 全量击穿（cached=0）且无分歧点，基本就是上游的锅
+  if (usage.cached === 0 && !divergeAt && missTok > 1000) return 'provider-miss';
   return 'unattributed';
 }
 
