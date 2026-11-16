@@ -529,10 +529,11 @@ test('v0.6.2 Nudge：80% 告警点名可折区间（seq 跨度 + 条数）', asy
       type: 'turn/end', sessionId: 's1', seq: 99, time: 9999,
       data: { turn: 1, reason: { kind: 'completed' } },
     });
-    const warn = ctx._wj.logs.find((l) => l.msg.includes('建议主动调用 wj_compress'));
-    assert.ok(warn, '应产生 Nudge 告警');
+    const warn = ctx._wj.logs.find((l) => l.msg.includes('nudge 已产出'));
+    assert.ok(warn, '应产出结构化 nudge（M5.2）');
     assert.ok(warn.msg.includes('seq 1→'), '应点名起始 seq');
     assert.ok(warn.msg.includes('共 5 条'), '应点名可折条数');
+    assert.ok(ctx._wj._pendingNudge.has('s1'), 'nudge 应入 pending 待注入');
     assert.ok(!wjFolds(ctx, 's1'), '80% 只提醒不折叠');
     function wjFolds(c, sid) { return c._wj.getOrCreate(sid).wj.ledger.blocks.size; }
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -1089,6 +1090,86 @@ test('v0.6.28：tokenizer 统一口径——三形态单一来源（M5.4）', as
   assert.equal(estimateTok([{ type: 'tool-call', name: 'ab', arguments: 'cd' }]), 1, 'tool-call 计入');
   assert.equal(estimateTok('abc'), 1, '纯 ASCII 0.25/字符');
   assert.equal(estimateTok(null), 1, '空值最小非零');
+});
+
+test('M5.2：turn/end 80% 产出 nudge（结构正确 + 存入 pending）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    // 25 条消息，4 条大消息构造 80~95% 水位（复用 v0.6.2 Nudge case 的构造）
+    for (let i = 1; i <= 25; i++) {
+      eventHandlers['session/event']({
+        type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: i <= 4 ? 25000 : 10 },
+      });
+    }
+    eventHandlers['session/event']({
+      type: 'turn/end', sessionId: 's1', seq: 99, time: 9999,
+      data: { turn: 5, reason: { kind: 'completed' } },
+    });
+    const pending = ctx._wj._pendingNudge.get('s1');
+    assert.ok(pending, '80% 水位应产出 pending nudge');
+    assert.equal(pending.turn, 5, 'pending 应记宿主 turn 号');
+    assert.ok(pending.message.tok > 0, 'nudge 消息应带 tok');
+    assert.ok(pending.message.content.includes('压缩建议'), 'nudge 内容应为 philosophy 文本');
+    assert.ok(Array.isArray(pending.candidateIds) && pending.candidateIds.length > 0, '候选区间应记录');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('M5.2：pre-step 注入 nudge（形状 + source.kind + 一次性消费）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    // 直接塞一个 pending（不跑完整 turn/end 流程）
+    ctx._wj._pendingNudge.set('s1', {
+      message: { id: 'wj-nudge-5', cls: 'sys', tok: 42, content: '【测试 nudge】' },
+      turn: 5,
+      candidateIds: ['u01', 'u02'],
+    });
+    // 手动触发 waterfall（payload 用宿主真实形状：agent.id）
+    const decision = { messages: [{ id: 'existing' }] };
+    const result = await ctx._wj._preStepHandler({ agent: { id: 's1' }, turn: 5 }, async () => decision);
+    assert.equal(result.messages.length, 2, '应注入 1 条消息');
+    const injected = result.messages[1];
+    assert.equal(injected.role, 'user');
+    assert.equal(injected.source.kind, 'wanjuan-nudge');
+    assert.equal(injected.source.form, 'nudge');
+    assert.equal(injected.content[0].text, '【测试 nudge】');
+    assert.equal(ctx._wj._pendingNudge.get('s1').injectedAt, 5, '注入后 pending 保留并标记 injectedAt（消费归 accept）');
+    // 二次触发：不应再注入
+    const result2 = await ctx._wj._preStepHandler({ agent: { id: 's1' }, turn: 6 }, async () => ({ messages: [] }));
+    assert.equal(result2.messages.length, 0, '无 pending 不应注入');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('M5.2：accept 链路——注入后 wj_compress 命中候选 → recordAccept + 清 pending', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    ctx.compaction = { compactRegion: async () => ({ ok: true }) };
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 25; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: i <= 4 ? 25000 : 10 } });
+    }
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999,
+      data: { turn: 5, reason: { kind: 'completed' } } });
+    const pending = ctx._wj._pendingNudge.get('s1');
+    assert.ok(pending, '前置：pending 已产出');
+    const range = [pending.candidateIds[0], pending.candidateIds[pending.candidateIds.length - 1]];
+    ctx._wj.getOrCreate('s1').wj.nudge.recordReject(range, 4); // 预置 reject，使 accept 的清账可观察
+    // 注入
+    await ctx._wj._preStepHandler({ agent: { id: 's1' }, turn: 5 }, async () => ({ messages: [{ id: 'm' }] }));
+    assert.equal(ctx._wj._pendingNudge.get('s1').injectedAt, 5, '注入后保留 pending');
+    // 模型照做：wj_compress 折叠候选端点 u01
+    const out = await ctx._wj._toolCompress({ ids: ['u01'], summary: '接受 nudge 的折叠' });
+    assert.ok(out.includes('✅'), '折叠应成功');
+    assert.equal(ctx._wj._pendingNudge.has('s1'), false, 'accept 应清 pending（修订后 accept 不再是死代码）');
+    assert.equal(ctx._wj.getOrCreate('s1').wj.nudge.rangeStates.size, 0, 'recordAccept 应清 rangeStates');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('[nudge] 接受')), '应记 accept 日志');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('P0-5：已折叠消息重投递不再污染日志', async () => {

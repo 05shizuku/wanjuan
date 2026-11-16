@@ -44,7 +44,7 @@ export class Philosophy {
     lines.push(`[万卷 压缩建议 - ${this.version}]`);
     lines.push('');
     lines.push('这是一条效率提醒，不是溢出警告。你可以根据当前任务状态选择接受或拒绝。');
-    lines.push('如果你认为应当压缩，请调用 `compress` 工具；如果不需要，可以直接忽略或调用 `decline_compress`。');
+    lines.push('如果你认为应当压缩，请调用 `wj_compress` 工具（携带区间或 ids 与 summary）；如果不需要，直接忽略本条即可。');
     lines.push('');
     lines.push('当前推荐的候选区间：');
 

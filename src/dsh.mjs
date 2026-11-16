@@ -72,6 +72,8 @@ export class WanjuanPlugin {
     // 日志环：Electron 主进程的 console 在 Windows 双击启动时不可见，
     // 文件日志也不收插件的 console 输出——所以内存留一份最近 30 条，wj_report 展示。
     this.logs = [];
+    this._pendingNudge = new Map();   // sessionId -> { message, turn, candidateIds }（M5.2）
+    this._injectedTurns = new Map();  // sessionId -> Set<turn>（同 turn 只注一次）
   }
 
   pushLog(level, msg) {
@@ -162,6 +164,24 @@ export class WanjuanPlugin {
         const p = this.tryHostCompaction(this._lastHostSession, Math.min(...seqs), Math.max(...seqs), newBlock.id, this._currentSessionId ?? 'default');
         if (p) await p; // 等宿主压缩完成再返回——工具结果消息必须落在压缩之后，表面稳定性才成立
       }
+    }
+    // M5.2：压缩成功 → 消费该会话的 pending nudge（模型已响应）
+    try {
+      const sid = this._currentSessionId ?? 'default';
+      const pending = this._pendingNudge.get(sid);
+      if (pending && newBlock && pending.candidateIds.length > 0) {
+        // 若本次折叠覆盖了候选区间的任一端，视为接受
+        const foldedIds = new Set(args.ids ?? []);
+        const hit = pending.candidateIds.some((id) => foldedIds.has(id));
+        if (hit) {
+          const range = [pending.candidateIds[0], pending.candidateIds[pending.candidateIds.length - 1]];
+          wj.nudge.recordAccept(range);
+          this.pushLog('log', `[nudge] 接受：区间 ${range[0]}~${range[1]} 已被折叠，rangeStates 已重置`);
+        }
+      }
+      this._pendingNudge.delete(sid);
+    } catch (e) {
+      this.pushLog('warn', `[nudge] accept 记账失败：${e.message}`);
     }
     return '✅ 已折叠';
   }
@@ -824,11 +844,40 @@ export function apply(ctx, config = {}) {
             plugin.pushLog('error', `自动折叠失败: ${err.message}`);
           }
         } else if (usageRatio >= 0.80) {
-          // Nudge（M3 两段式第一段）：点名可折区间，模型可直接照做
-          const cand = byTime.slice(0, byTime.length - TAIL_RETENTION);
+          // M5.2：结构化 nudge 产出。80% 水位触发（Gate 的 growth 门留给 L2；
+          // 方案 B 语义已定：lastFoldEstRaw 取折叠后 estRaw——折叠前基线会让 growth 变负数长哑火）
+          const pool = byTime.slice(0, byTime.length - TAIL_RETENTION);
+          const cand = pool;
           const cseqs = cand.map((m) => m.seq).filter((x) => typeof x === 'number');
           const span = cseqs.length ? `（seq ${Math.min(...cseqs)}→${Math.max(...cseqs)}，共 ${cand.length} 条）` : `（共 ${cand.length} 条）`;
-          plugin.pushLog('warn', `⚠️ 水位达到 ${(usageRatio * 100).toFixed(1)}%，建议主动调用 wj_compress 折叠最老消息${span}。`);
+          const turnNo = ev.data?.turn ?? 0;
+          let nudgeMsg = null;
+          let candidateIds = [];
+          try {
+            // 池已按 TAIL_RETENTION 切过，禁用 findCandidates 内部的二次尾部保留
+            const candidates = wj.nudge.findCandidates(pool, { tailKeepTok: 0 });
+            if (candidates.length > 0) {
+              nudgeMsg = wj.nudge.buildNudgeMessage(candidates, turnNo);
+              candidateIds = candidates.flatMap((c) => [c.range[0], c.range[1]]);
+            }
+          } catch (e) {
+            plugin.pushLog('warn', `[nudge] 构建失败：${e.message}`);
+          }
+          if (nudgeMsg) {
+            // 风险 B 接线：上一轮 nudge 已送达但模型未消费（消费走 accept 清账）→ 记 reject 降频，防 nagging
+            const old = plugin._pendingNudge.get(sessionId);
+            if (old && old.injectedAt !== undefined && old.turn !== turnNo && old.candidateIds.length > 0) {
+              try {
+                const range = [old.candidateIds[0], old.candidateIds[old.candidateIds.length - 1]];
+                wj.nudge.recordReject(range, turnNo);
+                plugin.pushLog('log', `[nudge] 上一轮 nudge 未被消费（turn ${old.turn}），记 reject 降频`);
+              } catch (e) { plugin.pushLog('warn', `[nudge] reject 记账失败：${e.message}`); }
+            }
+            plugin._pendingNudge.set(sessionId, { message: nudgeMsg, turn: turnNo, candidateIds });
+            plugin.pushLog('warn', `⚠️ 水位达到 ${(usageRatio * 100).toFixed(1)}%，nudge 已产出（turn ${turnNo}，${nudgeMsg.tok} tok），待下轮 pre-step 注入${span}。`);
+          } else {
+            plugin.pushLog('warn', `⚠️ 水位达到 ${(usageRatio * 100).toFixed(1)}%，nudge 被降频规则过滤（建议主动调用 wj_compress 折叠最老消息${span}）。`);
+          }
         }
         // v0.6.4：自动补桥——本轮若有折叠桥接则排队在其后，避免宿主并发压缩冲突
         Promise.resolve(foldBridge).then(() => plugin._autoReconcile?.()).catch(() => {});
@@ -837,6 +886,64 @@ export function apply(ctx, config = {}) {
       plugin.pushLog('warn', `session/event ${ev.type} fail: ${e.message}`);
     }
   });
+
+  // M5.2：agent/pre-step waterfall —— 把 pending nudge 送达模型
+  // 配方（探针实证）：注入消息必须带 source.kind，否则宿主 'reading kind' 崩溃；form 宿主不读，仅自文档化
+  try {
+    ctx.on('agent/pre-step', (plugin._preStepHandler = async (payload, next) => {
+      const decision = await next();
+      try {
+        // 风险 A 自愈：agent.id 与事件 sessionId 的字符串格式不赌——多 key 逐个命中，
+        // _currentSessionId 兜底保证「事件后必命中」（pre-step 前必有本会话事件）
+        const keyCandidates = [...new Set([payload?.agent?.id, payload?.sessionId, plugin._currentSessionId, 'default'].filter(Boolean))];
+        const hitKey = keyCandidates.find((k) => plugin._pendingNudge.has(k));
+        const sessionId = hitKey ?? keyCandidates[0];
+        const pending = hitKey ? plugin._pendingNudge.get(hitKey) : undefined;
+        if (pending) {
+          const turnNo = payload?.turn ?? pending.turn;
+          if (turnNo - pending.turn > 3) {
+            // 陈旧 nudge（跨 3 turn 未送达/未消费）——丢弃，防迟到注入打乱上下文
+            plugin.pushLog('log', `[nudge] pending 已陈旧（turn ${pending.turn} → ${turnNo}），丢弃`);
+            plugin._pendingNudge.delete(hitKey);
+          } else if ((plugin._injectedTurns.get(hitKey) ?? new Set()).has(turnNo)) {
+            plugin._pendingNudge.delete(hitKey); // 防御性兜底
+          } else {
+            const msgs = decision?.messages;
+            if (!Array.isArray(msgs) || Object.isFrozen(msgs) || msgs.length === 0) {
+              plugin.pushLog('warn', '[nudge] pre-step decision.messages 不可写或为空，跳过注入');
+              plugin._pendingNudge.delete(hitKey);
+            } else {
+              const nudgeMsg = {
+                id: pending.message.id ?? `wj-nudge-${turnNo}-${Date.now()}`,
+                role: 'user',
+                content: [{ type: 'text', text: pending.message.content }],
+                source: { kind: 'wanjuan-nudge', form: 'nudge' }, // ★ 必填（探针实证）
+              };
+              // 插在最后一条 claimed 之后（第一方同款，缓存友好）；claimed 缺失时追加末尾
+              const claimed = payload?.messages ?? [];
+              const lastClaimedIndex = msgs.findLastIndex((m) => claimed.includes(m));
+              const at = lastClaimedIndex >= 0 ? lastClaimedIndex + 1 : msgs.length;
+              const entered = msgs.toSpliced(at, 0, nudgeMsg);
+              const injectedNow = plugin._injectedTurns.get(hitKey) ?? new Set();
+              injectedNow.add(turnNo);
+              plugin._injectedTurns.set(hitKey, injectedNow.size > 20 ? new Set([...injectedNow].sort((a, b) => a - b).slice(-10)) : injectedNow);
+              // v0.6.29 修订：注入后【保留】pending 并标记 injectedAt——
+              // 消费归 accept（wj_compress 命中候选 → recordAccept + delete）；
+              // 未消费的 injected pending 由下轮 turn/end 记 reject 降频。此处 delete 会让 accept 永远查空（死代码）
+              pending.injectedAt = turnNo;
+              plugin.pushLog('log', `[nudge] 已注入（session ${String(sessionId).slice(0, 8)}, turn ${turnNo}, ${pending.message.tok} tok）`);
+              return { ...decision, messages: entered };
+            }
+          }
+        }
+      } catch (e) {
+        plugin.pushLog('warn', `[nudge] pre-step 注入失败：${e.message}`);
+      }
+      return decision;
+    }));
+  } catch (e) {
+    plugin.pushLog('warn', `[nudge] pre-step waterfall 注册失败：${e.message}`);
+  }
 
   for (const t of buildTools(plugin)) {
     try {
