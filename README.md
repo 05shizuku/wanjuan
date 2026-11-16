@@ -2,7 +2,7 @@
 
 > 读书破万卷。上下文像卷轴一样一折一折收起来，需要时再展开。
 
-[![version](https://img.shields.io/github/v/tag/05shizuku/wanjuan)](https://github.com/05shizuku/wanjuan/releases) [![tests](https://img.shields.io/badge/tests-180%20passing-brightgreen)](https://github.com/05shizuku/wanjuan/actions) [![node](https://img.shields.io/badge/node-%E2%89%A520-blue)](https://nodejs.org) [![license](https://img.shields.io/badge/license-MIT-lightgrey)](#-license)
+[![version](https://img.shields.io/github/v/tag/05shizuku/wanjuan)](https://github.com/05shizuku/wanjuan/releases) [![tests](https://img.shields.io/badge/tests-181%20passing-brightgreen)](https://github.com/05shizuku/wanjuan/actions) [![node](https://img.shields.io/badge/node-%E2%89%A520-blue)](https://nodejs.org) [![license](https://img.shields.io/badge/license-MIT-lightgrey)](#-license)
 
 **万卷** 是一个为 LLM 宿主（如 DeepSeek Harness）设计的**上下文压缩内核**。纯原生 Node.js ESM（>= 20），零第三方依赖，以事件溯源（Event Sourcing）与「前缀纪律」为根基，解决长对话场景下的窗口爆炸与 KV 缓存失效问题。
 
@@ -36,7 +36,7 @@ flowchart TB
 | **M1–M3 观测与折叠** | 全词汇入账 + 四工具 + 两段式水位引擎（80% 点名区间提醒 / 95% 自动折叠保尾 20 条，UUID 主机走显式 ids） |
 | **M3.5–M3.9 真实接管** | 桥接宿主 `compactRegion`（五层真机契约）+ 动态窗口与自学习 + 校准入档 + 自动补桥（终态/瞬态分类）+ 日志落盘审计 |
 | **M4 自愈** | 重启恢复 · `mut` 突变吸收 · 摊销对数压缩（启动重放有界）· 突变嗅探（TTL）· 崩溃遗留锁自愈（冷启动主动探针 + busy 反应式双通道）· `signal` 信号中止 · failed 桥接冷却（跨量级切窗口保护，v0.6.24） |
-| **M4.5+ 多会话与精度** | 多会话隔离（每会话独立账本目录，首会话收编旧账本升级无感）· `estimateTok` CJK 口径（字符串/ContentBlock 数组同源，中文不再低估 2-3 倍）· bundle 自带 `compaction-basic` 启用（纯 ASCII patch）· 启动环境探针 · 折叠节省估算 |
+| **M4.5+ 多会话与精度** | 多会话隔离（每会话独立账本目录，首会话收编旧账本升级无感）· `estimateTok` CJK 口径（字符串/ContentBlock 数组同源，中文不再低估 2-3 倍）· bundle 自带 `compaction-basic` 启用（纯 ASCII patch）· 启动环境探针 · 折叠节省估算 · 估算口径统一（`src/tokenizer.mjs` 单一来源，nudge 1.0 低估一并修复） |
 
 ### M3 的两个关键修正
 
@@ -96,7 +96,7 @@ flowchart TB
 |---|---|---|
 | `fingerprint` | ✅ v0.6.19 已接线（观察模式） | `turn/end` 限流对比账本活跃 vs 宿主表面重建，漂移告警；驱逐模式 v0.7 |
 | `gate` | 有测试（2 项）、未接线 | L2 决策层；阈值与 dsh 内联值（0.80/0.95）对齐后接入 |
-| `nudge`（NudgeManager 类） | 有测试（10 项）、未接线 | 80% 提醒现由日志实现（点名区间），类接入后更结构化 |
+| `nudge`（NudgeManager 类） | 有测试（10 项）、未接线 | ✅ **M5.2 探针实证送达路径**（v0.6.28 真机）：`agent/pre-step` waterfall 返回值 splice，注入消息必须带 `source.kind`（裸消息宿主崩溃）；配方存于 `src/nudge.mjs` 头注释，接线 v0.7 |
 | `report.buildReport` | ✅ v0.6.19 已接线 | `wj_report` 现附完整月报段（命中率/责任归属/块统计；归因数值 M5 充实） |
 | `Observer` | 有测试（7 项）、未接线 | 与 Diagnoser 两套遥测待合并 |
 | `snapshot.json` | 接口预留 | M4.3 摊销压缩已以更简方式覆盖 |
@@ -109,7 +109,6 @@ flowchart TB
 - **消息入账 tok 为启发式估算**：字符串与 ContentBlock 数组同口径（CJK 1.2 / 其他 0.25，v0.6.22 起数组分支已对齐）——非精确 tokenizer，残余偏差由 k̂ 校准吸收；入账走 estimator 的口径统一计划于 **v0.7**。
 - **归因分类未完成**：`missKind` 当前只产出 `new / unattributed`，完整归因 M5 交付。
 - **跨量级切窗口**：从大窗口模型切到小窗口（如 1M → 256K）时，首轮会全量折叠账本；若宿主 compaction 因超窗口失败，账本保持折叠、宿主侧上下文需重启 DSH 或开新会话恢复（failed 桥接已有 30 分钟冷却，不会无限重试）。建议跨量级切换时主动开新会话。
-- **估算口径双轨**：主口径 `estimateTok`（CJK 1.2/其他 0.25）与预留模块 nudge 内的 CJK 1.0 版本并存（nudge 未接线，不影响运行时）；v0.7 口径统一时合并。
 - **output reserve 与窗口不同源**：窗口动态解析自宿主注册表，output 来自 models.json/学习文件（未知模型兜底 8192）——大窗口下 reserve 偏保守（折叠偏早方向，安全）。
 
 

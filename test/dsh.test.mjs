@@ -1082,6 +1082,15 @@ test('v0.6.26：classifyMiss 全量击穿无分歧点 → provider-miss（上游
   assert.equal(classifyMiss({ usage: { input_tokens: 5000, cached: 5000 } }), 'new');
 });
 
+test('v0.6.28：tokenizer 统一口径——三形态单一来源（M5.4）', async () => {
+  const { estimateTok } = await import('../src/tokenizer.mjs');
+  assert.equal(estimateTok('你好'), 3, '字符串 CJK 1.2 口径');
+  assert.equal(estimateTok([{ type: 'text', text: '你好' }]), 3, '数组与字符串同口径');
+  assert.equal(estimateTok([{ type: 'tool-call', name: 'ab', arguments: 'cd' }]), 1, 'tool-call 计入');
+  assert.equal(estimateTok('abc'), 1, '纯 ASCII 0.25/字符');
+  assert.equal(estimateTok(null), 1, '空值最小非零');
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {

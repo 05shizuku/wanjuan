@@ -7,6 +7,7 @@ import { readFileSync, writeFileSync, appendFileSync, statSync, existsSync, rena
 import { join } from 'node:path';
 import { createWanjuan, PHILOSOPHY_KEEP_DROP } from './index.mjs';
 import { buildReport } from './report.mjs';
+import { estimateTok } from './tokenizer.mjs';
 
 export const name = 'wanjuan';
 // compaction：M3.5 真实上下文接管必需。宿主访问控制要求先声明 inject
@@ -16,39 +17,6 @@ export const inject = ['tools', 'connection', 'tokenMeter', 'webServer', 'compac
 
 let _seq = 0;
 function nextMsgId() { return `m${++_seq}`; }
-
-function estimateTok(content) {
-  // v0.6.16 P1-1：CJK 1.2 / 其他 0.25——length/2 对中文系统性低估约 2 倍（危险方向：折太晚）。
-  // 口径统一（入账走 estimator）仍属 v0.7；本函数是入账/sumTok 的唯一粗估口径。
-  if (typeof content === 'string' && content.length > 0) {
-    let cjk = 0, other = 0;
-    for (let i = 0; i < content.length; i++) {
-      const code = content.charCodeAt(i);
-      if (code >= 0x4e00 && code <= 0x9fa5) cjk++;
-      else other++;
-    }
-    return Math.max(1, Math.ceil(cjk * 1.2 + other * 0.25));
-  }
-  if (Array.isArray(content)) {
-    // 宿主消息的 content 是 ContentBlock 数组（text/reasoning/tool-call…）
-    // v0.6.22 P1：数组分支与字符串版同口径（此前 n/2 对中文低估 2-3 倍，
-    // 而宿主消息绝大多数走此分支——账本 tok 系统性偏低的真正主源）
-    let cjk = 0, other = 0;
-    for (const b of content) {
-      if (!b || typeof b !== 'object') continue;
-      let text = '';
-      if (typeof b.text === 'string') text = b.text;
-      else if (b.type === 'tool-call') text = (b.name ?? '') + (b.arguments ?? '');
-      for (let i = 0; i < text.length; i++) {
-        const code = text.charCodeAt(i);
-        if (code >= 0x4e00 && code <= 0x9fa5) cjk++;
-        else other++;
-      }
-    }
-    return Math.max(1, Math.ceil(cjk * 1.2 + other * 0.25));
-  }
-  return 1;
-}
 
 function normalizeUsage(usage) {
   if (!usage) return null;
@@ -721,7 +689,6 @@ export function apply(ctx, config = {}) {
       .catch(() => '');
   };
   // 桥接状态已在 getOrCreate 创建会话时按会话加载（v0.6.19 多会话隔离）
-
 
   ctx.on('session/event', (a0, a1) => {
     // 宿主签名：'session/event'(session, event) —— a0 是 Session 对象（有 .id），

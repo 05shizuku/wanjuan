@@ -29,6 +29,7 @@ export { Compressor } from './compress.mjs';
 export { Restorer } from './restore.mjs';
 export { Gate } from './gate.mjs';
 export { NudgeManager } from './nudge.mjs';
+export { estimateTok } from './tokenizer.mjs';
 export { Philosophy, PHILOSOPHY_KEEP_DROP } from './philosophy.mjs';
 
 export const DEFAULT_MODELS = JSON.parse(

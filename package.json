@@ -1,6 +1,6 @@
 {
   "name": "wanjuan",
-  "version": "0.6.27",
+  "version": "0.6.28",
   "description": "上下文压缩管理器（自运转压缩系统：接管/补桥/校准/学习/恢复/嗅探全自动）",
   "type": "module",
   "main": "./src/index.mjs",
@@ -14,7 +14,8 @@
     "./fingerprint": "./src/fingerprint.mjs",
     "./diagnose": "./src/diagnose.mjs",
     "./report": "./src/report.mjs",
-    "./models": "./src/models.json"
+    "./models": "./src/models.json",
+    "./tokenizer": "./src/tokenizer.mjs"
   },
   "files": [
     "src/",
@@ -30,7 +31,9 @@
     "node": ">=20"
   },
   "dsh": {
-    "bundle": { "patch": "./dsh.bundle.patch.yml" }
+    "bundle": {
+      "patch": "./dsh.bundle.patch.yml"
+    }
   },
   "license": "MIT"
 }

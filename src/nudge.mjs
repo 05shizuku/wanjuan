@@ -1,15 +1,25 @@
 // src/nudge.mjs
+// ═══════════════════════════════════════════════════════════════════
+// M5.2 探针实证（v0.6.28 真机，2026-11-16）：nudge 合法送达路径
+//
+// ctx.on('agent/pre-step', async (payload, next) => {
+//   const decision = await next();                  // 官方 waterfall：先放行下游
+//   if (decision?.kind !== 'enter' || !decision.messages?.length) return decision;
+//   const lastClaimedIndex = decision.messages.findLastIndex((m) => (payload?.messages ?? []).includes(m));
+//   const nudgeMsg = {
+//     id: crypto.randomUUID(),                      // 建议自带（宿主 createMessage 会赋，但注入对象需自足）
+//     role: 'user',
+//     content: [{ type: 'text', text: nudgeText }],
+//     source: { kind: 'wanjuan-nudge', form: 'nudge' }  // ★ 必填！无 source = 宿主 'reading kind' 崩溃
+//   };
+//   return { ...decision, messages: decision.messages.toSpliced(lastClaimedIndex + 1, 0, nudgeMsg) };
+// });
+//
+// 实证记录：裸消息（无 source）→ 'Cannot read properties of undefined (reading kind)'；
+// 带 source 后：无报错 + 模型原样引用探针文本（一字不动）。注入位置在 claimed 之后 = 缓存友好。
+// ═══════════════════════════════════════════════════════════════════
 import { Philosophy } from './philosophy.mjs';
-
-function estimateTok(content) {
-  if (!content) return 0;
-  let cjk = 0, other = 0;
-  for (const ch of content) {
-    if (/[\u4e00-\u9fff]/.test(ch)) cjk++;
-    else other++;
-  }
-  return Math.ceil(cjk * 1.0 + other * 0.25);
-}
+import { estimateTok } from './tokenizer.mjs'; // M5.4：统一口径（旧本地实现 1.0 低估 17%，已删除）
 
 export class NudgeManager {
   constructor({ philosophy = new Philosophy(), minSize = 10_000, tailKeepTok = 30_000 } = {}) {
