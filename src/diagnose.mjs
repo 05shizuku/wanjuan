@@ -13,12 +13,15 @@ const HOST_MISS = new Set(['rewrite', 'host-compact', 'host-rewrite']);
 const UPSTREAM_MISS = new Set(['ttl', 'provider-miss', 'switch-model']);
 const WANJUAN_MISS = new Set(['seam', 'abort']);
 
-export function classifyMiss({ usage, est }) {
+export function classifyMiss({ usage, est, divergeAt = null }) {
   if (!usage) return 'unattributed';
   if (typeof usage.input_tokens !== 'number') return 'unattributed';
   if (typeof usage.cached !== 'number') return 'unattributed';
   const missTok = Math.max(0, usage.input_tokens - usage.cached);
   if (missTok === 0) return 'new';
+  // v0.6.26：全量击穿且无分歧点（cached=0、无分歧、missTok>10K）——疑似上游驱逐缓存，
+  // 单列 provider-miss（进 upstream 责任桶），不再混入 unattributed
+  if (usage.cached === 0 && !divergeAt && missTok > 10000) return 'provider-miss';
   return 'unattributed';
 }
 
@@ -33,7 +36,7 @@ export class Diagnoser {
     const input = usage?.input_tokens ?? 0;
     const cached = usage?.cached ?? 0;
     const missTok = Math.max(0, input - cached);
-    const missKind = overrideMissKind || classifyMiss({ usage, est });
+    const missKind = overrideMissKind || classifyMiss({ usage, est, divergeAt });
     
     const rec = {
       n, t, provider, model,

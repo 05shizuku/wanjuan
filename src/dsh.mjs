@@ -107,12 +107,15 @@ export class WanjuanPlugin {
   }
 
   pushLog(level, msg) {
-    this.logs.push({ t: Date.now(), level, msg: String(msg) });
+    // v0.6.26：带上当前会话前缀（前 8 位），多会话下日志不再跨会话混流
+    const sid = this._currentSessionId ? String(this._currentSessionId).slice(0, 8) : 'root';
+    const prefixedMsg = `[${sid}] ${msg}`;
+    this.logs.push({ t: Date.now(), level, msg: prefixedMsg });
     if (this.logs.length > 30) this.logs.shift();
     // 原 console 行为保留：终端启动时仍然实时可见
     const fn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
-    try { fn(`[wanjuan] ${msg}`); } catch {}
-    this._appendLogFile(level, msg);
+    try { fn(`[wanjuan] ${prefixedMsg}`); } catch {}
+    this._appendLogFile(level, prefixedMsg);
   }
 
   // v0.6.4：日志落盘到 <数据目录>/wanjuan.log.jsonl，超 256KB 轮转保留最后 100 行

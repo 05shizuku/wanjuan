@@ -333,8 +333,8 @@ test('日志环：pushLog 截断 30 条，wj_report 附最近日志（含自动�
     // 环形截断：塞 35 条，留最后 30 条
     for (let i = 1; i <= 35; i++) plugin.pushLog('log', `测试日志 ${i}`);
     assert.equal(plugin.logs.length, 30);
-    assert.equal(plugin.logs[0].msg, '测试日志 6');
-    assert.equal(plugin.logs[29].msg, '测试日志 35');
+    assert.equal(plugin.logs[0].msg, '[root] 测试日志 6');
+    assert.equal(plugin.logs[29].msg, '[root] 测试日志 35');
 
     // 走一遍真实的折叠流程，让日志环里出现「自动折叠完成」
     for (let i = 1; i <= 25; i++) {
@@ -1064,6 +1064,20 @@ test('v0.6.25：decompress 按 seq 升序返回——raw 写入顺序乱也不�
     assert.deepEqual(seqs, [...seqs].sort((a, b) => a - b), '返回必须按 seq 升序');
     assert.equal(msgs.length, 3, '原文三条都应返回');
   } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.6.26：classifyMiss 全量击穿无分歧点 → provider-miss（上游桶）', async () => {
+  const { classifyMiss } = await import('../src/diagnose.mjs');
+  // 全量击穿（cached=0）+ 无分歧点 + missTok>10K → provider-miss
+  assert.equal(classifyMiss({ usage: { input_tokens: 50000, cached: 0 } }), 'provider-miss');
+  // missTok 小（冷启动小请求）→ 不误判
+  assert.equal(classifyMiss({ usage: { input_tokens: 5000, cached: 0 } }), 'unattributed');
+  // 有分歧点（正常追加导致的 miss）→ 不误判
+  assert.equal(classifyMiss({ usage: { input_tokens: 50000, cached: 0 }, divergeAt: 123 }), 'unattributed');
+  // 部分 cached（缓存仍在，只是没全中）→ 不误判
+  assert.equal(classifyMiss({ usage: { input_tokens: 50000, cached: 20000 } }), 'unattributed');
+  // 全命中 → new
+  assert.equal(classifyMiss({ usage: { input_tokens: 5000, cached: 5000 } }), 'new');
 });
 
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
