@@ -2,7 +2,7 @@
 
 > 读书破万卷。上下文像卷轴一样一折一折收起来，需要时再展开。
 
-[![version](https://img.shields.io/github/v/tag/05shizuku/wanjuan)](https://github.com/05shizuku/wanjuan/releases) [![tests](https://img.shields.io/badge/tests-177%20passing-brightgreen)](https://github.com/05shizuku/wanjuan/actions) [![node](https://img.shields.io/badge/node-%E2%89%A520-blue)](https://nodejs.org) [![license](https://img.shields.io/badge/license-MIT-lightgrey)](#-license)
+[![version](https://img.shields.io/github/v/tag/05shizuku/wanjuan)](https://github.com/05shizuku/wanjuan/releases) [![tests](https://img.shields.io/badge/tests-178%20passing-brightgreen)](https://github.com/05shizuku/wanjuan/actions) [![node](https://img.shields.io/badge/node-%E2%89%A520-blue)](https://nodejs.org) [![license](https://img.shields.io/badge/license-MIT-lightgrey)](#-license)
 
 **万卷** 是一个为 LLM 宿主（如 DeepSeek Harness）设计的**上下文压缩内核**。纯原生 Node.js ESM（>= 20），零第三方依赖，以事件溯源（Event Sourcing）与「前缀纪律」为根基，解决长对话场景下的窗口爆炸与 KV 缓存失效问题。
 
@@ -107,6 +107,7 @@ flowchart TB
 
 - **消息入账 tok 为启发式估算**：字符串与 ContentBlock 数组同口径（CJK 1.2 / 其他 0.25，v0.6.22 起数组分支已对齐）——非精确 tokenizer，残余偏差由 k̂ 校准吸收；入账走 estimator 的口径统一计划于 **v0.7**。
 - **归因分类未完成**：`missKind` 当前只产出 `new / unattributed`，完整归因 M5 交付。
+- **跨量级切窗口**：从大窗口模型切到小窗口（如 1M → 256K）时，首轮会全量折叠账本；若宿主 compaction 因超窗口失败，账本保持折叠、宿主侧上下文需重启 DSH 或开新会话恢复（failed 桥接已有 30 分钟冷却，不会无限重试）。建议跨量级切换时主动开新会话。
 - **估算口径双轨**：主口径 `estimateTok`（CJK 1.2/其他 0.25）与预留模块 nudge 内的 CJK 1.0 版本并存（nudge 未接线，不影响运行时）；v0.7 口径统一时合并。
 - **output reserve 与窗口不同源**：窗口动态解析自宿主注册表，output 来自 models.json/学习文件（未知模型兜底 8192）——大窗口下 reserve 偏保守（折叠偏早方向，安全）。
 

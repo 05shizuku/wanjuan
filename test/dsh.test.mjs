@@ -849,6 +849,34 @@ test('v0.6.20：桥接竞态——完成回调写入发起时会话，不受会�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.6.24：failed 桥接冷却 30 分钟——冷却内跳过，超时后允许重试', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers, registered } = freshCtx(dir);
+    let calls = 0;
+    ctx.compaction = { compactRegion: async () => { calls += 1; return { ok: true }; } };
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 3; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 10 } });
+    }
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    wj.compressor.compress({ ids: ['u01', 'u02'], summary: '块摘要' });
+    ctx._wj._currentSessionId = 's1';
+    ctx._wj._lastHostSession = { id: 's1' };
+    const reconcile = registered.find((d) => d.name === 'wj_reconcile');
+    // 冷却内（5 分钟前失败）：跳过，不重试
+    ctx._wj.getOrCreate('s1').bridgeStatus = { b1: { status: 'failed', at: Date.now() - 5 * 60 * 1000, error: 'context length exceeded' } };
+    await reconcile.handler({});
+    assert.equal(calls, 0, '冷却内不应重试（防超窗口死循环）');
+    // 冷却结束（31 分钟前失败）：允许重试一次，成功转 ok
+    ctx._wj.getOrCreate('s1').bridgeStatus.b1.at = Date.now() - 31 * 60 * 1000;
+    await reconcile.handler({});
+    assert.equal(calls, 1, '冷却结束应重试');
+    assert.equal(ctx._wj.getOrCreate('s1').bridgeStatus.b1.status, 'ok', '重试成功应转 ok');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('M4.4：崩溃遗留锁——busy 错误触发补偿 end 解锁并重试成功（signal 透传）', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {

@@ -237,6 +237,17 @@ export class WanjuanPlugin {
         if (Date.now() - stAt < 3 * 60 * 1000) { out.push(`${b.id}: 桥接进行中（${Math.round((Date.now() - stAt) / 1000)}s），跳过`); continue; }
         out.push(`${b.id}: pending 超时（僵尸），按 failed 重试`);
       }
+      if (st0 === 'failed') {
+        // v0.6.24 修复A：failed 冷却 30 分钟——超窗口场景（如 1M 切 256K 后全量折叠，
+        // 宿主摘要必然 context length exceeded）会形成「每 10 分钟重试→失败→再标记」
+        // 的死循环（日志刷屏 + 空 LLM 调用）。冷却期内跳过，30 分钟后允许重试一次。
+        const fAt = bridgeStatus?.[b.id]?.at ?? 0;
+        if (Date.now() - fAt < 30 * 60 * 1000) {
+          out.push(`${b.id}: 上次桥接失败（${Math.round((Date.now() - fAt) / 60000)} 分钟前），冷却中跳过`);
+          continue;
+        }
+        out.push(`${b.id}: failed 冷却结束，重试`);
+      }
       const p = this.tryHostCompaction(this._lastHostSession, start, end, b.id, this._currentSessionId ?? 'default');
       if (p) await p;
       // v0.6.21 P0：读 srec.bridgeStatus（markBridge 原地修改该记录）——
