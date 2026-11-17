@@ -17,6 +17,8 @@
 //
 // 实证记录：裸消息（无 source）→ 'Cannot read properties of undefined (reading kind)'；
 // 带 source 后：无报错 + 模型原样引用探针文本（一字不动）。注入位置在 claimed 之后 = 缓存友好。
+// 兜底语义：payload.messages 是宿主 claimed 消息；若为空（如测试直调或首个 turn），
+// findLastIndex = -1 → 注入到 messages 末尾，与「claimed 之后」等价（宿主自身兜底 decision 也是 [...claimed, context] 形态）。
 // ═══════════════════════════════════════════════════════════════════
 import { Philosophy } from './philosophy.mjs';
 import { estimateTok } from './tokenizer.mjs'; // M5.4：统一口径（旧本地实现 1.0 低估 17%，已删除）

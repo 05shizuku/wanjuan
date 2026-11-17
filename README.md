@@ -2,7 +2,7 @@
 
 > 读书破万卷。上下文像卷轴一样一折一折收起来，需要时再展开。
 
-[![version](https://img.shields.io/github/v/tag/05shizuku/wanjuan)](https://github.com/05shizuku/wanjuan/releases) [![tests](https://img.shields.io/badge/tests-184%20passing-brightgreen)](https://github.com/05shizuku/wanjuan/actions) [![node](https://img.shields.io/badge/node-%E2%89%A520-blue)](https://nodejs.org) [![license](https://img.shields.io/badge/license-MIT-lightgrey)](#-license)
+[![version](https://img.shields.io/github/v/tag/05shizuku/wanjuan)](https://github.com/05shizuku/wanjuan/releases) [![tests](https://img.shields.io/badge/tests-185%20passing-brightgreen)](https://github.com/05shizuku/wanjuan/actions) [![node](https://img.shields.io/badge/node-%E2%89%A520-blue)](https://nodejs.org) [![license](https://img.shields.io/badge/license-MIT-lightgrey)](#-license)
 
 **万卷** 是一个为 LLM 宿主（如 DeepSeek Harness）设计的**上下文压缩内核**。纯原生 Node.js ESM（>= 20），零第三方依赖，以事件溯源（Event Sourcing）与「前缀纪律」为根基，解决长对话场景下的窗口爆炸与 KV 缓存失效问题。
 
@@ -86,7 +86,7 @@ flowchart TB
 - **桥接超时兜底**：宿主摘要挂死 180s（`bridgeTimeoutMs` 可调）转瞬态失败，不永久阻塞手动路径。
 - **自包含依赖**：bundle patch 自动启用宿主 `compaction-basic`（纯 ASCII patch 文件，防编码事故），安装即完整。
 - **启动环境探针**：压缩服务缺失时启动即大字报警，绝不静默待机。
-- **防弹测试**：174 个自动化测试用例（含大量失败注入），`node --test` 全绿。
+- **防弹测试**：185 个自动化测试用例（含大量失败注入），`node --test` 全绿。
 
 ## 🧩 已知未接线（预留模块）
 
@@ -108,6 +108,7 @@ flowchart TB
 
 - **消息入账 tok 为启发式估算**：字符串与 ContentBlock 数组同口径（CJK 1.2 / 其他 0.25，v0.6.22 起数组分支已对齐）——非精确 tokenizer，残余偏差由 k̂ 校准吸收；入账走 estimator 的口径统一计划于 **v0.7**。
 - **归因分类未完成**：`missKind` 当前只产出 `new / unattributed`，完整归因 M5 交付。
+- **k̂ 冷启动双向偏差**：万卷挂载时账本只见挂载后的新增消息，挂载前历史（system prompt / tools / 对话）账本看不到。v0.6.30 的 observed clip（[0.5, 5.0]）阻止 k̂ 飞百倍（k̂=118 → 5.0），但引入两个持续偏差：**早期低估**（estRaw 小时 estFinal 远低于真实 input，该折不折）、**中期虚高**（estRaw 涨到几十万后 k̂ 仍停在 5.0 未收敛——EMA 半衰期约 15 轮——estFinal 虚高约 5 倍，可能误触发折叠）；约 15 轮后收敛到 ~1.0 恢复准确。根治方案是 v0.7 的 baseline 附加量模型（`estFinal = estRaw × k̂ × 1.05 + baseline`）。可观测信号：`requests.jsonl` 的 `degraded: khat-observed-clipped`。
 - **跨量级切窗口**：从大窗口模型切到小窗口（如 1M → 256K）时，首轮会全量折叠账本；若宿主 compaction 因超窗口失败，账本保持折叠、宿主侧上下文需重启 DSH 或开新会话恢复（failed 桥接已有 30 分钟冷却，不会无限重试）。建议跨量级切换时主动开新会话。
 - **output reserve 与窗口不同源**：窗口动态解析自宿主注册表，output 来自 models.json/学习文件（未知模型兜底 8192）——大窗口下 reserve 偏保守（折叠偏早方向，安全）。
 
@@ -129,7 +130,7 @@ flowchart TB
 ```bash
 # 获取代码并自检
 git clone https://github.com/05shizuku/wanjuan.git
-cd wanjuan && npm test        # 预期 174 个用例全绿
+cd wanjuan && npm test        # 预期 185 个用例全绿
 
 # 挂进 DSH profile（junction/软链到 profile 的 node_modules）
 # Windows: mklink /J "<profile>\node_modules\wanjuan" "<本仓库>"

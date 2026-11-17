@@ -1172,6 +1172,33 @@ test('M5.2：accept 链路——注入后 wj_compress 命中候选 → recordAcc
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.6.30：k̂ 冷启动保护——observed 钳到 [0.5, 5.0] 并记 degraded', async () => {
+  const { Estimator } = await import('../src/estimate.mjs');
+  const est = new Estimator({ models: { t: { m: { window: 1000000 } } } });
+  // 冷启动极端：input 541565 / estRaw 1814 → rawObserved ≈ 298 → 钳到 5.0
+  est.observeUsage({ provider: 't', model: 'm', usageInputTokens: 541565, estRaw: 1814 });
+  let rec = est.calib.get('["t","m"]');
+  assert.equal(rec.khatObserved, 5.0, `极端 observed 应钳到 5.0（实际 ${rec.khatObserved}）`);
+  assert.equal(rec.n, 1);
+  assert.ok(est.getDegraded().includes('khat-observed-clipped'), '应记 clipped degrade');
+  // 低侧：estRaw 远大于 input → rawObserved 0.1 → 钳到 0.5
+  est.clearDegraded();
+  est.observeUsage({ provider: 't', model: 'm', usageInputTokens: 100, estRaw: 1000 });
+  rec = est.calib.get('["t","m"]');
+  assert.ok(rec.khatObserved >= 0.5 && rec.khatObserved <= 5.0, `k̂ 应始终在钳制区间内（实际 ${rec.khatObserved}）`);
+  assert.ok(est.getDegraded().includes('khat-observed-clipped'), '低侧超限同样记 degrade');
+  // 正常值（1.05）不钳、不记 degrade
+  est.clearDegraded();
+  est.observeUsage({ provider: 't', model: 'm', usageInputTokens: 1050, estRaw: 1000 });
+  rec = est.calib.get('["t","m"]');
+  assert.ok(rec.khatObserved > 0.5 && rec.khatObserved < 5.0);
+  assert.equal(est.getDegraded().includes('khat-observed-clipped'), false, '正常值不应记 clipped');
+  // 连续钳制输入：EMA 稳定在 5.0 上限，不再飞百倍
+  for (let i = 0; i < 5; i++) est.observeUsage({ provider: 't', model: 'm', usageInputTokens: 500000, estRaw: 1800 });
+  rec = est.calib.get('["t","m"]');
+  assert.ok(rec.khatObserved <= 5.0, `连续极端输入下 k̂ 不得突破 5.0（实际 ${rec.khatObserved}）`);
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {

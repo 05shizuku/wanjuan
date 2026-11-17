@@ -67,7 +67,16 @@ export class Estimator {
       this._degrade('bad-usage');
       return false;
     }
-    const observed = usageInputTokens / estRaw; // KAHAT-SAMPLE-DIVISION
+    // KAHAT-SAMPLE-DIVISION（CI：本文件唯一除法）
+    const rawObserved = usageInputTokens / estRaw;
+    // v0.6.30 冷启动保护：observed 上限/下限钳制。
+    // 根因：万卷挂载时账本只有部分消息，宿主真实 input 含 system prompt / tools / 挂载前历史，
+    // observed 可达数百（真机实测 298：input 541565 / estRaw 1814）。此值进 EMA 后数十轮才收敛，
+    // 期间水位判定失真 10~100 倍（误折/漏折）。策略：clip 到 [0.5, 5.0]，超限记 degraded 可观测。
+    // 诚实声明：clip 只是把灾难限到 5 倍，非根治——根治是 v0.7 的 baseline 附加量模型
+    // （estFinal = estRaw × k̂ × 1.05 + baseline，结构性漏算与估算误差解耦）。
+    const observed = Math.max(0.5, Math.min(5.0, rawObserved));
+    if (rawObserved !== observed) this._degrade('khat-observed-clipped');
     const key = this._key(provider, model);
     const rec = this.calib.get(key) ?? { khatObserved: observed, n: 0 };
     rec.khatObserved = rec.n === 0 ? observed : (1 - PRIOR_ALPHA) * rec.khatObserved + PRIOR_ALPHA * observed;
