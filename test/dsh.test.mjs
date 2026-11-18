@@ -28,12 +28,13 @@ function freshCtx(dir) {
   return { ctx, registered, eventHandlers, waterHandlers, infos, warns };
 }
 
-test('apply：注册 5 个工具（wj_ 前缀防撞宿主），compress 描述含 KEEP/DROP 且带 output', () => {
+test('apply：注册 6 个工具（wj_ 前缀防撞宿主），compress 描述含 KEEP/DROP 且带 output', () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
     const { ctx, registered } = freshCtx(dir);
     apply(ctx, { dir });
-    assert.equal(registered.length, 5);
+    assert.equal(registered.length, 6);
+    assert.ok(registered.some((d) => d.name === 'wj_unfold'), '应有 wj_unfold 纯记账修复工具（v0.6.33）');
     assert.ok(registered.some((d) => d.name === 'wj_reconcile'), '应有 wj_reconcile 补桥工具');
     const compress = registered.find((d) => d.name === 'wj_compress');
     assert.ok(compress.description.includes('必须丢弃'));
@@ -815,12 +816,12 @@ test('M4.4：冷启动探针——首个事件即主动清理崩溃遗留锁（�
       id: 's1',
     };
     apply(ctx, { dir, shadowMode: false });
+    ctx._wj._repairWaitMs = 10; // v0.6.32：等待重扫注入短时长（测试加速）
     // 首个事件以 (session, event) 双参投递——踢脚探针应直接对账解锁
     eventHandlers['session/event'](fakeSession, { type: 'user/message', sessionId: 's1', seq: 5, time: 1000,
       data: { id: 'u1', role: 'user', content: 'hi', tok: 1 } });
-    await new Promise((r) => setImmediate(r));
-    await new Promise((r) => setImmediate(r));
-    assert.equal(appends.length, 1, '冷启动探针应补写补偿 end');
+    for (let i = 0; i < 60 && appends.length < 1; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(appends.length, 1, '冷启动探针应补写补偿 end（等待重扫后仍无 end）');
     assert.equal(appends[0][0], 'compaction/end');
     assert.ok(ctx._wj.logs.some((l) => l.msg.includes('崩溃遗留压缩锁')), '应记录解锁日志');
     // 第二次事件不再重复探针（_recoveryKicked 已置位）
@@ -895,9 +896,9 @@ test('M4.4：崩溃遗留锁——busy 错误触发补偿 end 解锁并重试成
       eventAt: (q) => (q === 4 ? { type: 'compaction/start', seq: 4, data: { compactionId: 'c1' } } : { type: 'user/message', seq: q }),
       append: (type, data) => appends.push([type, data]),
     };
+    ctx._wj._repairWaitMs = 10; // v0.6.32：等待重扫注入短时长
     ctx._wj.tryHostCompaction(ctx._wj._lastHostSession, 1, 5, 'bl');
-    await new Promise((r) => setImmediate(r));
-    await new Promise((r) => setImmediate(r));
+    for (let i = 0; i < 80 && sigs.length < 2; i++) await new Promise((r) => setTimeout(r, 10));
     assert.equal(sigs.length, 2, '解锁后应重试一次');
     assert.ok(sigs.every((x) => x && typeof x.aborted === 'boolean'), 'signal 应透传给 compactRegion 第 4 参');
     assert.equal(appends.length, 1, '应补写恰好一个补偿事件');
@@ -1223,6 +1224,84 @@ test('v0.6.31：水位止血——clipped-k̂ 虚高被真实 input 纠偏，不
     eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 9, reason: { kind: 'completed' } } });
     assert.equal(ctx._wj.getOrCreate('s1').wj.ledger.blocks.size, 0, '真实 62% 不应被假水位 102% 骗折（Day-1 回归）');
     assert.ok(ctx._wj.logs.some((l) => l.msg.includes('[水位] 账面')), '应记录账面/真实背离');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.6.32 刀一：真 end 等待期内落盘 → 跳过补偿（防一个 start 两条 end）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    ctx._wj._repairWaitMs = 30; // 快速重扫
+    // 可控 fake session：等待期内「真 end 落盘」（eventAt 动态翻面）
+    const sess = {
+      endLanded: false,
+      appended: [],
+      get seq() { return this.endLanded ? 7 : 6; }, // 真 end 落盘会推进 seq（忠实模拟宿主追加）
+      append(type, data) { this.appended.push([type, data]); },
+      eventAt(q) {
+        if (q === 5) return { type: 'compaction/start', seq: 5, data: { compactionId: 'c9' } };
+        if (q === 6 && this.endLanded) return { type: 'compaction/end', seq: 6, data: {} };
+        return undefined;
+      },
+    };
+    setTimeout(() => { sess.endLanded = true; }, 10); // 真 end 在等待期内（10ms）落盘，重扫（30ms）时可见
+    const repaired = await ctx._wj.busyLockRepair(sess);
+    assert.equal(repaired, false, '真 end 已落盘，不应补偿');
+    assert.equal(sess.appended.length, 0, '不得双写补偿 end');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('重扫后发现 end 已自行落盘')), '应记录跳过原因');
+    // 对照：end 未落盘 → 正常补偿
+    const sess2 = { seq: 6, appended: [], endLanded: false,
+      append(type, data) { this.appended.push([type, data]); },
+      eventAt(q) { return q === 5 ? { type: 'compaction/start', seq: 5, data: {} } : undefined; } };
+    const repaired2 = await ctx._wj.busyLockRepair(sess2);
+    assert.equal(repaired2, true, '仍无 end 应正常补偿');
+    assert.equal(sess2.appended.length, 1, '补偿 end 已写');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.6.32 刀二：no open turn 判 pending 挂起重试，不再终态停摆', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    ctx.compaction = { compactRegion: async () => { throw new Error('no open turn'); } };
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 3; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 10 } });
+    }
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    wj.compressor.compress({ ids: ['u01', 'u02'], summary: '块摘要' });
+    ctx._wj._currentSessionId = 's1';
+    ctx._wj._lastHostSession = { id: 's1' };
+    await ctx._wj.tryHostCompaction(ctx._wj._lastHostSession, 1, 3, 'b1', 's1');
+    const st = ctx._wj.getOrCreate('s1').bridgeStatus.b1;
+    assert.equal(st.status, 'pending', '前置拒绝应挂起（deferred）而非终态 failed');
+    assert.ok((st.error ?? '').includes('deferred'), '应注明挂起原因');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.6.33：wj_unfold 纯记账修复——折叠消息恢复活跃，原文不投递', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers, registered } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 3; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `细节${i}`, tok: 10 } });
+    }
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    wj.compressor.compress({ ids: ['u01', 'u02'], summary: '误折叠的块' });
+    assert.equal(wj.ledger.getActiveMessages().length, 1, '前置：折叠后只剩 1 条活跃');
+    const unfold = registered.find((d) => d.name === 'wj_unfold');
+    const out = await unfold.handler({ blockId: 'b1' });
+    const text = out.content[0].text; // wrappedHandler 返回结构化对象
+    assert.ok(text.includes('已恢复 2 条'), '应报告恢复条数');
+    assert.equal(wj.ledger.getActiveMessages().length, 3, '折叠消息应回到活跃');
+    assert.ok(!text.includes('细节'), '原文不得投递进工具结果（纯记账）');
+    // 幂等：再次调用应提示无折叠消息
+    const out2 = await unfold.handler({ blockId: 'b1' });
+    assert.ok(out2.content[0].text.includes('没有折叠中的消息'), '重复恢复应幂等提示');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -201,7 +201,8 @@ export class Ledger {
   }
 
   recordUnfold({ block, why }) {
-    if (!['context', 'file'].includes(why)) {
+    // v0.6.33：'repair' = 纯记账修复（误折叠纠正），不投递原文——原文可达仍由 raw 归档保证
+    if (!['context', 'file', 'repair'].includes(why)) {
       throw new InvariantError('原文可达', `unfold why 非法：${why}`);
     }
     const ev = { k: 'unfold', block, why };

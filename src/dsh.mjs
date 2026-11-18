@@ -340,6 +340,23 @@ function buildTools(plugin) {
       }
     ),
     makeTool(
+      'wj_unfold',
+      '把已折叠块的全部消息恢复为活跃（纯账本记账修复：不投递原文进上下文）。用于误折叠纠正；需要看原文细节请用 wj_decompress。',
+      { blockId: { type: 'string', description: '要恢复的块 ID（如 b1）' } },
+      ['blockId'],
+      (args) => {
+        const wj = plugin._currentWj();
+        // 不调 getBlock：unfold 的 _apply 会删除块记录（BlockError），消息计数天然幂等
+        let count = 0;
+        for (const m of wj.ledger.messages.values()) {
+          if (m.status === 'folded' && m.blockId === args.blockId) count += 1;
+        }
+        if (count === 0) return `块 ${args.blockId} 当前没有折叠中的消息（可能已恢复过或不存在）`;
+        wj.ledger.recordUnfold({ block: args.blockId, why: 'repair' });
+        return `✅ 已恢复 ${count} 条消息为活跃（纯账本记账：原文未投递上下文；水位判定走真实 input，不会因此误折叠）`;
+      }
+    ),
+    makeTool(
       'wj_report',
       '生成缓存命中率与责任归属报告。可选 logTail 深读落盘日志尾部（事故现场审计）。',
       { logTail: { type: 'number', description: '额外读取 wanjuan.log.jsonl 尾部行数（≤200，缺省 0 只看内存日志环）' } },
@@ -573,14 +590,28 @@ export function apply(ctx, config = {}) {
       const busyLockRepair = async (sess) => {
         try {
           if (!sess || typeof sess.append !== 'function' || typeof sess.eventAt !== 'function') return false;
-          let unmatched = null;
-          for (let q = Number(sess.seq) - 1; q >= 0; q -= 1) {
-            const ev = sess.eventAt(q);
-            if (!ev) continue;
-            if (ev.type === 'compaction/start') { unmatched = ev; break; }
-            if (ev.type === 'compaction/end') break;
-          }
+          const scanUnmatched = () => {
+            for (let q = Number(sess.seq) - 1; q >= 0; q -= 1) {
+              const ev = sess.eventAt(q);
+              if (!ev) continue;
+              if (ev.type === 'compaction/start') return ev;
+              if (ev.type === 'compaction/end') return null;
+            }
+            return null;
+          };
+          let unmatched = scanUnmatched();
           if (!unmatched) return false;
+          // v0.6.32 刀一：补偿前等待重扫——上一实例的摘要可能仍在收尾，真 end 迟到落盘；
+          // 立即补偿会造出「一个 start 两条 end」→ loader 判整本日志损坏 → 会话从侧栏消失
+          // （尔水青禾案 5805 补偿 end + 5807 真 end）。等待时长可注入（测试用），默认 3 秒，
+          // 与失败取证的秒级迟到窗口匹配。
+          const waitMs = Number(plugin._repairWaitMs ?? 3000);
+          await new Promise((ok) => setTimeout(ok, waitMs));
+          unmatched = scanUnmatched();
+          if (!unmatched) {
+            plugin.pushLog('log', 'M4.4：重扫后发现 end 已自行落盘，跳过补偿');
+            return false;
+          }
           sess.append('compaction/end', {
             ...(unmatched.data ?? {}),
             error: { message: 'wanjuan crash-recovery: compensating end for unmatched compaction/start' },
@@ -592,6 +623,7 @@ export function apply(ctx, config = {}) {
           return false;
         }
       };
+      plugin.busyLockRepair = busyLockRepair; // 暴露供测试直呼（v0.6.32 刀一）
 
   const tryHostCompaction = (session, startSeq, endSeq, blockId, sid) => {
     try {
@@ -687,6 +719,7 @@ export function apply(ctx, config = {}) {
           }
           // v0.6.4 失败分类：终态不重试（自动补桥才不会每轮空耗一次 LLM 摘要）
           if (msg.includes('not found in surface')) markBridge(sid, blockId, 'skip', '区间已不在宿主表面（早已压缩或锚点失效），视为对齐');
+          else if (msg.includes('no open turn')) markBridge(sid, blockId, 'pending', 'deferred: 当前回合未闭合，下一阈值重试'); // v0.6.32 刀二：前置拒绝挂起重试，不再终态停摆
           else if (msg.includes('summary is not smaller')) markBridge(sid, blockId, 'skip', msg);
           else if (msg.includes('not a balanced boundary')) markBridge(sid, blockId, 'skip', msg);
           else markBridge(sid, blockId, 'failed', msg);
