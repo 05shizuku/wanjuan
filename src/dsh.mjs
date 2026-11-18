@@ -74,6 +74,8 @@ export class WanjuanPlugin {
     this.logs = [];
     this._pendingNudge = new Map();   // sessionId -> { message, turn, candidateIds }（M5.2）
     this._injectedTurns = new Map();  // sessionId -> Set<turn>（同 turn 只注一次）
+    this._lastRealInput = new Map();  // sessionId -> { input, t }（最近一次真实 usage 观测，水位止血用）
+    this._lastDivergeLog = new Map(); // sessionId -> t（背离日志节流，10 分钟/会话）
   }
 
   pushLog(level, msg) {
@@ -421,7 +423,7 @@ export function apply(ctx, config = {}) {
   const FORCE_FOLD_THRESHOLD = 0.95; // 强折阈值：95%
   const TAIL_RETENTION = 20;         // 尾部保护窗：永远不折叠最新的 N 条消息
 
-  const recordUsage = (wj, usage, provider, model) => {
+  const recordUsage = (wj, usage, provider, model, sessionId) => {
     const u = normalizeUsage(usage);
     if (!u) return;
     warmupModelWindow(wj, provider, model); // M3.6：顺手预热当前模型的窗口解析（并自学习落盘）
@@ -461,6 +463,11 @@ export function apply(ctx, config = {}) {
         wj.estimator.observeUsage({ provider, model, usageInputTokens: u.input, estRaw: est.estRaw });
       }
     } catch {}
+    // v0.6.31：记录最近真实 input——它是水位的正确分子（天然含 system/tools/挂载前历史），
+    // turn/end 水位判定时优先于 k̂ 预测值使用
+    if (sessionId && u.input > 0) {
+      (plugin._lastRealInput ?? new Map()).set(sessionId, { input: u.input, t: Date.now() });
+    }
   };
 
   // ===== M3.6：动态窗口感知（跟随实际服务模型自适应）=====
@@ -746,7 +753,7 @@ export function apply(ctx, config = {}) {
         recordOne(wj, ev.data?.message, ev.time, ev.seq);
         if (ev.data?.usage) {
           const src = ev.data.message?.source ?? {};
-          recordUsage(wj, ev.data.usage, src.provider, src.model);
+          recordUsage(wj, ev.data.usage, src.provider, src.model, sessionId);
         }
       } else if (ev.type === 'tool/result') {
         recordOne(wj, ev.data?.message, ev.time, ev.seq);
@@ -813,7 +820,29 @@ export function apply(ctx, config = {}) {
         // 已知边界：est.output 与 window 不同源（output 静态来自 models.json/学习文件，window 动态解析自宿主注册表）——
         // 未知模型 output 兜底 8192，对大窗口偏保守（折叠偏早方向，安全）
         const usable = Math.max(1, window - (est.output ?? 0));
-        const usageRatio = est.estFinal / usable;
+        let usageRatio = est.estFinal / usable;
+        // v0.6.31 止血：有新鲜真实观测（30 分钟内）时，水位以真实 input 为准（观测 > 预测）。
+        // Day-1 实测：clipped-k̂ 钉死 5.0 的会话，账面水位 102.2% 而真实仅 62%——k̂ 乘数在
+        // 「永久性结构缺口」（挂载前历史不在账本）面前数学上无解，EMA 钉死不收敛，
+        // 误触发强制折叠（白折 1679 条）。真实 input 天然是正确分子，直接采用。
+        // 已知残差：真实 input 是「上一次请求」的观测，不含当前 turn 新增的消息——
+        // 极端场景（单 turn 涌入巨量工具输出）下可能低估一轮；30 分钟新鲜窗封顶风险，
+        // 且宿主自身压缩是真实溢出的最后防线（wanjuan 强折只是助手，不是唯一防线）。
+        try {
+          const real = plugin._lastRealInput?.get(sessionId);
+          if (real && Date.now() - real.t < 30 * 60 * 1000 && Number.isFinite(real.input) && real.input > 0) {
+            const realRatio = real.input / usable;
+            if (Math.abs(realRatio - usageRatio) > 0.2) {
+              // 节流：钉死会话每个 turn 都背离，10 分钟内不重复打，防淹没日志环
+              const lastDivergeT = plugin._lastDivergeLog?.get(sessionId) ?? 0;
+              if (Date.now() - lastDivergeT > 10 * 60 * 1000) {
+                (plugin._lastDivergeLog ?? new Map()).set(sessionId, Date.now());
+                plugin.pushLog('log', `[水位] 账面 ${(usageRatio * 100).toFixed(1)}% vs 真实 ${(realRatio * 100).toFixed(1)}%（背离 >20%，以真实为准——k̂ 受结构性缺口影响）`);
+              }
+            }
+            usageRatio = realRatio;
+          }
+        } catch {}
         let foldBridge = null; // 本轮折叠的宿主桥接 promise（供自动补桥排队）
 
         if (usageRatio >= FORCE_FOLD_THRESHOLD) {

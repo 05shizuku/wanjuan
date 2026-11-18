@@ -385,7 +385,7 @@ test('M3.6：窗口跟随宿主注册表——小窗口触发折叠，缓存命�
       type: 'assistant/message', sessionId: 's1', seq: 26, time: 2000,
       data: {
         message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'nvmine', model: 'glm' }, content: [] },
-        usage: { inputTokens: 1000, cacheReadTokens: 500 },
+        usage: { inputTokens: 100000, cacheReadTokens: 500 }, // 真实 input 与小窗口自洽（v0.6.31 observe>predict：水位以真实 input 为准）
       },
     });
     await new Promise((r) => setImmediate(r)); // 等窗口预热落缓存
@@ -920,7 +920,7 @@ test('P1-A：水位分母减 output reserve——与 estimator.fits 语义对齐
         data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 6100 } });
     }
     eventHandlers['session/event']({ type: 'assistant/message', sessionId: 's1', seq: 31, time: 2000,
-      data: { message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' }, content: [] }, usage: { inputTokens: 180000, cacheReadTokens: 0 } } }); // usage 需符合场景量级（≈整段上下文），否则 k̂ 被拉崩
+      data: { message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 'deepseek', model: 'deepseek-chat' }, content: [] }, usage: { inputTokens: 185000, cacheReadTokens: 0 } } }); // v0.6.31 observe>predict：真实 185000/(200000-8192)=96.4%≥95 折叠；无 reserve 则 92.5% 不折——保留 reserve 判别力
     eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 1, reason: { kind: 'completed' } } });
     const wj = ctx._wj.getOrCreate('s1').wj;
     assert.equal(wj.ledger.blocks.size, 1, 'output reserve 计入后应在 95% 线正确折叠');
@@ -1197,6 +1197,33 @@ test('v0.6.30：k̂ 冷启动保护——observed 钳到 [0.5, 5.0] 并记 degra
   for (let i = 0; i < 5; i++) est.observeUsage({ provider: 't', model: 'm', usageInputTokens: 500000, estRaw: 1800 });
   rec = est.calib.get('["t","m"]');
   assert.ok(rec.khatObserved <= 5.0, `连续极端输入下 k̂ 不得突破 5.0（实际 ${rec.khatObserved}）`);
+});
+
+test('v0.6.31：水位止血——clipped-k̂ 虚高被真实 input 纠偏，不再误触发强制折叠', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    ctx.compaction = { compactRegion: async () => ({ ok: true }) };
+    // 预置学习窗口 1M（复现 30e39a74 的 Day-1 形态：1M 窗口 + 挂载前历史不在账本）
+    const { writeFileSync: wf } = await import('node:fs');
+    wf(join(dir, 'models.learned.json'), JSON.stringify({ t: { m: { window: 1000000, output: 8192 } } }), 'utf8');
+    apply(ctx, { dir, shadowMode: false });
+    // ① 小账本 + 大 input → observed 巨大 → k̂ 钳到 5.0（Day-1 同款）
+    eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: 1, time: 1001,
+      data: { id: 'u01', role: 'user', content: 'x', tok: 20 } });
+    eventHandlers['session/event']({ type: 'assistant/message', sessionId: 's1', seq: 2, time: 1002,
+      data: { message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 't', model: 'm' }, content: [] }, usage: { inputTokens: 616400 } } });
+    assert.equal(ctx._wj.getOrCreate('s1').wj.estimator.calib.get('["t","m"]').khatObserved, 5.0, '前置：k̂ 已被钳到 5.0');
+    // ② 账本涨到 ~200K（真实 input 仍 616K ≈ 62%，无新观测）
+    for (let i = 2; i <= 43; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i + 1, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 4750 } });
+    }
+    // ③ turn/end：账面水位 ≈105%（k̂5 × estRaw 200K），真实 62% → 止血生效，不折叠
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 9, reason: { kind: 'completed' } } });
+    assert.equal(ctx._wj.getOrCreate('s1').wj.ledger.blocks.size, 0, '真实 62% 不应被假水位 102% 骗折（Day-1 回归）');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('[水位] 账面')), '应记录账面/真实背离');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
