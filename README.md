@@ -2,7 +2,7 @@
 
 > 读书破万卷。上下文像卷轴一样一折一折收起来，需要时再展开。
 
-[![version](https://img.shields.io/github/v/tag/05shizuku/wanjuan)](https://github.com/05shizuku/wanjuan/releases) [![tests](https://img.shields.io/badge/tests-196%20passing-brightgreen)](https://github.com/05shizuku/wanjuan/actions) [![node](https://img.shields.io/badge/node-%E2%89%A520-blue)](https://nodejs.org) [![license](https://img.shields.io/badge/license-MIT-lightgrey)](#-license)
+[![version](https://img.shields.io/github/v/tag/05shizuku/wanjuan)](https://github.com/05shizuku/wanjuan/releases) [![tests](https://img.shields.io/badge/tests-197%20passing-brightgreen)](https://github.com/05shizuku/wanjuan/actions) [![node](https://img.shields.io/badge/node-%E2%89%A520-blue)](https://nodejs.org) [![license](https://img.shields.io/badge/license-MIT-lightgrey)](#-license)
 
 **万卷** 是一个为 LLM 宿主（如 DeepSeek Harness）设计的**上下文压缩内核**。纯原生 Node.js ESM（>= 20），零第三方依赖，以事件溯源（Event Sourcing）与「前缀纪律」为根基，解决长对话场景下的窗口爆炸与 KV 缓存失效问题。
 
@@ -101,7 +101,7 @@ flowchart TB
 | `report.buildReport` | ✅ v0.6.19 已接线 | `wj_report` 现附完整月报段（命中率/责任归属/块统计；归因数值 M5 充实） |
 | `Observer` | 有测试（7 项）、未接线 | 与 Diagnoser 两套遥测待合并 |
 | `snapshot.json` | 接口预留 | M4.3 摊销压缩已以更简方式覆盖 |
-| **v0.7 模型自适应**（进行中） | 复审推演沉淀 + 模块审计 | ✅ **baseline 附加量模型已交付** · ✅ **M5.1 指纹精确驱逐已交付**（seq < 表面最小值零误驱逐对账）· ✅ **启动回溯入账已交付**（挂载时从宿主表面反向重建历史，幂等；账本从此覆盖全会话）·（estFinal = estRaw × k̂ × 1.05 + baseline，结构性开销加法吸收，k̂ 回归纯估算误差）· 启动回溯入账（surface 反向重建历史）· 超窗口桥接降级 skip · 切窗主动预警 · 分批折叠（每批 ≤100K）· host-bootstrap 归因类别 · **工程卫生**：Math.min(...spread) 改 reduce（6 万条防栈溢出）· orphan-mut degrade · compress at=0 时间锚修正 · fsync 权衡评估 |
+| **v0.7 模型自适应**（进行中） | 复审推演沉淀 + 模块审计 | ✅ **baseline 附加量模型已交付** · ✅ **M5.1 指纹精确驱逐已交付**（v0.7.4 判据升级：不在表面且宿主已推进到其后——覆盖最老收缩与中部空洞两种压缩形态，零误驱逐）· ✅ **启动回溯入账已交付**（挂载时从宿主表面反向重建历史，幂等；账本从此覆盖全会话）·（estFinal = estRaw × k̂ × 1.05 + baseline，结构性开销加法吸收，k̂ 回归纯估算误差）· 启动回溯入账（surface 反向重建历史）· 超窗口桥接降级 skip · 切窗主动预警 · 分批折叠（每批 ≤100K）· host-bootstrap 归因类别 · **工程卫生**：Math.min(...spread) 改 reduce（6 万条防栈溢出）· orphan-mut degrade · compress at=0 时间锚修正 · fsync 权衡评估 |
 
 `classifyMiss` 归因分类当前只产出 `new / unattributed`（`overrideMissKind` 注入口已预留），完整归因 **M5 交付**。
 

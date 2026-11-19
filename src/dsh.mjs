@@ -849,19 +849,21 @@ export function apply(ctx, config = {}) {
               const actives = wj.ledger.getActiveMessages();
               const missing = actives.filter((m) => !surfaceIds.has(m.id));
               if (missing.length > 0) {
-                // v0.7.1 M5.1：精确驱逐——宿主压缩总是从最老处收缩，seq 严格小于表面
-                // 最小 seq 的消息必不在表面（零误驱逐）；seq ≥ min 或无 seq 的保留观察。
-                const minSurfaceSeq = Math.min(...nodes.filter(Number.isFinite));
+                // v0.7.4 M5.1b：驱逐判据升级——「不在表面 且 宿主已推进到其后」。
+                // 消息不在 surfaceIds，且表面存在 seq 更大的节点 ⟹ 宿主已处理到该消息之后，
+                // 它已被压缩/移除。对「最老收缩」与「中部空洞」两种宿主压缩形态都成立，
+                // 零误驱逐：还活着的消息必在 surfaceIds 里。无 seq 的消息无法判定，保留观察。
+                const maxSurfaceSeq = Math.max(...nodes.filter(Number.isFinite));
                 const evictIds = missing
-                  .filter((m) => typeof m.seq === 'number' && m.seq < minSurfaceSeq)
+                  .filter((m) => typeof m.seq === 'number' && m.seq < maxSurfaceSeq)
                   .map((m) => m.id);
                 if (evictIds.length > 0) {
                   wj.ledger.recordEvict({ ids: evictIds, why: 'reconcile' });
-                  plugin.pushLog('warn', `指纹对账（M5.1）：账本活跃 ${actives.length} 条中 ${evictIds.length} 条已被宿主压缩（seq < ${minSurfaceSeq}），已驱逐对齐`);
+                  plugin.pushLog('warn', `指纹对账（M5.1）：账本活跃 ${actives.length} 条中 ${evictIds.length} 条已被宿主压缩（不在表面且宿主已推进到其后），已驱逐对齐`);
                 }
                 const rest = missing.length - evictIds.length;
                 if (rest > 0) {
-                  plugin.pushLog('log', `指纹观察：另有 ${rest} 条不在表面但 seq ≥ 表面最小值（重建存疑），保留观察`);
+                  plugin.pushLog('log', `指纹观察：另有 ${rest} 条不在表面且无 seq 可判定（重建存疑），保留观察`);
                 }
               }
             }

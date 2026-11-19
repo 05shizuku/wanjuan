@@ -1466,6 +1466,32 @@ test('v0.7.3：超窗口桥接降级——context length 判 skip 而非 failed'
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.7.4 M5.1b：中部空洞型压缩——seq < 表面最大值即驱逐（bb00f425 85.6% 误差根治）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    // 时间序 1..5 共 5 条消息；宿主在中部压缩了 2~4（表面只剩 1 和 5）
+    const ids = ['m1', 'm2', 'm3', 'm4', 'm5'];
+    for (let i = 1; i <= 5; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: ids[i - 1], role: 'user', content: `m${i}`, tok: 10 } });
+    }
+    const fakeSession = {
+      seq: 5,
+      surface: { nodes: [1, 5] }, // 中部空洞：2~4 被宿主压缩
+      eventAt: (q) => (q === 1 ? { type: 'user/message', data: { id: 'm1' } } : q === 5 ? { type: 'user/message', data: { id: 'm5' } } : undefined),
+      id: 's1',
+    };
+    eventHandlers['session/event'](fakeSession, { type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 1, reason: { kind: 'completed' } } });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    // 旧判据（seq < min=1）：零驱逐 → estRaw 多算 400K（bb00f425 的 85.6% 误差根源）
+    // 新判据（不在表面 且 seq < max=5）：m2/m3/m4 驱逐，m1/m5 保留
+    assert.deepEqual(wj.ledger.getActiveMessages().map((m) => m.id).sort(), ['m1', 'm5'], '中部空洞的三条应被驱逐，两端保留');
+    for (const id of ['m2', 'm3', 'm4']) assert.equal(wj.ledger.messages.get(id).status, 'evicted', `${id} 应 evicted`);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {
