@@ -90,7 +90,7 @@ test('CI：全库只允许一处 usage / est_raw 除法', () => {
   const marker = 'KAHAT-SAMPLE-DIVISION';
   const markers = src.split(marker).length - 1;
   assert.equal(markers, 1);
-  const divisions = (src.match(/usageInputTokens\s*\/\s*estRaw/g) ?? []).length;
+  const divisions = (src.match(/\w+\s*\/\s*estRaw/g) ?? []).length; // v0.7：残差 = (input − baseline) / estRaw
   assert.equal(divisions, 1);
 });
 

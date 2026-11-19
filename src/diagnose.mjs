@@ -32,7 +32,7 @@ export class Diagnoser {
     this.path = join(dir, 'requests.jsonl');
   }
 
-  record({ n, t = Date.now(), provider, model, usage, est, khat, calibrating, degraded = [], divergeAt = null, overrideMissKind = null }) {
+  record({ n, t = Date.now(), provider, model, usage, est, khat, calibrating, degraded = [], divergeAt = null, overrideMissKind = null, baseline = 0 }) {
     const input = usage?.input_tokens ?? 0;
     const cached = usage?.cached ?? 0;
     const missTok = Math.max(0, input - cached);
@@ -49,6 +49,7 @@ export class Diagnoser {
       missTok,
       degraded: Array.isArray(degraded) ? [...degraded] : [],
       divergeAt,
+      baseline,
     };
     // v0.6.5：遥测非 durability 数据——超 5MB 轮转保留尾 2000 行，防止无限增长
     try {

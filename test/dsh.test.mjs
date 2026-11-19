@@ -1214,16 +1214,19 @@ test('v0.6.31：水位止血——clipped-k̂ 虚高被真实 input 纠偏，不
       data: { id: 'u01', role: 'user', content: 'x', tok: 20 } });
     eventHandlers['session/event']({ type: 'assistant/message', sessionId: 's1', seq: 2, time: 1002,
       data: { message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 't', model: 'm' }, content: [] }, usage: { inputTokens: 616400 } } });
-    assert.equal(ctx._wj.getOrCreate('s1').wj.estimator.calib.get('["t","m"]').khatObserved, 5.0, '前置：k̂ 已被钳到 5.0');
+    const calib = ctx._wj.getOrCreate('s1').wj.estimator.calib.get('["t","m"]');
+    assert.equal(calib.khatObserved, 1.0, 'v0.7 baseline 吸收结构缺口后 k̂ 回归 1.0（不再钳 5.0）');
+    assert.equal(ctx._wj._sessionBaseline.get('s1').baseline, 616379, 'baseline = input − estRaw（含 a1 的 1 tok，结构性开销 616379）');
     // ② 账本涨到 ~200K（真实 input 仍 616K ≈ 62%，无新观测）
     for (let i = 2; i <= 43; i++) {
       eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i + 1, time: 1000 + i,
         data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 4750 } });
     }
-    // ③ turn/end：账面水位 ≈105%（k̂5 × estRaw 200K），真实 62% → 止血生效，不折叠
+    // ③ turn/end：v0.7 水位 = (estFinal + baseline)/usable ≈ (210K + 616K)/992K ≈ 83%——
+    // 强折线（95%）不触发；nudge 线（80%）触发但二次确认（真实 62% < 80%）拦截
     eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 9, reason: { kind: 'completed' } } });
-    assert.equal(ctx._wj.getOrCreate('s1').wj.ledger.blocks.size, 0, '真实 62% 不应被假水位 102% 骗折（Day-1 回归）');
-    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('[水位] 账面')), '应记录账面/真实背离');
+    assert.equal(ctx._wj.getOrCreate('s1').wj.ledger.blocks.size, 0, '真实 62% 不应被假水位骗折（Day-1 回归）');
+    assert.equal(ctx._wj._pendingNudge.size, 0, '真实 62% < 80%：nudge 应被二次确认拦截');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1352,7 +1355,7 @@ test('v0.6.35：Day-3 回归——真实 26% 时不得产出 nudge（观测>预�
     eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 9, reason: { kind: 'completed' } } });
     assert.equal(ctx._wj._pendingNudge.size, 0, '真实 26% 不得产出 nudge（Day-3 bb00f425 回归）');
     assert.ok(!ctx._wj.logs.some((l) => l.msg.includes('nudge 已产出')), '不得有产出日志');
-    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('[水位] 账面')), '账面/真实背离应被记录');
+    // v0.7 baseline 后：estFinal+baseline 与真实差距收敛（<20% 阈值），背离日志不再触发属正确行为
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

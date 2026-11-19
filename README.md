@@ -101,7 +101,7 @@ flowchart TB
 | `report.buildReport` | ✅ v0.6.19 已接线 | `wj_report` 现附完整月报段（命中率/责任归属/块统计；归因数值 M5 充实） |
 | `Observer` | 有测试（7 项）、未接线 | 与 Diagnoser 两套遥测待合并 |
 | `snapshot.json` | 接口预留 | M4.3 摊销压缩已以更简方式覆盖 |
-| **v0.7 模型自适应**（规划） | 复审推演沉淀 + 模块审计 | **baseline 附加量模型**（estFinal = estRaw × k̂ × 1.05 + baseline，根治 k̂ 冷启动双向偏差）· 启动回溯入账（surface 反向重建历史）· 超窗口桥接降级 skip · 切窗主动预警 · 分批折叠（每批 ≤100K）· host-bootstrap 归因类别 · **工程卫生**：Math.min(...spread) 改 reduce（6 万条防栈溢出）· orphan-mut degrade · compress at=0 时间锚修正 · fsync 权衡评估 |
+| **v0.7 模型自适应**（进行中） | 复审推演沉淀 + 模块审计 | ✅ **baseline 附加量模型已交付**（estFinal = estRaw × k̂ × 1.05 + baseline，结构性开销加法吸收，k̂ 回归纯估算误差）· 启动回溯入账（surface 反向重建历史）· 超窗口桥接降级 skip · 切窗主动预警 · 分批折叠（每批 ≤100K）· host-bootstrap 归因类别 · **工程卫生**：Math.min(...spread) 改 reduce（6 万条防栈溢出）· orphan-mut degrade · compress at=0 时间锚修正 · fsync 权衡评估 |
 
 `classifyMiss` 归因分类当前只产出 `new / unattributed`（`overrideMissKind` 注入口已预留），完整归因 **M5 交付**。
 

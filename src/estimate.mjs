@@ -56,7 +56,7 @@ export class Estimator {
     return { n, calibrating: n < MIN_SAMPLES };
   }
 
-  observeUsage({ provider, model, usageInputTokens, estRaw }) {
+  observeUsage({ provider, model, usageInputTokens, estRaw, baseline = 0 }) {
     if (!(estRaw > 0)) {
       this._warn(`khat 更新被拒: estRaw=${estRaw}`);
       this._degrade('bad-est-raw');
@@ -67,14 +67,12 @@ export class Estimator {
       this._degrade('bad-usage');
       return false;
     }
-    // KAHAT-SAMPLE-DIVISION（CI：本文件唯一除法）
-    const rawObserved = usageInputTokens / estRaw;
-    // v0.6.30 冷启动保护：observed 上限/下限钳制。
-    // 根因：万卷挂载时账本只有部分消息，宿主真实 input 含 system prompt / tools / 挂载前历史，
-    // observed 可达数百（真机实测 298：input 541565 / estRaw 1814）。此值进 EMA 后数十轮才收敛，
-    // 期间水位判定失真 10~100 倍（误折/漏折）。策略：clip 到 [0.5, 5.0]，超限记 degraded 可观测。
-    // 诚实声明：clip 只是把灾难限到 5 倍，非根治——根治是 v0.7 的 baseline 附加量模型
-    // （estFinal = estRaw × k̂ × 1.05 + baseline，结构性漏算与估算误差解耦）。
+    // v0.7 baseline 附加量模型：k̂ 只吸收「估算误差」（残差 = input − baseline，应 ≈ estRaw），
+    // 结构性开销（system/tools/挂载前历史）由 baseline 加法吸收——两者解耦，EMA 快速收敛。
+    // input 低于 baseline（宿主压缩了账本不知道的内容）时残差按 0 处理（k̂ 不会变负）。
+    // v0.6.30 的 [0.5, 5.0] 钳制保留为安全网（baseline 模型下应极少触发——可观测信号）。
+    const residual = Math.max(0, usageInputTokens - baseline);
+    const rawObserved = residual / estRaw; // KAHAT-SAMPLE-DIVISION（CI：本文件唯一除法）
     const observed = Math.max(0.5, Math.min(5.0, rawObserved));
     if (rawObserved !== observed) this._degrade('khat-observed-clipped');
     const key = this._key(provider, model);

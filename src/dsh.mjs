@@ -76,6 +76,7 @@ export class WanjuanPlugin {
     this._injectedTurns = new Map();  // sessionId -> Set<turn>（同 turn 只注一次）
     this._lastRealInput = new Map();  // sessionId -> { input, t }（最近一次真实 usage 观测，水位止血用）
     this._lastDivergeLog = new Map(); // sessionId -> t（背离日志节流，10 分钟/会话）
+    this._sessionBaseline = new Map(); // sessionId -> { baseline, t }（v0.7 附加量模型：结构性开销）
   }
 
   pushLog(level, msg) {
@@ -458,6 +459,19 @@ export function apply(ctx, config = {}) {
         est = wj.estimator.estimate({ messages: active }, { provider, model });
       }
     } catch {}
+    // v0.7 baseline 附加量模型：首观测测量结构性开销（input − estRaw = system/tools/挂载前历史），
+    // 宿主压缩导致间距收缩时向下跟踪（min 规则）。k̂ 的残差 = input − baseline，回归纯估算误差。
+    let baseline = 0;
+    try {
+      if (sessionId && u.input > 0 && est) {
+        const gap = Math.max(0, u.input - est.estRaw);
+        const prev = plugin._sessionBaseline?.get(sessionId);
+        if (!prev || gap < prev.baseline) {
+          plugin._sessionBaseline.set(sessionId, { baseline: gap, t: Date.now() });
+        }
+        baseline = plugin._sessionBaseline.get(sessionId)?.baseline ?? 0;
+      }
+    } catch {}
     try {
       wj.diagnoser.record({
         usage: usageObj,
@@ -467,6 +481,7 @@ export function apply(ctx, config = {}) {
         khat: est?.khat,
         calibrating: est?.calibrating,
         degraded: wj.estimator.getDegraded(),
+        baseline,
       });
     } catch (e) {
       plugin.pushLog('warn', `diagnoser.record fail: ${e.message}`);
@@ -477,7 +492,7 @@ export function apply(ctx, config = {}) {
     // 这部分开销会被 k̂ 一并吸收——对水位预测反而更准。
     try {
       if (est && u.input > 0) {
-        wj.estimator.observeUsage({ provider, model, usageInputTokens: u.input, estRaw: est.estRaw });
+        wj.estimator.observeUsage({ provider, model, usageInputTokens: u.input, estRaw: est.estRaw, baseline });
       }
     } catch {}
     // v0.6.31：记录最近真实 input——它是水位的正确分子（天然含 system/tools/挂载前历史），
@@ -853,7 +868,10 @@ export function apply(ctx, config = {}) {
         // 已知边界：est.output 与 window 不同源（output 静态来自 models.json/学习文件，window 动态解析自宿主注册表）——
         // 未知模型 output 兜底 8192，对大窗口偏保守（折叠偏早方向，安全）
         const usable = Math.max(1, window - (est.output ?? 0));
-        let usageRatio = est.estFinal / usable;
+        // v0.7 baseline 附加量模型：账面水位 = (estFinal + baseline) / usable——
+        // estFinal 只含账本可见消息的估算，结构性开销（system/tools/挂载前历史）由 baseline 加法补上。
+        const sessionBaseline = plugin._sessionBaseline?.get(sessionId)?.baseline ?? 0;
+        let usageRatio = (est.estFinal + sessionBaseline) / usable;
         // v0.6.31 止血：有新鲜真实观测（30 分钟内）时，水位以真实 input 为准（观测 > 预测）。
         // Day-1 实测：clipped-k̂ 钉死 5.0 的会话，账面水位 102.2% 而真实仅 62%——k̂ 乘数在
         // 「永久性结构缺口」（挂载前历史不在账本）面前数学上无解，EMA 钉死不收敛，
