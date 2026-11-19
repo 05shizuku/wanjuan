@@ -787,6 +787,24 @@ export function apply(ctx, config = {}) {
         Promise.resolve().then(async () => {
           // M4.4 冷启动探针：此刻本进程尚无任何压缩在途，发现的未匹配 start 必为崩溃遗留，直接对账解锁
           try { await busyLockRepair(a0); } catch {}
+          // v0.7.2 启动回溯入账：从宿主表面反向重建挂载前历史（幂等——recordMsg 按 id 去重）。
+          // 账本从此覆盖全会话：nudge/强折的候选池包含真实最老消息，baseline 收缩至 system+tools。
+          try {
+            const nodes = a0?.surface?.nodes;
+            if (Array.isArray(nodes) && nodes.length > 0) {
+              let backfilled = 0;
+              for (const sq of nodes) {
+                const sev = a0.eventAt?.(sq);
+                const t = String(sev?.type ?? '');
+                if (!t.includes('user') && !t.includes('assistant') && !t.includes('tool')) continue;
+                const msg = (t.includes('assistant') || t.includes('tool')) ? sev?.data?.message : sev?.data;
+                if (!msg?.id || wj.ledger.messages.has(msg.id)) continue;
+                recordOne(wj, msg, sev?.time ?? Date.now(), sq);
+                backfilled += 1;
+              }
+              if (backfilled > 0) plugin.pushLog('warn', `v0.7 启动回溯：从宿主表面回填 ${backfilled} 条挂载前消息（账本现在覆盖全会话）`);
+            }
+          } catch (e) { plugin.pushLog('warn', `启动回溯失败：${e.message}`); }
           return plugin._autoReconcile?.();
         }).catch(() => {});
       }

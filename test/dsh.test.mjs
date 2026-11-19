@@ -1402,6 +1402,37 @@ test('v0.7.1 M5.1：指纹精确驱逐——seq < 表面最小值的零误驱逐
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.7.2：启动回溯入账——从宿主表面重建挂载前历史（幂等）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    // 宿主会话：表面有 3 条挂载前消息（UUID id，时间序）
+    const fakeSession = {
+      seq: 3,
+      surface: { nodes: [1, 2, 3] },
+      eventAt: (q) => ({
+        1: { type: 'user/message', time: 100, data: { id: 'pre-aaa', role: 'user', content: '挂载前1' } },
+        2: { type: 'assistant/message', time: 200, data: { message: { id: 'pre-bbb', role: 'assistant', content: [{ type: 'text', text: '挂载前2' }] } } },
+        3: { type: 'user/message', time: 300, data: { id: 'pre-ccc', role: 'user', content: '挂载前3' } },
+      })[q],
+      append: () => {},
+      id: 's1',
+    };
+    eventHandlers['session/event'](fakeSession, { type: 'user/message', sessionId: 's1', seq: 4, time: 400,
+      data: { id: 'u01', role: 'user', content: '挂载后', tok: 10 } });
+    for (let i = 0; i < 40 && !ctx._wj.logs.some((l) => l.msg.includes('启动回溯')); i++) await new Promise((r) => setTimeout(r, 10));
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    assert.deepEqual(wj.ledger.getActiveMessages().map((m) => m.id).sort(), ['pre-aaa', 'pre-bbb', 'pre-ccc', 'u01'].sort(), '挂载前历史应被回填');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('回填 3 条')), '应记录回填数量');
+    // 幂等：kick 只跑一次 + recordMsg 去重——新事件不重复回填
+    eventHandlers['session/event'](fakeSession, { type: 'user/message', sessionId: 's1', seq: 5, time: 500,
+      data: { id: 'u02', role: 'user', content: '挂载后2', tok: 10 } });
+    for (let i = 0; i < 20; i++) await new Promise((r) => setTimeout(r, 10));
+    assert.equal(wj.ledger.getActiveMessages().length, 5, '幂等：4 条回填 + 1 条新消息');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {
