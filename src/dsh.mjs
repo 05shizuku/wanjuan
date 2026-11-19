@@ -913,6 +913,26 @@ export function apply(ctx, config = {}) {
           const cseqs = cand.map((m) => m.seq).filter((x) => typeof x === 'number');
           const span = cseqs.length ? `（seq ${Math.min(...cseqs)}→${Math.max(...cseqs)}，共 ${cand.length} 条）` : `（共 ${cand.length} 条）`;
           const turnNo = ev.data?.turn ?? 0;
+          // v0.6.35 二次确认：Day-3 实测个别 turn/end 的观测>预测纠偏未生效
+          // （bb00f425 真实 26~32% 时仍产出 6 次）——产出前用最近真实观测复核，
+          // 双重保险；无新鲜观测时记诊断日志，定位失效路径。
+          let skipNudge = false;
+          try {
+            const realNow = plugin._lastRealInput?.get(sessionId);
+            if (realNow && Date.now() - realNow.t < 30 * 60 * 1000 && realNow.input > 0) {
+              const realRatioNow = realNow.input / usable;
+              if (realRatioNow < 0.80) {
+                skipNudge = true;
+                plugin.pushLog('log', `[nudge] 二次确认：真实水位 ${(realRatioNow * 100).toFixed(1)}% < 80%，跳过产出（账面 ${(usageRatio * 100).toFixed(1)}%）`);
+              }
+            } else {
+              const lastT = plugin._lastDivergeLog?.get(sessionId + '|nn') ?? 0;
+              if (Date.now() - lastT > 30 * 60 * 1000) {
+                (plugin._lastDivergeLog ?? new Map()).set(sessionId + '|nn', Date.now());
+                plugin.pushLog('log', '[nudge] 无新鲜真实观测，按账面水位产出（诊断）');
+              }
+            }
+          } catch {}
           let nudgeMsg = null;
           let candidateIds = [];
           try {
@@ -925,7 +945,7 @@ export function apply(ctx, config = {}) {
           } catch (e) {
             plugin.pushLog('warn', `[nudge] 构建失败：${e.message}`);
           }
-          if (nudgeMsg) {
+          if (!skipNudge && nudgeMsg) {
             // 风险 B 接线：上一轮 nudge 已送达但模型未消费（消费走 accept 清账）→ 记 reject 降频，防 nagging
             const old = plugin._pendingNudge.get(sessionId);
             if (old && old.injectedAt !== undefined && old.turn !== turnNo && old.candidateIds.length > 0) {
@@ -937,7 +957,7 @@ export function apply(ctx, config = {}) {
             }
             plugin._pendingNudge.set(sessionId, { message: nudgeMsg, turn: turnNo, candidateIds });
             plugin.pushLog('warn', `⚠️ 水位达到 ${(usageRatio * 100).toFixed(1)}%，nudge 已产出（turn ${turnNo}，${nudgeMsg.tok} tok），待下轮 pre-step 注入${span}。`);
-          } else {
+          } else if (!skipNudge) {
             plugin.pushLog('warn', `⚠️ 水位达到 ${(usageRatio * 100).toFixed(1)}%，nudge 被降频规则过滤（建议主动调用 wj_compress 折叠最老消息${span}）。`);
           }
         }

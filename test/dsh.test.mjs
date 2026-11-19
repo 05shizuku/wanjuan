@@ -1330,6 +1330,48 @@ test('v0.6.34：UUID 乱序——getActiveMessages 时间序，nudge 区间可�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.6.35：Day-3 回归——真实 26% 时不得产出 nudge（观测>预测 + 二次确认）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    // 预置学习窗口 1M（复现 bb00f425 形态）
+    const { writeFileSync: wf } = await import('node:fs');
+    wf(join(dir, 'models.learned.json'), JSON.stringify({ t: { m: { window: 1000000, output: 8192 } } }), 'utf8');
+    apply(ctx, { dir, shadowMode: false });
+    // ① 小账本 + 大 input → k̂ 钳到 5
+    eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: 1, time: 1001,
+      data: { id: 'u01', role: 'user', content: 'x', tok: 20 } });
+    eventHandlers['session/event']({ type: 'assistant/message', sessionId: 's1', seq: 2, time: 1002,
+      data: { message: { id: 'a1', role: 'assistant', source: { kind: 'model', provider: 't', model: 'm' }, content: [] }, usage: { inputTokens: 616400 } } });
+    // ② 账本涨到 ~180K（真实 input 仍 26 万 ≈ 26%）
+    for (let i = 2; i <= 39; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i + 1, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 4750 } });
+    }
+    // ③ turn/end：账面 ~81%（k̂4.3 × estRaw 180K），真实 26% → 观测>预测 + 二次确认双重拦截
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 9, reason: { kind: 'completed' } } });
+    assert.equal(ctx._wj._pendingNudge.size, 0, '真实 26% 不得产出 nudge（Day-3 bb00f425 回归）');
+    assert.ok(!ctx._wj.logs.some((l) => l.msg.includes('nudge 已产出')), '不得有产出日志');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('[水位] 账面')), '账面/真实背离应被记录');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.6.35：无新鲜观测诊断日志——nudge 按账面产出的路径可见', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 25; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: i <= 4 ? 25000 : 10 } });
+    }
+    // 清空真实观测（模拟无观测 turn）→ 按账面产出 + 诊断日志可见
+    ctx._wj._lastRealInput.clear();
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 1, reason: { kind: 'completed' } } });
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('无新鲜真实观测')), '应记诊断日志（定位失效路径）');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {

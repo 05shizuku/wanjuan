@@ -2,7 +2,7 @@
 
 > 读书破万卷。上下文像卷轴一样一折一折收起来，需要时再展开。
 
-[![version](https://img.shields.io/github/v/tag/05shizuku/wanjuan)](https://github.com/05shizuku/wanjuan/releases) [![tests](https://img.shields.io/badge/tests-190%20passing-brightgreen)](https://github.com/05shizuku/wanjuan/actions) [![node](https://img.shields.io/badge/node-%E2%89%A520-blue)](https://nodejs.org) [![license](https://img.shields.io/badge/license-MIT-lightgrey)](#-license)
+[![version](https://img.shields.io/github/v/tag/05shizuku/wanjuan)](https://github.com/05shizuku/wanjuan/releases) [![tests](https://img.shields.io/badge/tests-192%20passing-brightgreen)](https://github.com/05shizuku/wanjuan/actions) [![node](https://img.shields.io/badge/node-%E2%89%A520-blue)](https://nodejs.org) [![license](https://img.shields.io/badge/license-MIT-lightgrey)](#-license)
 
 **万卷** 是一个为 LLM 宿主（如 DeepSeek Harness）设计的**上下文压缩内核**。纯原生 Node.js ESM（>= 20），零第三方依赖，以事件溯源（Event Sourcing）与「前缀纪律」为根基，解决长对话场景下的窗口爆炸与 KV 缓存失效问题。
 
