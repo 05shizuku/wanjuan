@@ -988,7 +988,7 @@ test('v0.6.19：store.replay 的 degraded 不再跨次累积', async () => {
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
-test('v0.6.19：fingerprint 观察模式——账本活跃从宿主表面消失时告警（不驱逐）', async () => {
+test('v0.7.1：指纹对账——重建不完整时（seq ≥ 表面最小值）保留观察，不误驱逐', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
   try {
     const { ctx, eventHandlers } = freshCtx(dir);
@@ -1007,8 +1007,8 @@ test('v0.6.19：fingerprint 观察模式——账本活跃从宿主表面消失�
     eventHandlers['session/event'](fakeSession, { type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 1, reason: { kind: 'completed' } } });
     const hit = ctx._wj.logs.find((l) => l.msg.includes('指纹观察'));
     assert.ok(hit, '应产生指纹观察告警');
-    assert.ok(hit.msg.includes('2 条不在宿主表面'), '应指出漂移数量');
-    assert.equal(ctx._wj.getOrCreate('s1').wj.ledger.getActiveMessages().length, 3, '观察模式不驱逐，活跃集不变');
+    assert.ok(hit.msg.includes('另有 2 条不在表面'), '应指出保留观察的数量（seq ≥ 表面最小值，重建存疑）');
+    assert.equal(ctx._wj.getOrCreate('s1').wj.ledger.getActiveMessages().length, 3, '重建存疑时不驱逐，活跃集不变');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -1372,6 +1372,33 @@ test('v0.6.35：无新鲜观测诊断日志——nudge 按账面产出的路径�
     ctx._wj._lastRealInput.clear();
     eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 1, reason: { kind: 'completed' } } });
     assert.ok(ctx._wj.logs.some((l) => l.msg.includes('无新鲜真实观测')), '应记诊断日志（定位失效路径）');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.1 M5.1：指纹精确驱逐——seq < 表面最小值的零误驱逐对账', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 3; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 10 } });
+    }
+    // 一条无 seq 的账本消息（无法定位，必须保留）
+    ctx._wj.getOrCreate('s1').wj.ledger.recordMsg({ id: 'x1', tok: 5, content: '无seq' });
+    // 宿主表面：只有 seq 3 可见（u01/u02 被宿主压缩，u03 仍在表面）
+    const fakeSession = {
+      seq: 3,
+      surface: { nodes: [3] },
+      eventAt: (q) => (q === 3 ? { type: 'user/message', data: { id: 'u03' } } : undefined),
+      id: 's1',
+    };
+    eventHandlers['session/event'](fakeSession, { type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 1, reason: { kind: 'completed' } } });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    assert.deepEqual(wj.ledger.getActiveMessages().map((m) => m.id).sort(), ['u03', 'x1'], 'seq < 3 的 u01/u02 被驱逐，u03 与无 seq 的 x1 保留');
+    assert.equal(wj.ledger.messages.get('u01').status, 'evicted', 'u01 应标记 evicted');
+    assert.equal(wj.ledger.messages.get('u02').status, 'evicted', 'u02 应标记 evicted');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('指纹对账（M5.1）') && l.msg.includes('2 条已被宿主压缩')), '应记录驱逐对账');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

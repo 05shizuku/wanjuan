@@ -830,7 +830,20 @@ export function apply(ctx, config = {}) {
               const actives = wj.ledger.getActiveMessages();
               const missing = actives.filter((m) => !surfaceIds.has(m.id));
               if (missing.length > 0) {
-                plugin.pushLog('warn', `指纹观察：账本活跃 ${actives.length} 条中 ${missing.length} 条不在宿主表面（宿主侧可能已自行压缩）——观察模式，暂不自动驱逐`);
+                // v0.7.1 M5.1：精确驱逐——宿主压缩总是从最老处收缩，seq 严格小于表面
+                // 最小 seq 的消息必不在表面（零误驱逐）；seq ≥ min 或无 seq 的保留观察。
+                const minSurfaceSeq = Math.min(...nodes.filter(Number.isFinite));
+                const evictIds = missing
+                  .filter((m) => typeof m.seq === 'number' && m.seq < minSurfaceSeq)
+                  .map((m) => m.id);
+                if (evictIds.length > 0) {
+                  wj.ledger.recordEvict({ ids: evictIds, why: 'reconcile' });
+                  plugin.pushLog('warn', `指纹对账（M5.1）：账本活跃 ${actives.length} 条中 ${evictIds.length} 条已被宿主压缩（seq < ${minSurfaceSeq}），已驱逐对齐`);
+                }
+                const rest = missing.length - evictIds.length;
+                if (rest > 0) {
+                  plugin.pushLog('log', `指纹观察：另有 ${rest} 条不在表面但 seq ≥ 表面最小值（重建存疑），保留观察`);
+                }
               }
             }
           }
