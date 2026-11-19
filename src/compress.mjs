@@ -38,7 +38,8 @@ export class Compressor {
       }
 
       toFold = activeMsgs.slice(startIndex, endIndex + 1);
-    }
+      foldIds = toFold.map((m) => m.id); // v0.6.34：range 也走 ids 精确折叠——此前只传 range，
+    }                                  // ledger 按字典序解析，折叠集合与 raw 归档不一致（外部用户报告）
 
     const blockId = this._nextBlockId();
     const srcTok = toFold.reduce((s, m) => s + (m.tok || 0), 0);

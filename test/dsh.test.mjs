@@ -203,8 +203,8 @@ test('compress：ids 精确折叠不受 UUID 字典序影响', () => {
     assert.equal(wj.ledger.messages.get('uuid-aaa').status, 'folded');
     assert.equal(wj.ledger.messages.get('uuid-bbb').status, 'active');
     const block = wj.ledger.getBlock(blockId);
-    // ids 数组按账本活跃序（id 字典序）存储，集合正确即可
-    assert.deepEqual(block.ids, ['uuid-aaa', 'uuid-ccc']);
+    // ids 集合正确即可（v0.6.34 起账本活跃序为时间序，ids 数组随之按时间序）
+    assert.deepEqual([...block.ids].sort(), ['uuid-aaa', 'uuid-ccc']);
     assert.deepEqual(block.atRange, [1000, 2000]);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
@@ -1302,6 +1302,31 @@ test('v0.6.33：wj_unfold 纯记账修复——折叠消息恢复活跃，原文
     // 幂等：再次调用应提示无折叠消息
     const out2 = await unfold.handler({ blockId: 'b1' });
     assert.ok(out2.content[0].text.includes('没有折叠中的消息'), '重复恢复应幂等提示');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.6.34：UUID 乱序——getActiveMessages 时间序，nudge 区间可正确压缩（外部报告回归）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers, registered } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    // 模拟宿主 UUID：时间序 1..6，但 id 是随机十六进制（字典序 ≠ 时间序）
+    const uuids = ['f13c1c60', '4bd8d65c', 'efcbd24c', '721a955a', '52db0961', 'a9d3e7f2'];
+    for (let i = 1; i <= 6; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: uuids[i - 1], role: 'user', content: `消息${i}`, tok: 10 } });
+    }
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    const order = wj.ledger.getActiveMessages().map((m) => m.id);
+    assert.deepEqual(order, uuids, '活跃集必须按时间序（at）返回，而非 id 字典序');
+    // nudge 语义的候选：时间序里第 2~4 条（端点 4bd8d65c ~ 721a955a）
+    const compress = registered.find((d) => d.name === 'wj_compress');
+    const out = await compress.handler({ range: ['4bd8d65c', '721a955a'], summary: '时间序区间折叠' });
+    const text = out.content?.[0]?.text ?? String(out);
+    assert.ok(text.includes('✅'), `时间序区间应折叠成功（实际：${text.slice(0, 80)}）`);
+    const folded = [...wj.ledger.messages.entries()].filter(([id, m]) => m.status === 'folded').map(([id]) => id); // id 是 Map 的键
+    assert.deepEqual(folded.sort(), ['4bd8d65c', '721a955a', 'efcbd24c'].sort(), '折叠的应是时间序区间的三条');
+    assert.equal(wj.ledger.getActiveMessages().length, 3, '剩余 3 条活跃');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

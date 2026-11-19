@@ -283,7 +283,11 @@ export class Ledger {
   getActiveMessages() {
     const out = [];
     for (const m of this.messages.values()) if (m.status === 'active') out.push(m.ev);
-    return out.sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+    // v0.6.34（外部用户报告）：按 (at, id) 时间序返回——此前按 id 字典序，UUID 下时间相邻
+    // 的消息在字典序里随机散布，compress 的 range 解析（在 activeMsgs 里 findIndex 端点）
+    // 约 50% 概率「起点在终点之后」报区间无效，另 50% 切出散乱错集（静默错折）。
+    // nudge 候选区间、手动 range、指纹 first/last 全部回归时间语义。
+    return out.sort((a, b) => (a.at ?? 0) - (b.at ?? 0) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
   }
   getBlock(id) { return this.blocks.get(id); }
   listBlocks() { return [...this.blocks.values()]; }
