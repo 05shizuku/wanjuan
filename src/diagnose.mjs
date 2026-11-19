@@ -9,16 +9,19 @@ import { join } from 'node:path';
 
 const EXPECTED_MISS = new Set(['new', 'compress-repay']);
 // 责任方映射
-const HOST_MISS = new Set(['rewrite', 'host-compact', 'host-rewrite']);
+const HOST_MISS = new Set(['rewrite', 'host-compact', 'host-rewrite', 'host-bootstrap']);
 const UPSTREAM_MISS = new Set(['ttl', 'provider-miss', 'switch-model']);
 const WANJUAN_MISS = new Set(['seam', 'abort']);
 
-export function classifyMiss({ usage, est, divergeAt = null }) {
+export function classifyMiss({ usage, est, divergeAt = null, baseline = 0 }) {
   if (!usage) return 'unattributed';
   if (typeof usage.input_tokens !== 'number') return 'unattributed';
   if (typeof usage.cached !== 'number') return 'unattributed';
   const missTok = Math.max(0, usage.input_tokens - usage.cached);
   if (missTok === 0) return 'new';
+  // v0.7.3：挂载前固定开销单列——账本消息可忽略（estRaw < baseline/10）且全量击穿，
+  // miss 几乎全部来自 system/tools/挂载前历史（结构性），单列 host-bootstrap 归 host 桶
+  if (usage.cached === 0 && !divergeAt && baseline > 0 && est && est.estRaw < baseline * 0.1) return 'host-bootstrap';
   // v0.6.27：门槛 10K → 1K（真机数据：6 个 ~9K 的新击穿全掉进了 unattributed）——
   // 全量击穿（cached=0）且无分歧点，基本就是上游的锅
   if (usage.cached === 0 && !divergeAt && missTok > 1000) return 'provider-miss';
@@ -36,7 +39,7 @@ export class Diagnoser {
     const input = usage?.input_tokens ?? 0;
     const cached = usage?.cached ?? 0;
     const missTok = Math.max(0, input - cached);
-    const missKind = overrideMissKind || classifyMiss({ usage, est, divergeAt });
+    const missKind = overrideMissKind || classifyMiss({ usage, est, divergeAt, baseline });
     
     const rec = {
       n, t, provider, model,

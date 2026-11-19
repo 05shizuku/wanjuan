@@ -734,6 +734,7 @@ export function apply(ctx, config = {}) {
           }
           // v0.6.4 失败分类：终态不重试（自动补桥才不会每轮空耗一次 LLM 摘要）
           if (msg.includes('not found in surface')) markBridge(sid, blockId, 'skip', '区间已不在宿主表面（早已压缩或锚点失效），视为对齐');
+          else if (msg.includes('context length') || msg.includes('maximum context') || msg.includes('too long')) markBridge(sid, blockId, 'skip', '区间过大宿主无法摘要（超窗口）——账本保持折叠，宿主侧由原生压缩接管'); // v0.7.3 超窗口降级
           else if (msg.includes('no open turn')) markBridge(sid, blockId, 'pending', 'deferred: 当前回合未闭合，下一阈值重试'); // v0.6.32 刀二：前置拒绝挂起重试，不再终态停摆
           else if (msg.includes('summary is not smaller')) markBridge(sid, blockId, 'skip', msg);
           else if (msg.includes('not a balanced boundary')) markBridge(sid, blockId, 'skip', msg);

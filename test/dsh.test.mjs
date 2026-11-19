@@ -1433,6 +1433,39 @@ test('v0.7.2：启动回溯入账——从宿主表面重建挂载前历史（�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.7.3：host-bootstrap 归因——账本可忽略时全量击穿单列 host 桶', async () => {
+  const { classifyMiss } = await import('../src/diagnose.mjs');
+  // 账本消息可忽略（estRaw 500 < baseline 50000 的 10%）且全量击穿 → host-bootstrap
+  assert.equal(classifyMiss({ usage: { input_tokens: 500000, cached: 0 }, est: { estRaw: 500 }, baseline: 50000 }), 'host-bootstrap');
+  // 账本消息占比显著（estRaw ≥ baseline/10）→ 不误判（走 provider-miss/unattributed 链）
+  assert.equal(classifyMiss({ usage: { input_tokens: 500000, cached: 0 }, est: { estRaw: 300000 }, baseline: 50000 }), 'provider-miss');
+  // 有分歧点 → 不误判
+  assert.equal(classifyMiss({ usage: { input_tokens: 500000, cached: 0 }, est: { estRaw: 500 }, baseline: 50000, divergeAt: 7 }), 'unattributed');
+  // 部分 cached → 不误判
+  assert.equal(classifyMiss({ usage: { input_tokens: 500000, cached: 200000 }, est: { estRaw: 500 }, baseline: 50000 }), 'unattributed');
+});
+
+test('v0.7.3：超窗口桥接降级——context length 判 skip 而非 failed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    ctx.compaction = { compactRegion: async () => { throw new Error('context length exceeded: 950000 tokens > 8192 maximum context'); } };
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 3; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 10 } });
+    }
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    wj.compressor.compress({ ids: ['u01', 'u02'], summary: '块摘要' });
+    ctx._wj._currentSessionId = 's1';
+    ctx._wj._lastHostSession = { id: 's1' };
+    await ctx._wj.tryHostCompaction(ctx._wj._lastHostSession, 1, 3, 'b1', 's1');
+    const st = ctx._wj.getOrCreate('s1').bridgeStatus.b1;
+    assert.equal(st.status, 'skip', '超窗口应降级 skip（账本保持折叠，宿主侧原生压缩接管）');
+    assert.ok((st.error ?? '').includes('超窗口'), '应注明超窗口原因');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {
