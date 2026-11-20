@@ -1492,6 +1492,68 @@ test('v0.7.4 M5.1b：中部空洞型压缩——seq < 表面最大值即驱逐�
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.7.5 P0-1：重扫命中不同 start（新桥接在途）→ 放弃补偿，不对在途压缩补 end', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    ctx._wj._repairWaitMs = 30;
+    // 可控 fake：首扫只看到旧 start@4；等待期内新桥接追加新 start@7（seq 推进到 8）
+    const sess = {
+      appended: [],
+      newStartLanded: false,
+      get seq() { return this.newStartLanded ? 8 : 5; },
+      append(type, data) { this.appended.push([type, data]); },
+      eventAt(q) {
+        if (q === 4) return { type: 'compaction/start', seq: 4, data: { compactionId: 'old' } };
+        if (q === 7 && this.newStartLanded) return { type: 'compaction/start', seq: 7, data: { compactionId: 'new' } };
+        return undefined;
+      },
+    };
+    setTimeout(() => { sess.newStartLanded = true; }, 10); // 新 start 在等待期内落盘
+    const repaired = await ctx._wj.busyLockRepair(sess);
+    assert.equal(repaired, false, '重扫命中不同 start（在途压缩）应放弃补偿');
+    assert.equal(sess.appended.length, 0, '不得对在途压缩补写 end（双 end = 会话消失）');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('重扫命中不同 start')), '应记录放弃原因');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.5 P1-2：tokenizer 宿主真实形态——tool-result 嵌套 content 与 reasoning 计入', async () => {
+  const { estimateTok } = await import('../src/tokenizer.mjs');
+  // 宿主真实形态：tool-result 载荷在嵌套 content 数组
+  const toolResultMsg = [{ type: 'tool-result', content: [{ type: 'text', text: '这是一段很长的工具输出'.repeat(10) }] }];
+  const tok = estimateTok(toolResultMsg);
+  assert.ok(tok > 50, `tool-result 嵌套内容应计入（实际 ${tok}，修复前 ≈1）`);
+  // reasoning 块的 thinking 字段计入
+  const reasoningMsg = [{ type: 'reasoning', thinking: '这是一段很长的思考过程'.repeat(10) }];
+  assert.ok(estimateTok(reasoningMsg) > 50, 'reasoning/thinking 应计入');
+  // 对照：空块仍 ≈1
+  assert.equal(estimateTok([{ type: 'tool-result', content: [] }]), 1, '空载荷仍最小非零');
+});
+
+test('v0.7.5 P2-2：收编归属持久化——owner.json 防根账本孤儿', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    // 第一轮：会话 A 收编根目录
+    const ctxA = { tools: { register: () => {} }, on: () => {}, logger: { info: () => {}, warn: () => {}, error: () => {} } };
+    apply(ctxA, { dir, shadowMode: false });
+    ctxA._wj.getOrCreate('session-aaaaaaaa');
+    const { existsSync: ex, readFileSync: rf } = await import('node:fs');
+    assert.ok(ex(join(dir, 'owner.json')), '收编后应写 owner.json');
+    assert.equal(JSON.parse(rf(join(dir, 'owner.json'))).sid, 'session-aaaaaaaa', 'owner 应记录收编者');
+    // 第二会话 B：独立目录
+    ctxA._wj.getOrCreate('session-bbbbbbbb');
+    assert.ok(ex(join(dir, 'sessions', 'session-bbbbbbbb')), 'B 应有独立目录');
+    // 模拟重启：全新 plugin 实例，A 仍映射根目录（owner.json 持久化）
+    const ctxB = { tools: { register: () => {} }, on: () => {}, logger: { info: () => {}, warn: () => {}, error: () => {} } };
+    apply(ctxB, { dir, shadowMode: false });
+    const recA = ctxB._wj.getOrCreate('session-aaaaaaaa');
+    assert.equal(recA.sid, dir, '重启后 A 仍映射根目录（owner.json）');
+    const recB = ctxB._wj.getOrCreate('session-bbbbbbbb');
+    assert.ok(recB.sid.includes('sessions'), 'B 仍映射独立目录');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {

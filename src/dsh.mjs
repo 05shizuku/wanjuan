@@ -115,10 +115,17 @@ export class WanjuanPlugin {
       // v0.6.17 多会话隔离：每会话独立账本目录（sessions/<sid>/）。
       // 首个会话收编根目录旧账本（升级无感，历史延续）；后续会话完全隔离，
       // 折叠选择不再跨会话混选，桥接 seq 恒为本会话日志位次。
-      const legacyReady = this._legacyAdopted !== true && !existsSync(join(this.dir, 'sessions'));
+      // v0.7.5 P2-2：收编归属持久化——根账本的 owner sid 记入 owner.json，此后该 sid
+      // 永远映射根目录（防第二会话诞生后根账本变孤儿：块检索/raw/baseline 全部不可达）
+      let ownerSid = null;
+      try { ownerSid = JSON.parse(readFileSync(join(this.dir, 'owner.json'), 'utf8')).sid ?? null; } catch {}
+      const legacyReady = ownerSid !== null ? key === ownerSid : (this._legacyAdopted !== true && !existsSync(join(this.dir, 'sessions')));
       const sid = key.replace(/[^\w.-]/g, '_').slice(0, 80) || 'default';
-      const sessionDir = legacyReady ? this.dir : join(this.dir, 'sessions', sid);
-      if (legacyReady) this._legacyAdopted = true;
+      const sessionDir = legacyReady ? this.dir : (ownerSid === key ? this.dir : join(this.dir, 'sessions', sid));
+      if (legacyReady) {
+        this._legacyAdopted = true;
+        try { writeFileSync(join(this.dir, 'owner.json'), JSON.stringify({ sid: key, at: Date.now() }), 'utf8'); } catch {}
+      }
       const wj = createWanjuan({ dir: sessionDir, compactionThreshold: this.config?.compactionThreshold });
       this._loadLearnedInto(wj); // 模型学习是全局知识，注入每个新会话
       let bridgeStatus = {};
@@ -148,7 +155,10 @@ export class WanjuanPlugin {
     if (this.shadowMode) {
       return '影子模式：只提示，不真的折叠。把 shadowMode 设为 false 才生效。';
     }
-    const wj = this._currentWj();
+    // v0.7.5 P2-1：入口快照会话指针——桥接 await 期间实时指针可能切换
+    const sid = this._currentSessionId ?? 'default';
+    const hostSession = this._lastHostSession;
+    const wj = this.getOrCreate(sid).wj;
     const before = new Set(wj.ledger.listBlocks().map((b) => b.id));
     wj.compressor.compress({
       ...args,
@@ -164,13 +174,13 @@ export class WanjuanPlugin {
         if (m.status === 'folded' && m.blockId === newBlock.id && typeof m.ev.seq === 'number') seqs.push(m.ev.seq);
       }
       if (seqs.length > 0) {
-        const p = this.tryHostCompaction(this._lastHostSession, Math.min(...seqs), Math.max(...seqs), newBlock.id, this._currentSessionId ?? 'default');
+        const p = this.tryHostCompaction(hostSession, Math.min(...seqs), Math.max(...seqs), newBlock.id, sid); // v0.7.5：快照
         if (p) await p; // 等宿主压缩完成再返回——工具结果消息必须落在压缩之后，表面稳定性才成立
       }
     }
     // M5.2：压缩成功 → 消费该会话的 pending nudge（模型已响应）
     try {
-      const sid = this._currentSessionId ?? 'default';
+      // v0.7.5 P2-1：用入口快照 sid（await 期间实时指针可能切换）
       const pending = this._pendingNudge.get(sid);
       if (pending && newBlock && pending.candidateIds.length > 0) {
         // 若本次折叠覆盖了候选区间的任一端，视为接受
@@ -195,7 +205,11 @@ export class WanjuanPlugin {
     if (this.shadowMode) return '影子模式：不执行补桥。';
     if (!this.tryHostCompaction || !this.dir) return '桥接未初始化（config.dir 未设置？）。';
     if (!this._lastHostSession) return '跳过（尚无宿主 session 引用，等首个会话事件后可用）。';
-    const srec = this.getOrCreate(this._currentSessionId ?? 'default');
+    // v0.7.5 P1-1：入口快照会话指针——循环 await（桥接最长 180s）期间实时指针可能切到
+    // 其他会话，把 A 的 seq 区间错压到 B 的 surface、把 A 的块状态写进 B 的 host-bridge.json
+    const hostSession = this._lastHostSession;
+    const entrySid = this._currentSessionId ?? 'default';
+    const srec = this.getOrCreate(entrySid);
     const wj = srec.wj;
     const bridgeStatus = srec.bridgeStatus ?? {};
     const out = [];
@@ -243,7 +257,7 @@ export class WanjuanPlugin {
         }
         out.push(`${b.id}: failed 冷却结束，重试`);
       }
-      const p = this.tryHostCompaction(this._lastHostSession, start, end, b.id, this._currentSessionId ?? 'default');
+      const p = this.tryHostCompaction(hostSession, start, end, b.id, entrySid); // v0.7.5 P1-1：快照
       if (p) await p;
       // v0.6.21 P0：读 srec.bridgeStatus（markBridge 原地修改该记录）——
       // this._bridgeStatus 在 await 期间可能已被其他会话的事件切换覆盖
@@ -616,6 +630,8 @@ export function apply(ctx, config = {}) {
           };
           let unmatched = scanUnmatched();
           if (!unmatched) return false;
+          const firstSeq = unmatched.seq; // v0.7.5 P0-1：锁定首扫目标——重扫必须命中同一条
+          const inFlightAtScan = plugin._bridgeInFlight ?? 0; // 首扫时在途数（反应式路径含失败的自身，基线化比较）
           // v0.6.32 刀一：补偿前等待重扫——上一实例的摘要可能仍在收尾，真 end 迟到落盘；
           // 立即补偿会造出「一个 start 两条 end」→ loader 判整本日志损坏 → 会话从侧栏消失
           // （尔水青禾案 5805 补偿 end + 5807 真 end）。等待时长可注入（测试用），默认 3 秒，
@@ -625,6 +641,12 @@ export function apply(ctx, config = {}) {
           unmatched = scanUnmatched();
           if (!unmatched) {
             plugin.pushLog('log', 'M4.4：重扫后发现 end 已自行落盘，跳过补偿');
+            return false;
+          }
+          // v0.7.5 P0-1：重扫必须命中同一 seq 且无在途桥接——3 秒窗口内 wanjuan 自己的
+          // 新桥接会追加新 start，对在途压缩补 end = 双 end（会话消失的回归路径）。放弃本轮零成本。
+          if (unmatched.seq !== firstSeq || (plugin._bridgeInFlight ?? 0) > inFlightAtScan) { // 有【新增】在途桥接才阻断
+            plugin.pushLog('log', `M4.4：重扫命中不同 start（seq ${unmatched.seq} ≠ ${firstSeq}）或有在途桥接，放弃本轮补偿（inFlight=${plugin._bridgeInFlight ?? 0} vs 首扫=${inFlightAtScan}）`);
             return false;
           }
           sess.append('compaction/end', {
@@ -853,7 +875,8 @@ export function apply(ctx, config = {}) {
                 // 消息不在 surfaceIds，且表面存在 seq 更大的节点 ⟹ 宿主已处理到该消息之后，
                 // 它已被压缩/移除。对「最老收缩」与「中部空洞」两种宿主压缩形态都成立，
                 // 零误驱逐：还活着的消息必在 surfaceIds 里。无 seq 的消息无法判定，保留观察。
-                const maxSurfaceSeq = Math.max(...nodes.filter(Number.isFinite));
+                let maxSurfaceSeq = 0; // v0.7.5 P2-3：循环求 max（spread 在 >65K 节点时抛 RangeError → 探针静默停摆）
+                for (const sq of nodes) if (Number.isFinite(sq) && sq > maxSurfaceSeq) maxSurfaceSeq = sq;
                 const evictIds = missing
                   .filter((m) => typeof m.seq === 'number' && m.seq < maxSurfaceSeq)
                   .map((m) => m.id);
@@ -868,7 +891,14 @@ export function apply(ctx, config = {}) {
               }
             }
           }
-        } catch {}
+        } catch (e) {
+        // v0.7.5 P2-3：探针异常不再静默——30 分钟节流日志（停摆可见）
+        const lastErrT = plugin._lastDivergeLog?.get('fp-err') ?? 0;
+        if (Date.now() - lastErrT > 30 * 60 * 1000) {
+          (plugin._lastDivergeLog ?? new Map()).set('fp-err', Date.now());
+          plugin.pushLog('warn', `指纹探针异常（30 分钟节流）：${e.message}`);
+        }
+        }
         // M4.3：追加事件跨阈值 → 运行期摊销对数压缩（0000 卷即检查点，启动永不重压大账本）。
         // 放在水位早退之前：少量消息的 turn/end 也要能触发归并。
         try {

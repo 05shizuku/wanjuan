@@ -10,6 +10,21 @@
 //   但代理对（emoji 等）charCodeAt 拆成两个 other（0.5），for...of 只算一个（0.25）。
 //   charCodeAt 更保守（偏大），对水位预测是"偏早折叠"的安全方向。
 
+// v0.7.5 P1-2：递归提取文本——宿主块词汇 text/reasoning/image/tool-call/tool-result，
+// tool-result 载荷在嵌套 content 数组、reasoning 载荷在 thinking 字段（此前漏算，
+// 工具输出整条按 ~1 tok 入账——代理会话中最大的 token 类）
+function extractText(blocks) {
+  let out = '';
+  for (const b of blocks) {
+    if (!b || typeof b !== 'object') continue;
+    if (typeof b.text === 'string') out += b.text;
+    else if (typeof b.thinking === 'string') out += b.thinking;
+    else if (b.type === 'tool-call') out += (b.name ?? '') + (b.arguments ?? '');
+    else if (Array.isArray(b.content)) out += extractText(b.content);
+  }
+  return out;
+}
+
 function _estimateString(s) {
   let cjk = 0, other = 0;
   for (let i = 0; i < s.length; i++) {
@@ -31,13 +46,7 @@ export function estimateTok(content) {
     return _estimateString(content);
   }
   if (Array.isArray(content)) {
-    let text = '';
-    for (const b of content) {
-      if (!b || typeof b !== 'object') continue;
-      if (typeof b.text === 'string') text += b.text;
-      else if (b.type === 'tool-call') text += (b.name ?? '') + (b.arguments ?? '');
-    }
-    return _estimateString(text);
+    return _estimateString(extractText(content));
   }
   return 1;
 }
