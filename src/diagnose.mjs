@@ -4,7 +4,7 @@
 //   这是预期的半成品状态——月报的招牌功能要 M3 才算完整。
 //   责任隔离机制本身已在：overrideMissKind 可注入 host-rewrite，写月报时能分离。
 // src/diagnose.mjs
-import { appendFileSync, existsSync, readFileSync, mkdirSync, statSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, readFileSync, mkdirSync, statSync, writeFileSync, renameSync } from 'node:fs';
 import { join } from 'node:path';
 
 const EXPECTED_MISS = new Set(['new', 'compress-repay']);
@@ -58,7 +58,10 @@ export class Diagnoser {
     try {
       if (statSync(this.path).size > 5 * 1024 * 1024) {
         const tail = readFileSync(this.path, 'utf8').trim().split('\n').slice(-2000);
-        writeFileSync(this.path, tail.join('\n') + '\n', 'utf8');
+        // v0.7.6 P1(C2)：轮转改原子写——裸截断重写的崩溃窗口正是坏行来源
+        const rtmp = this.path + '.tmp';
+        writeFileSync(rtmp, tail.join('\n') + '\n', 'utf8');
+        renameSync(rtmp, this.path);
       }
     } catch {}
     appendFileSync(this.path, JSON.stringify(rec) + '\n', 'utf8');
@@ -69,10 +72,13 @@ export class Diagnoser {
     if (!existsSync(this.path)) return [];
     const text = readFileSync(this.path, 'utf8');
     const out = [];
+    let bad = 0;
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
-      out.push(JSON.parse(line));
+      // v0.7.6 P1(C1/C2)：坏行跳过而非抛错——旧语义下一条坏行永久毒化 provider/model 探测。
+      try { out.push(JSON.parse(line)); } catch { bad++; }
     }
+    if (bad > 0) console.warn(`[wanjuan/diagnose] requests.jsonl 有 ${bad} 行损坏，已跳过`);
     return out;
   }
 

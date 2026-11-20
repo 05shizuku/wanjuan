@@ -92,7 +92,9 @@ export class Estimator {
     const countedHistory = new Set();
 
     for (const m of request.messages) {
-      const tok = m.tok ?? 0;
+      // v0.7.6 P2(C1)：负 tok（宿主直传任意值）会使 estFinal 为负 → fits 恒真 → 水位失效。钳 0 + 记 degrade。
+      if ((m.tok ?? 0) < 0) this._degrade('negative-tok');
+      const tok = Math.max(0, m.tok ?? 0);
       const cls = m.cls;
       const isHistory = m.history === true;
 

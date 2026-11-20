@@ -19,7 +19,8 @@ function extractText(blocks) {
     if (!b || typeof b !== 'object') continue;
     if (typeof b.text === 'string') out += b.text;
     else if (typeof b.thinking === 'string') out += b.thinking;
-    else if (b.type === 'tool-call') out += (b.name ?? '') + (b.arguments ?? '');
+    else if (b.type === 'tool-call') out += (b.name ?? '') + (typeof b.arguments === 'string' ? b.arguments : JSON.stringify(b.arguments ?? '')); // v0.7.6 P2(C1)：object arguments 原拼接成 "[object Object]" 漏算
+    else if (typeof b.content === 'string') out += b.content; // v0.7.6 P2(C1)：string 型 content——巨大工具载荷按 1 tok 入账的漏洞
     else if (Array.isArray(b.content)) out += extractText(b.content);
   }
   return out;

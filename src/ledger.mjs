@@ -33,7 +33,11 @@ export class Ledger {
   _replay() {
     const state = this.store.replay();
     this._lastReplayEventCount = state.events.length;
-    for (const ev of state.events) this._apply(ev);
+    for (const ev of state.events) {
+      // v0.7.6 P1(C1)：合法 JSON 但形状非法的事件（null / 缺 range 的 fold / 缺 ids 的 evict）
+      // 与 store 的 json-parse-error 同等宽容：记 degraded 跳过，构造函数不再崩。
+      try { this._apply(ev); } catch (e) { this._degrade(`malformed-event(${(ev && ev.k) ?? String(ev)}): ${e.message}`); }
+    }
   }
 
   _apply(ev) {
@@ -42,7 +46,8 @@ export class Ledger {
     } else if (ev.k === 'mut') {
       const m = this.messages.get(ev.id);
       if (m) {
-        m.ev = { ...m.ev, bytes: ev.bytes, content: ev.content };
+        m.ev = { ...m.ev, bytes: ev.bytes }; // v0.7.6 P2(C1)：mut 不带 content 时不得抹掉原值
+        if (ev.content !== undefined) m.ev.content = ev.content;
         if (ev.tok !== undefined) m.ev.tok = ev.tok; // M4：突变后 token 估算同步更新，水位不漂移
         m.ev.mutatedAt = ev.at;
       }
@@ -249,6 +254,9 @@ export class Ledger {
     const out = [];
     for (const m of this.getActiveMessages()) out.push({ ...m });
     for (const b of this.blocks.values()) {
+      // v0.7.6 P0(C1)：promote 虚拟父块 range=null 且无 ids——fold 事件不可重放
+      // （replay 旧语义解构 null 崩溃 → 0000 卷砖化 → 重启全会话离线）。层级由 promote 事件重建。
+      if (b.range == null && !b.ids) continue;
       const seqs = [];
       for (const m of this.messages.values()) {
         if (m.status === 'folded' && m.blockId === b.id && typeof m.ev.seq === 'number') seqs.push(m.ev.seq);
@@ -316,4 +324,4 @@ export class Ledger {
 
     return { activeTok, leafTok, totalTok, blocks: this.blocks.size, messages: this.messages.size };
   }
-}
+}// CANARY-PWSH-2043674422

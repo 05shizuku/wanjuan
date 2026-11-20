@@ -16,8 +16,14 @@ export class Restorer {
 
     // 父块递归展开
     if (block.children && block.children.length > 0) {
+      // v0.7.6 P2(C1)：子块已全部展开过时返回幂等提示，而非递归抛 BLOCK_NOT_FOUND。
+      const gone = block.children.filter((c) => !this.ledger.getBlock(c));
+      if (gone.length === block.children.length) {
+        return `块 ${blockId} 的子块已全部展开过（无剩余可恢复内容）`;
+      }
       const allMsgs = [];
       for (const childId of block.children) {
+        if (!this.ledger.getBlock(childId)) continue; // 已展开的子块跳过
         allMsgs.push(...this.decompress(childId, mode));
       }
       // v0.6.25：聚合后按 seq 升序——子块各自有序不代表拼接有序

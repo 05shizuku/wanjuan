@@ -11,11 +11,13 @@ function fresh() {
   return { dir, d: new Diagnoser({ dir }), cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
-test('坏行导致 readAll loud 报错', () => {
+test('v0.7.6：坏行跳过不再毒化——readAll 返回好行（旧 loud 语义 + 生产 catch{} 会永久毒化 provider/model 探测）', () => {
   const { dir, d, cleanup } = fresh();
   try {
     writeFileSync(join(dir, 'requests.jsonl'), '{"n":1}\nnot-json\n', 'utf8');
-    assert.throws(() => d.readAll());
+    const rows = d.readAll(); // 修复前：抛错 → turn/end 静默 → 窗口跌回 128K → 大窗口模型被反复误强折
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].n, 1);
   } finally { cleanup(); }
 });
 

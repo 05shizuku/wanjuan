@@ -1,7 +1,6 @@
 // src/store.mjs
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync,
-         statSync, readdirSync, renameSync, openSync, readSync, closeSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, statSync, readdirSync, renameSync, openSync, readSync, closeSync, fsyncSync } from 'node:fs';
 import { join } from 'node:path';
 
 const FORBIDDEN = new Set(['__proto__', 'constructor', 'prototype']);
@@ -88,7 +87,11 @@ export class Store {
         const line = lines[i].trim();
         if (!line) continue;
         try {
-          events.push(JSON.parse(line));
+          const ev = JSON.parse(line);
+          // v0.7.6 P1(C1)：合法 JSON 但非对象（null / 数字 / 字符串）——_reduce 读 ev.k 会崩，
+          // 构造函数无捕获 → 全会话离线。记 degraded 跳过，与 parse-error 同等宽容。
+          if (ev === null || typeof ev !== 'object') { this.degraded.push({ file: f, line: i + 1, reason: 'malformed-line' }); continue; }
+          events.push(ev);
         } catch (e) {
           this.degraded.push({ file: f, line: i + 1, reason: 'json-parse-error' });
         }
@@ -111,9 +114,10 @@ export class Store {
       if (ev.k === 'msg') messages.push(ev);
       else if (ev.k === 'mut') mutated.set(ev.id, ev);
       else if (ev.k === 'fold') blocks.set(ev.block, ev);
-      else if (ev.k === 'evict') for (const id of ev.ids) evicted.add(id);
+      // v0.7.6 P1(C1)：形状非法事件（缺 ids/children）不得在 _reduce 抛错——构造函数无捕获。
+      else if (ev.k === 'evict') { if (Array.isArray(ev.ids)) for (const id of ev.ids) evicted.add(id); }
       else if (ev.k === 'promote') {
-        for (const c of ev.children) { const b = blocks.get(c); if (b) b.promotedInto = ev.parent; }
+        if (Array.isArray(ev.children)) for (const c of ev.children) { const b = blocks.get(c); if (b) b.promotedInto = ev.parent; }
       }
     }
     return { events, messages, blocks, evicted, mutated };
@@ -149,7 +153,18 @@ export class Store {
   // 其余卷移入 archive/（原文永不删除）。月度会话的启动重放延迟从此有界。
   compact(events) {
     const body = events.map((ev) => JSON.stringify(ev) + '\n').join('');
-    writeFileSync(this._segPath(0), body, 'utf8');
+    // v0.7.6 P0-1(C2)：原子重写——裸 writeFileSync 先截断后写，崩溃撕裂即账本损坏，
+    // 默认 100MB 单卷下 archive 为空、无副本可恢复。与 writeRaw 同款：tmp+fsync+rename。
+    const target = this._segPath(0);
+    const tmp = join(this.dir, `ledger.0000.jsonl.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    const fd = openSync(tmp, 'w');
+    try {
+      writeFileSync(fd, body, 'utf8');
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, target);
     // v0.6.15 P0-6：每次压缩独立时间戳子目录——Windows renameSync 目标存在即抛
     // EEXIST，旧方案二次压缩必现并无限失败循环；新方案重名根除，且各次归档互不混淆
     const adir = join(this.dir, 'archive', String(Date.now()));

@@ -118,13 +118,20 @@ export class WanjuanPlugin {
       // v0.7.5 P2-2：收编归属持久化——根账本的 owner sid 记入 owner.json，此后该 sid
       // 永远映射根目录（防第二会话诞生后根账本变孤儿：块检索/raw/baseline 全部不可达）
       let ownerSid = null;
-      try { ownerSid = JSON.parse(readFileSync(join(this.dir, 'owner.json'), 'utf8')).sid ?? null; } catch {}
-      const legacyReady = ownerSid !== null ? key === ownerSid : (this._legacyAdopted !== true && !existsSync(join(this.dir, 'sessions')));
+      let ownerCorrupt = false;
+      try { ownerSid = JSON.parse(readFileSync(join(this.dir, 'owner.json'), 'utf8')).sid ?? null; } catch { ownerCorrupt = existsSync(join(this.dir, 'owner.json')); }
+      if (ownerCorrupt) console.warn('[wanjuan] owner.json 解析失败（疑似写入中断），已拒绝根目录收编，会话走独立目录'); // v0.7.6 P2(C1)
+      const legacyReady = ownerSid !== null ? key === ownerSid : (!ownerCorrupt && this._legacyAdopted !== true && !existsSync(join(this.dir, 'sessions')));
       const sid = key.replace(/[^\w.-]/g, '_').slice(0, 80) || 'default';
       const sessionDir = legacyReady ? this.dir : (ownerSid === key ? this.dir : join(this.dir, 'sessions', sid));
       if (legacyReady) {
         this._legacyAdopted = true;
-        try { writeFileSync(join(this.dir, 'owner.json'), JSON.stringify({ sid: key, at: Date.now() }), 'utf8'); } catch {}
+        // v0.7.6 P2(C2)：tmp+rename 原子写（与 host-bridge.json 同款）
+        try {
+          const otmp = join(this.dir, `.owner-${Date.now()}.tmp`);
+          writeFileSync(otmp, JSON.stringify({ sid: key, at: Date.now() }), 'utf8');
+          renameSync(otmp, join(this.dir, 'owner.json'));
+        } catch {}
       }
       const wj = createWanjuan({ dir: sessionDir, compactionThreshold: this.config?.compactionThreshold });
       this._loadLearnedInto(wj); // 模型学习是全局知识，注入每个新会话
@@ -183,8 +190,11 @@ export class WanjuanPlugin {
       // v0.7.5 P2-1：用入口快照 sid（await 期间实时指针可能切换）
       const pending = this._pendingNudge.get(sid);
       if (pending && newBlock && pending.candidateIds.length > 0) {
-        // 若本次折叠覆盖了候选区间的任一端，视为接受
-        const foldedIds = new Set(args.ids ?? []);
+        // v0.7.6 P2(C2)：用折叠后账本的真实 id 集——range 折叠时 args.ids 为空，旧判定恒 miss。
+        const foldedIds = new Set();
+        for (const m of wj.ledger.messages.values()) {
+          if (m.status === 'folded' && m.blockId === newBlock.id) foldedIds.add(m.ev.id);
+        }
         const hit = pending.candidateIds.some((id) => foldedIds.has(id));
         if (hit) {
           const range = [pending.candidateIds[0], pending.candidateIds[pending.candidateIds.length - 1]];
@@ -432,6 +442,12 @@ function buildTools(plugin) {
 }
 
 export function apply(ctx, config = {}) {
+  // v0.7.6 P1(C2)：幂等 apply——ctx.on 是累加语义，重复 apply 会双监听：双 Store 交错追加、
+  // 同批消息折成双块、nudge 每 turn 双注入。
+  if (ctx._wj) {
+    try { ctx._wj.pushLog('warn', '重复 apply：已存在活跃实例，直接复用（如需重载请重启宿主）'); } catch {}
+    return ctx._wj;
+  }
   const plugin = new WanjuanPlugin({ config });
   ctx._wj = plugin;
 
@@ -478,12 +494,21 @@ export function apply(ctx, config = {}) {
     let baseline = 0;
     try {
       if (sessionId && u.input > 0 && est) {
-        const gap = Math.max(0, u.input - est.estRaw);
+        // v0.7.6 P2(C2)：estRaw 高估样本（rawGap≤0）不得采纳——min 规则会把 baseline 永久锁 0。
+        // 下行保持 min 即时收敛，上行改慢速 EMA（10%/次）自愈。
+        const rawGap = u.input - est.estRaw;
         const prev = plugin._sessionBaseline?.get(sessionId);
-        if (!prev || gap < prev.baseline) {
-          plugin._sessionBaseline.set(sessionId, { baseline: gap, t: Date.now() });
+        if (rawGap > 0) {
+          if (!prev || rawGap < prev.baseline) {
+            plugin._sessionBaseline.set(sessionId, { baseline: rawGap, t: Date.now() });
+          } else if (rawGap > prev.baseline) {
+            prev.baseline = prev.baseline + (rawGap - prev.baseline) * 0.1;
+            prev.t = Date.now();
+          }
+          baseline = plugin._sessionBaseline.get(sessionId)?.baseline ?? 0;
+        } else if (prev) {
+          baseline = prev.baseline; // 高估样本：沿用既有基线
         }
-        baseline = plugin._sessionBaseline.get(sessionId)?.baseline ?? 0;
       }
     } catch {}
     try {
@@ -616,7 +641,7 @@ export function apply(ctx, config = {}) {
       // M4.4：崩溃遗留锁修复——镜像宿主自身的失败收尾路径（补写补偿 compaction/end）。
       // 宿主锁语义：未匹配 start 阻塞一切压缩入口；其自愈依赖 session/end-seed，
       // 崩溃后若不产生 end-seed 则锁到会话终止——这里主动对账解锁。
-      const busyLockRepair = async (sess) => {
+      const busyLockRepair = async (sess, sid) => { // v0.7.6：sid 入参（宽限窗判定）
         try {
           if (!sess || typeof sess.append !== 'function' || typeof sess.eventAt !== 'function') return false;
           const scanUnmatched = () => {
@@ -647,6 +672,13 @@ export function apply(ctx, config = {}) {
           // 新桥接会追加新 start，对在途压缩补 end = 双 end（会话消失的回归路径）。放弃本轮零成本。
           if (unmatched.seq !== firstSeq || (plugin._bridgeInFlight ?? 0) > inFlightAtScan) { // 有【新增】在途桥接才阻断
             plugin.pushLog('log', `M4.4：重扫命中不同 start（seq ${unmatched.seq} ≠ ${firstSeq}）或有在途桥接，放弃本轮补偿（inFlight=${plugin._bridgeInFlight ?? 0} vs 首扫=${inFlightAtScan}）`);
+            return false;
+          }
+          // v0.7.6 P0-2(C2)：孤儿压缩宽限窗——该会话最近有桥接超时，宿主可能仍在摘要，
+          // 此时补 end 会与迟到的真 end 撞出双 end。窗内拒绝（过期后照常补偿）。
+          const limboUntil = sid ? (plugin._bridgeLimbo?.get(sid) ?? 0) : 0;
+          if (Date.now() < limboUntil) {
+            plugin.pushLog('log', `M4.4：孤儿压缩宽限窗内（剩 ${Math.ceil((limboUntil - Date.now()) / 1000)}s），拒绝补偿以防双 end`);
             return false;
           }
           sess.append('compaction/end', {
@@ -738,10 +770,15 @@ export function apply(ctx, config = {}) {
         .catch(async (err) => {
           clearTimeout(bridgeTimer);
           let msg = String(err?.message ?? err);
+          // v0.7.6 P0-2(C2)：桥接超时 ≠ 宿主停止——abort 不保证宿主中止，孤儿压缩可能仍在跑。
+          // 宽限窗内 busyLockRepair 不得对该会话补 end（补偿 end + 迟到真 end = 双 end = 会话消失）。
+          if (msg.includes('桥接超时')) {
+            (plugin._bridgeLimbo ??= new Map()).set(sid, Date.now() + timeoutMs + 60000);
+          }
           // v0.6.9 风险一：崩溃遗留压缩锁——无其他在途桥接时补写补偿 end 并重试一次
           if (msg.includes('compaction lock is already active')) {
             if ((plugin._bridgeInFlight ?? 0) <= 1) {
-              const repaired = await busyLockRepair(session);
+              const repaired = await busyLockRepair(session, sid); // v0.7.6：带 sid 判宽限窗
               if (repaired) {
                 try {
                   const res = await svc.compactRegion(startSeq, endSeq, agent, ac.signal);
@@ -753,6 +790,12 @@ export function apply(ctx, config = {}) {
                 }
               }
             }
+          }
+          // v0.7.6 P0-2(C2)：撞锁发生在宽限窗内 → 孤儿压缩还占着宿主锁，挂起重试而非终态失败。
+          if (msg.includes('compaction lock is already active') && Date.now() < (plugin._bridgeLimbo?.get(sid) ?? 0)) {
+            markBridge(sid, blockId, 'pending', 'deferred: 孤儿压缩宽限窗内（先前的超时桥接可能仍在宿主侧运行），稍后重试');
+            plugin.pushLog('log', 'M3.5：撞锁但处于孤儿压缩宽限窗——挂起重试');
+            return;
           }
           // v0.6.4 失败分类：终态不重试（自动补桥才不会每轮空耗一次 LLM 摘要）
           if (msg.includes('not found in surface')) markBridge(sid, blockId, 'skip', '区间已不在宿主表面（早已压缩或锚点失效），视为对齐');
@@ -861,8 +904,10 @@ export function apply(ctx, config = {}) {
             const nodes = a0?.surface?.nodes;
             if (Array.isArray(nodes) && nodes.length > 0) {
               const surfaceIds = new Set();
+              let readOk = 0; // v0.7.6 P1(C1)：表面节点读取成功计数——契约漂移保险丝
               for (const sq of nodes) {
                 const sev = a0.eventAt?.(sq);
+                if (sev) readOk++;
                 const t = String(sev?.type ?? '');
                 if (!t.includes('user') && !t.includes('assistant') && !t.includes('tool')) continue;
                 const mid = (t.includes('assistant') || t.includes('tool')) ? sev?.data?.message?.id : sev?.data?.id;
@@ -870,7 +915,11 @@ export function apply(ctx, config = {}) {
               }
               const actives = wj.ledger.getActiveMessages();
               const missing = actives.filter((m) => !surfaceIds.has(m.id));
-              if (missing.length > 0) {
+              if (missing.length > 0 && readOk === 0) {
+                // v0.7.6 P1(C1)：零读取 = 宿主契约漂移，surfaceIds 空集会把全部活跃消息误判为已压缩。evict 不可逆。
+                plugin.pushLog('warn', `指纹对账（M5.1）：表面 ${nodes.length} 个节点全部读取失败（宿主契约漂移？），本轮跳过驱逐防批量误删`);
+              }
+              if (missing.length > 0 && readOk > 0) {
                 // v0.7.4 M5.1b：驱逐判据升级——「不在表面 且 宿主已推进到其后」。
                 // 消息不在 surfaceIds，且表面存在 seq 更大的节点 ⟹ 宿主已处理到该消息之后，
                 // 它已被压缩/移除。对「最老收缩」与「中部空洞」两种宿主压缩形态都成立，
@@ -880,7 +929,7 @@ export function apply(ctx, config = {}) {
                 const evictIds = missing
                   .filter((m) => typeof m.seq === 'number' && m.seq < maxSurfaceSeq)
                   .map((m) => m.id);
-                if (evictIds.length > 0) {
+                if (evictIds.length > 0 && readOk > 0) { // readOk=0 时 evictIds 必为误判
                   wj.ledger.recordEvict({ ids: evictIds, why: 'reconcile' });
                   plugin.pushLog('warn', `指纹对账（M5.1）：账本活跃 ${actives.length} 条中 ${evictIds.length} 条已被宿主压缩（不在表面且宿主已推进到其后），已驱逐对齐`);
                 }
@@ -906,7 +955,10 @@ export function apply(ctx, config = {}) {
             plugin.pushLog('log', `账本自压缩：${wj.ledger._appendsSinceCompact} 个事件归并为等价极简流`);
             wj.ledger.compactNow();
           }
-        } catch {}
+        } catch (e) {
+          // v0.7.6 P0(C1)：自压缩失败不得静默——砖化征兆必须可见
+          plugin.pushLog('warn', `账本自压缩失败（保留原账本，重启重试）：${e.message}`);
+        }
 
         // 注意：Estimator 没有 estRaw 方法（那是 estimate() 返回值的字段）；
         // 且宿主消息 id 是 UUID，字典序≠时间序（2026-11-14 实测），必须按 at 排出真实时间序。
@@ -918,7 +970,10 @@ export function apply(ctx, config = {}) {
         try {
           const last = wj.diagnoser.readAll().at(-1);
           if (last?.provider) { provider = last.provider; model = last.model ?? ''; }
-        } catch {}
+        } catch (e) {
+          // v0.7.6 P1(C1)：读取失败必须可见——静默跌回 128K 兜底会误强折大窗口会话
+          plugin.pushLog('warn', `requests.jsonl 读取失败（provider/model 探测降级 128K 窗口）：${e.message}`);
+        }
 
         const est = wj.estimator.estimate({ messages: byTime }, { provider, model });
         // M3.6：窗口三级取值——宿主注册表（动态预热缓存）→ models.json → 128K 兜底
@@ -1117,4 +1172,5 @@ export function apply(ctx, config = {}) {
     }
   }
 
+  return plugin; // v0.7.6：返回实例——与幂等复用路径的返回一致
 }

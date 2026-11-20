@@ -1554,6 +1554,98 @@ test('v0.7.5 P2-2：收编归属持久化——owner.json 防根账本孤儿', a
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.7.6 P0(C1)：promote 虚拟父块 × 对数压缩——重放存活不砖化', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-brick-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    wj.ledger.recordMsg({ id: 'm1', at: 1, tok: 10, content: 'a' });
+    wj.ledger.recordMsg({ id: 'm2', at: 2, tok: 10, content: 'b' });
+    wj.ledger.recordFold({ block: 'b1', ids: ['m1'], range: ['m1', 'm1'], srcTok: 10, sumTok: 3, tier: 0, rawRef: 'block.b1.raw.jsonl' });
+    wj.ledger.recordPromote({ parent: 'bP', children: ['b1'], srcTok: 10, sumTok: 3, tier: 1 });
+    wj.ledger.compactNow(); // 修复前：产生 range:null 的 fold → 重放抛 TypeError → 0000 卷砖化
+    // 重启模拟：全新实例读同一目录（修复前构造函数直接崩）
+    const { ctx: ctx2 } = freshCtx(dir);
+    apply(ctx2, { dir, shadowMode: false });
+    const wj2 = ctx2._wj.getOrCreate('s1').wj;
+    assert.ok(wj2.ledger.listBlocks().some((b) => b.id === 'bP'), '父块应由 promote 事件重建');
+    const b1b = wj2.ledger.getBlock('b1');
+    assert.ok(b1b, '子块 b1 重放重建');
+    assert.ok(Array.isArray(b1b.ids) && b1b.ids.includes('m1'), '折叠归属保留在块 ids 中（压缩后折叠消息不留 msg 记录）');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.6 P1(C1)：合法 JSON 形状非法账本行——构造存活 + degraded，不再砖化全会话', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-brick2-'));
+  try {
+    const { writeFileSync: wf } = await import('node:fs');
+    wf(join(dir, 'ledger.0000.jsonl'),
+      '{"k":"msg","id":"m1","at":1,"tok":5}\n' +
+      'null\n' +
+      '{"k":"fold","block":"b1","rawRef":"x"}\n' +
+      '{"k":"evict"}\n', 'utf8');
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false }); // 修复前：构造函数 TypeError → apply 崩 → 全部 wj_* 离线
+    const wj = ctx._wj.getOrCreate('default').wj;
+    assert.equal(wj.ledger.messages.get('m1')?.status, 'active', '合法消息存活');
+    assert.ok(wj.ledger.getDegraded().some((d) => String(d).includes('malformed-event')), '形状非法事件记 degraded');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.6 P0-2(C2)：孤儿压缩宽限窗——窗内拒绝补偿防双 end，窗后照常', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-limbo-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    ctx._wj._repairWaitMs = 1;
+    const sess = {
+      appended: [],
+      get seq() { return 5; },
+      append(type, data) { this.appended.push([type, data]); },
+      eventAt(q) { if (q === 4) return { type: 'compaction/start', seq: 4, data: { compactionId: 'old' } }; return undefined; },
+    };
+    ctx._wj._bridgeLimbo = new Map([['s1', Date.now() + 60000]]);
+    assert.equal(await ctx._wj.busyLockRepair(sess, 's1'), false, '窗内拒绝补偿');
+    assert.equal(sess.appended.length, 0, '不得补 end（双 end = 会话消失）');
+    ctx._wj._bridgeLimbo.set('s1', Date.now() - 1);
+    assert.equal(await ctx._wj.busyLockRepair(sess, 's1'), true, '窗后照常补偿');
+    assert.equal(sess.appended.length, 1, '补偿 end 已写');
+    ctx._wj._bridgeLimbo.set('other', Date.now() + 60000);
+    assert.equal(await ctx._wj.busyLockRepair(sess, 'another-session'), true, '宽限窗按会话隔离');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.6 P1(C2)：重复 apply 幂等——复用实例防双监听双账本', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-apply2-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    const first = apply(ctx, { dir, shadowMode: false });
+    const again = apply(ctx, { dir, shadowMode: false });
+    assert.equal(again, ctx._wj);
+    assert.equal(again, first, '二次 apply 必须复用同一实例');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.6 P2(C1)：负 tok 钳 0——estRaw 不再为负、fits 不再恒真', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-negtok-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    const r = wj.estimator.estimate({ messages: [{ tok: -500, cls: 'text' }, { tok: 100, cls: 'text' }] }, { provider: 'p', model: 'm' });
+    assert.equal(r.estRaw, 100, '负 tok 被钳 0');
+    const deg = (wj.estimator.getDegraded?.() ?? wj.estimator.degraded ?? []);
+    assert.ok(deg.includes('negative-tok'), '应记 degrade');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.6 P2(C1)：tokenizer string 型 content 与 object 型 arguments 计入', async () => {
+  const { estimateTok } = await import('../src/tokenizer.mjs');
+  assert.ok(estimateTok([{ type: 'tool-result', content: '这是一段很长的工具输出'.repeat(10) }]) > 50, 'string content 计入');
+  assert.ok(estimateTok([{ type: 'tool-call', name: 'f', arguments: { big: 'x'.repeat(500) } }]) > 50, 'object arguments 计入');
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {
