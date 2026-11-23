@@ -42,7 +42,8 @@ export class Diagnoser {
     const missKind = overrideMissKind || classifyMiss({ usage, est, divergeAt, baseline });
     
     const rec = {
-      n, t, provider, model,
+      ...(n !== undefined ? { n } : {}), // v0.7.7 P2-17(D)：dsh 不传 n，落盘 undefined 键无意义
+      t, provider, model,
       input, cached,
       new: missTok,
       estBy: est?.estFinal ?? 0,

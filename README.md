@@ -87,7 +87,8 @@ flowchart TB
 - **桥接超时兜底**：宿主摘要挂死 180s（`bridgeTimeoutMs` 可调）转瞬态失败，不永久阻塞手动路径。
 - **自包含依赖**：bundle patch 自动启用宿主 `compaction-basic`（纯 ASCII patch 文件，防编码事故），安装即完整。
 - **启动环境探针**：压缩服务缺失时启动即大字报警，绝不静默待机。
-- **防弹测试**：185 个自动化测试用例（含大量失败注入），`node --test` 全绿。
+- **防弹测试**：216 个自动化测试用例（含大量失败注入），`node --test` 全绿。
+- **账本 append 无 fsync 的取舍（v0.7.7 明示）**：断电最多丢尾部事件；块原文（raw）带 fsync 永远完整；重启后由指纹探针从宿主表面重建。
 
 ## 🧩 已知未接线（预留模块）
 
@@ -132,7 +133,7 @@ flowchart TB
 ```bash
 # 获取代码并自检
 git clone https://github.com/05shizuku/wanjuan.git
-cd wanjuan && npm test        # 预期 185 个用例全绿
+cd wanjuan && npm test        # 预期 216 个用例全绿
 
 # 挂进 DSH profile（junction/软链到 profile 的 node_modules）
 # Windows: mklink /J "<profile>\node_modules\wanjuan" "<本仓库>"

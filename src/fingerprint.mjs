@@ -1,3 +1,5 @@
+// ⚠️ v0.7.7 P2-11(D)：本模块生产路径未接线（dsh.mjs 内联实现了等价逻辑），仅测试直测。
+// 接线前需先补齐缺口（如 Fingerprinter.reconcile 的 recordMsg 缺 at/seq），或按 DESIGN §13 处置删除。
 // src/fingerprint.mjs
 import { createHash } from 'node:crypto';
 

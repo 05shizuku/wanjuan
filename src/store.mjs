@@ -1,6 +1,6 @@
 // src/store.mjs
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, statSync, readdirSync, renameSync, openSync, readSync, closeSync, fsyncSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, statSync, readdirSync, renameSync, openSync, readSync, closeSync, fsyncSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
 const FORBIDDEN = new Set(['__proto__', 'constructor', 'prototype']);
@@ -30,6 +30,13 @@ export class Store {
     this.degraded = [];
     this._degradedWarned = false;
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    // v0.7.7 P2-7(D)：清扫崩溃残留的 tmp 文件（>1 小时；SEG_RE 不匹配所以无害但会堆积）
+    try {
+      for (const f of readdirSync(this.dir)) {
+        if (!/\.tmp/.test(f)) continue;
+        try { if (Date.now() - statSync(join(this.dir, f)).mtimeMs > 3600 * 1000) unlinkSync(join(this.dir, f)); } catch {}
+      }
+    } catch {}
     this._syncSegIndex();
   }
 

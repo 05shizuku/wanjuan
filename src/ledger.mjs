@@ -46,7 +46,7 @@ export class Ledger {
     } else if (ev.k === 'mut') {
       const m = this.messages.get(ev.id);
       if (m) {
-        m.ev = { ...m.ev, bytes: ev.bytes }; // v0.7.6 P2(C1)：mut 不带 content 时不得抹掉原值
+        m.ev = { ...m.ev, ...(ev.bytes !== undefined ? { bytes: ev.bytes } : {}) }; // v0.7.6 P2(C1)+v0.7.7 P2-8(D)：content/bytes 缺失都不得抹掉原值
         if (ev.content !== undefined) m.ev.content = ev.content;
         if (ev.tok !== undefined) m.ev.tok = ev.tok; // M4：突变后 token 估算同步更新，水位不漂移
         m.ev.mutatedAt = ev.at;
@@ -253,15 +253,20 @@ export class Ledger {
   _compactionEvents() {
     const out = [];
     for (const m of this.getActiveMessages()) out.push({ ...m });
+    // v0.7.7 P1-7(D)：单趟扫描建 blockId→[min,max] 映射——原 O(消息×块) 嵌套在
+    // 10 万消息 × 1 千块 = 1 亿次迭代，长会话 turn/end 撞阈值那轮会卡停宿主事件循环。
+    const spanByBlock = new Map();
+    for (const m of this.messages.values()) {
+      if (m.status !== 'folded' || typeof m.ev.seq !== 'number' || !m.blockId) continue;
+      const cur = spanByBlock.get(m.blockId);
+      if (!cur) spanByBlock.set(m.blockId, [m.ev.seq, m.ev.seq]);
+      else { if (m.ev.seq < cur[0]) cur[0] = m.ev.seq; if (m.ev.seq > cur[1]) cur[1] = m.ev.seq; }
+    }
     for (const b of this.blocks.values()) {
       // v0.7.6 P0(C1)：promote 虚拟父块 range=null 且无 ids——fold 事件不可重放
       // （replay 旧语义解构 null 崩溃 → 0000 卷砖化 → 重启全会话离线）。层级由 promote 事件重建。
       if (b.range == null && !b.ids) continue;
-      const seqs = [];
-      for (const m of this.messages.values()) {
-        if (m.status === 'folded' && m.blockId === b.id && typeof m.ev.seq === 'number') seqs.push(m.ev.seq);
-      }
-      const span = seqs.length ? [Math.min(...seqs), Math.max(...seqs)] : (b.seqSpan ?? null); // v0.6.12 审计增强
+      const span = spanByBlock.get(b.id) ?? (b.seqSpan ?? null); // v0.6.12 审计增强
       out.push({ k: 'fold', block: b.id, tier: b.tier, range: b.range, srcTok: b.srcTok, sumTok: b.sumTok, rawRef: b.rawRef,
         ...(b.ids ? { ids: b.ids } : {}), ...(span ? { seqSpan: span } : {}), ...(b.atRange ? { atRange: b.atRange } : {}), ...(b.note ? { note: b.note } : {}) });
     }
@@ -275,7 +280,8 @@ export class Ledger {
   }
 
   compactNow() {
-    const before = this.store.replay().events.length; // 实测计数（_lastReplayEventCount 只是构造时快照）
+    // v0.7.7 P1-7(D)：内存计数，砍掉一次全量重放（store.replay 全量读盘只为数个数）
+    const before = this._lastReplayEventCount + this._appendsSinceCompact;
     const events = this._compactionEvents();
     this.store.compact(events);
     this.messages.clear();

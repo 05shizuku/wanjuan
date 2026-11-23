@@ -1,3 +1,5 @@
+// ⚠️ v0.7.7 P2-11(D)：本模块生产路径未接线（dsh.mjs 内联实现了等价逻辑），仅测试直测。
+// 接线前需先补齐缺口（如 Fingerprinter.reconcile 的 recordMsg 缺 at/seq），或按 DESIGN §13 处置删除。
 // M1 说明（P2-7）：emergency 动作（usageRatio ≥ 0.95）返回后，dsh.mjs 无人接。
 //   M1 期间 emergency 和 nudge 行为一致（都只是"该 nudge 了"的信号）。
 //   M2 会实现 emergency 加强版 nudge（门降到 0、语气升级、推荐列表标红）。

@@ -17,6 +17,11 @@ export class Compressor {
   compress({ range, ids, summary, topics = [], tier = 1, sumTok = 0, seqSpan }) {
     const activeMsgs = this.ledger.getActiveMessages();
 
+    // v0.7.7 P2-2(D)：显式参数校验——此前 ids/range 皆缺时裸 TypeError
+    // （"range is not iterable"），模型完全无从下手。
+    if (!Array.isArray(ids) && !Array.isArray(range)) {
+      throw new InvariantError('参数完备', 'ids 与 range 至少提供一个（二选一）');
+    }
     let toFold;
     let foldIds;
     if (Array.isArray(ids)) {
@@ -47,7 +52,7 @@ export class Compressor {
 
     // 时间锚：取真实有 at 的消息的最早/最晚
     const ats = toFold.map((m) => m.at).filter((t) => typeof t === 'number' && t > 0);
-    const atRange = ats.length > 0 ? [Math.min(...ats), Math.max(...ats)] : null;
+    const atRange = ats.length > 0 ? [ats.reduce((a, b) => (a < b ? a : b)), ats.reduce((a, b) => (a > b ? a : b))] : null; // v0.7.7 P1-3(D)：reduce 防栈溢出
 
     this.blocks.writeRaw(blockId, toFold);
 

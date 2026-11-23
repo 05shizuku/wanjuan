@@ -9,6 +9,11 @@ export class Restorer {
   }
 
   decompress(blockId, mode = 'context') {
+    // v0.7.7 P2-1(D)：blockId 白名单——模型可传 ../ 构造路径穿越读目录外文件；
+    // 块 id 本来就是 b<数字> 生成，不匹配直接拒绝（在 API 边界拦截，工具层免重复校验）。
+    if (!/^b\d+$/.test(String(blockId ?? ''))) {
+      throw new BlockError('BAD_BLOCK_ID', `blockId 必须是 b<数字> 形式（如 b1），已拒绝：${String(blockId).slice(0, 40)}`);
+    }
     const block = this.ledger.getBlock(blockId);
     if (!block) {
       throw new BlockError('BLOCK_NOT_FOUND', `块 ${blockId} 不存在于账本中`);

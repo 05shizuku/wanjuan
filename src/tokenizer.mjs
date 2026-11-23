@@ -27,13 +27,18 @@ function extractText(blocks) {
 }
 
 function _estimateString(s) {
-  let cjk = 0, other = 0;
+  // v0.7.7 P1-6(D)：区间表扩展——韩文/假名/CJK 扩展A/全角标点原按 0.25 计，
+  // 系统性低估 → 水位偏晚折叠（危险方向：偏早才安全）。
+  let weighted = 0, other = 0;
   for (let i = 0; i < s.length; i++) {
     const code = s.charCodeAt(i);
-    if (code >= 0x4e00 && code <= 0x9fa5) cjk++;
+    if ((code >= 0x4e00 && code <= 0x9fff) || (code >= 0x3400 && code <= 0x4dbf) ||
+        (code >= 0x3000 && code <= 0x303f) || (code >= 0xff00 && code <= 0xffef)) weighted += 1.2; // 汉字/扩展A/CJK标点/全角
+    else if (code >= 0x3040 && code <= 0x30ff) weighted += 1.2; // 假名
+    else if (code >= 0xac00 && code <= 0xd7af) weighted += 2.0; // 谚文
     else other++;
   }
-  return Math.max(1, Math.ceil(cjk * 1.2 + other * 0.25));
+  return Math.max(1, Math.ceil(weighted + other * 0.25));
 }
 
 /**

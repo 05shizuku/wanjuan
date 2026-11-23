@@ -1,3 +1,4 @@
+import { tmpdir } from 'node:os';
 // src/dsh.mjs
 // 万卷 DSH 插件。2026-11-14 真机契约最终修正：
 //  - 不注册 ctx.on('llm/stream')。
@@ -13,26 +14,37 @@ export const name = 'wanjuan';
 // compaction：M3.5 真实上下文接管必需。宿主访问控制要求先声明 inject
 // （2026-11-14 真机实测：直接属性访问抛 "cannot get property without inject"）。
 // 若 profile 未挂 compaction 实现导致加载失败，需在插件管理里启用原生 compaction-basic。
-export const inject = ['tools', 'connection', 'tokenMeter', 'webServer', 'compaction', 'llm'];
+export const inject = ['tools', 'compaction', 'llm']; // v0.7.7 P2-12(D)：裁剪全程未使用的 connection/tokenMeter/webServer（缩小访问面）
 
 let _seq = 0;
-function nextMsgId() { return `m${++_seq}`; }
+const _boot = Date.now().toString(36); // v0.7.7 P2-3(D)：合成 id 带启动戳——重启后不再与历史账本碰撞
+function nextMsgId() { return `m${_boot}-${++_seq}`; }
 
-function normalizeUsage(usage) {
+export function normalizeUsage(usage) { // v0.7.7：导出供形态表测试
   if (!usage) return null;
 
-  // 宿主的 inputTokens 是 miss 部分，cacheReadTokens 是 cached 部分
-  const miss = usage.inputTokens ?? usage.input_tokens ?? usage.input ?? usage.prompt_tokens ?? 0;
-  const cached = usage.cacheReadTokens ?? usage.cached_tokens ?? usage.cached ?? usage.prompt_tokens_details?.cached_tokens ?? 0;
-
-  // 万卷底层的 input 语义是总输入，必须把 miss 和 cached 加起来。
-  // 为了兼容老版本（可能直接传 prompt_tokens 是总数的情况），做个保护：
-  let totalInput = miss;
-  if (usage.cacheReadTokens !== undefined || usage.cached_tokens !== undefined) {
-    totalInput = miss + cached;
+  // v0.7.7 P1-1(D)：按已知形态显式分支，绝不猜加法——OpenAI 的 prompt_tokens 是总数
+  // （cached 是子集，相加即双计），Anthropic 的 input_tokens 不含 cache_read。
+  if (usage.inputTokens !== undefined) {
+    // 宿主契约：inputTokens = miss，cacheReadTokens = cached
+    const cached = usage.cacheReadTokens ?? 0;
+    return { input: usage.inputTokens + cached, cached };
   }
-
-  return { input: totalInput, cached };
+  if (usage.prompt_tokens !== undefined) {
+    // OpenAI 总数口径
+    const cached = usage.prompt_tokens_details?.cached_tokens ?? usage.cached_tokens ?? usage.cached ?? 0;
+    return { input: usage.prompt_tokens, cached };
+  }
+  if (usage.input_tokens !== undefined) {
+    // Anthropic/中继：input_tokens 不含 cache_read
+    const cached = usage.cache_read_input_tokens ?? usage.cacheReadTokens ?? usage.cached_tokens ?? usage.cached ?? 0;
+    return { input: usage.input_tokens + cached, cached };
+  }
+  if (usage.input !== undefined) {
+    const cached = usage.cacheReadTokens ?? usage.cached_tokens ?? usage.cached ?? 0;
+    return { input: usage.input + (cached || 0), cached };
+  }
+  return { input: 0, cached: 0, degraded: 'usage-shape-unknown' };
 }
 
 function recordOne(wj, message, at, seq) {
@@ -77,6 +89,8 @@ export class WanjuanPlugin {
     this._lastRealInput = new Map();  // sessionId -> { input, t }（最近一次真实 usage 观测，水位止血用）
     this._lastDivergeLog = new Map(); // sessionId -> t（背离日志节流，10 分钟/会话）
     this._sessionBaseline = new Map(); // sessionId -> { baseline, t }（v0.7 附加量模型：结构性开销）
+this._hostSessions = new Map(); // v0.7.7 P1-4(D)：sessionId→Session——单槽 _lastHostSession 在多会话事件交错下会把 A 的 seq 区间送进 B 的表面
+this._lastUsageRecord = new Map(); // v0.7.7 P1-8(D)：会话最近一次 provider/model 记录（turn/end 免全量读盘）
   }
 
   pushLog(level, msg) {
@@ -158,13 +172,29 @@ export class WanjuanPlugin {
     return this.getOrCreate(this._currentSessionId ?? 'default').wj;
   }
 
+  // v0.7.7 P0-2(D)+P1-7(D)：块锚统一提取——先扫折叠消息的 seq（自压缩后恒空：折叠消息的
+  // msg 事件已被丢弃），回退 block.seqSpan（_compactionEvents 在压缩时刻写入的唯一幸存锚），
+  // 再无才判无锚。此前长会话自压缩后全部存量块永久失桥（M3.5 核心承诺失效）。
+  // 极值用单趟循环（P1-3：20 万元素 Math.min(...a) 抛 RangeError）。
+  blockSeqAnchors(wj, block) {
+    let lo = Infinity, hi = -Infinity;
+    for (const m of wj.ledger.messages.values()) {
+      if (m.status !== 'folded' || m.blockId !== block.id || typeof m.ev.seq !== 'number') continue;
+      if (m.ev.seq < lo) lo = m.ev.seq;
+      if (m.ev.seq > hi) hi = m.ev.seq;
+    }
+    if (lo !== Infinity) return [lo, hi];
+    if (Array.isArray(block.seqSpan) && Number.isFinite(block.seqSpan[0]) && Number.isFinite(block.seqSpan[1])) return [block.seqSpan[0], block.seqSpan[1]];
+    return null;
+  }
+
   async _toolCompress(args) {
     if (this.shadowMode) {
       return '影子模式：只提示，不真的折叠。把 shadowMode 设为 false 才生效。';
     }
     // v0.7.5 P2-1：入口快照会话指针——桥接 await 期间实时指针可能切换
     const sid = this._currentSessionId ?? 'default';
-    const hostSession = this._lastHostSession;
+    const hostSession = this._hostSessions?.get(sid) ?? this._lastHostSession; // v0.7.7 P1-4(D)：按入口会话取
     const wj = this.getOrCreate(sid).wj;
     const before = new Set(wj.ledger.listBlocks().map((b) => b.id));
     wj.compressor.compress({
@@ -176,12 +206,10 @@ export class WanjuanPlugin {
     // 手动路径同时是 M3.5 的实时验证通路）。
     const newBlock = wj.ledger.listBlocks().find((b) => !before.has(b.id));
     if (newBlock && typeof this.tryHostCompaction === 'function') {
-      const seqs = [];
-      for (const m of wj.ledger.messages.values()) {
-        if (m.status === 'folded' && m.blockId === newBlock.id && typeof m.ev.seq === 'number') seqs.push(m.ev.seq);
-      }
-      if (seqs.length > 0) {
-        const p = this.tryHostCompaction(hostSession, Math.min(...seqs), Math.max(...seqs), newBlock.id, sid); // v0.7.5：快照
+      // v0.7.7 P0-2(D)：统一锚提取（消息扫描 → seqSpan 回退）——自压缩后仍可桥接
+      const span = this.blockSeqAnchors(wj, newBlock);
+      if (span) {
+        const p = this.tryHostCompaction(hostSession, span[0], span[1], newBlock.id, sid);
         if (p) await p; // 等宿主压缩完成再返回——工具结果消息必须落在压缩之后，表面稳定性才成立
       }
     }
@@ -197,9 +225,9 @@ export class WanjuanPlugin {
         }
         const hit = pending.candidateIds.some((id) => foldedIds.has(id));
         if (hit) {
-          const range = [pending.candidateIds[0], pending.candidateIds[pending.candidateIds.length - 1]];
-          wj.nudge.recordAccept(range);
-          this.pushLog('log', `[nudge] 接受：区间 ${range[0]}~${range[1]} 已被折叠，rangeStates 已重置`);
+          // v0.7.7 P0-1(D)：逐候选清账——并集 key 清不掉单候选的 reject 状态
+          wj.nudge.recordAcceptCandidates(pending.candidates ?? []);
+          this.pushLog('log', `[nudge] 接受：折叠覆盖候选（${pending.candidates?.length ?? 0} 个），rangeStates 已按候选清账`);
         }
       }
       this._pendingNudge.delete(sid);
@@ -217,8 +245,8 @@ export class WanjuanPlugin {
     if (!this._lastHostSession) return '跳过（尚无宿主 session 引用，等首个会话事件后可用）。';
     // v0.7.5 P1-1：入口快照会话指针——循环 await（桥接最长 180s）期间实时指针可能切到
     // 其他会话，把 A 的 seq 区间错压到 B 的 surface、把 A 的块状态写进 B 的 host-bridge.json
-    const hostSession = this._lastHostSession;
     const entrySid = this._currentSessionId ?? 'default';
+    const hostSession = this._hostSessions?.get(entrySid) ?? this._lastHostSession; // v0.7.7 P1-4(D)：按入口会话取
     const srec = this.getOrCreate(entrySid);
     const wj = srec.wj;
     const bridgeStatus = srec.bridgeStatus ?? {};
@@ -240,12 +268,11 @@ export class WanjuanPlugin {
       }
     } catch {}
     for (const b of wj.ledger.listBlocks()) {
-      const seqs = [];
-      for (const m of wj.ledger.messages.values()) {
-        if (m.status === 'folded' && m.blockId === b.id && typeof m.ev.seq === 'number') seqs.push(m.ev.seq);
-      }
-      if (seqs.length === 0) { out.push(`${b.id}: 跳过（无 seq 锚，宿主无法定位区间）`); continue; }
-      const start = Math.min(...seqs), end = Math.max(...seqs);
+      // v0.7.7 P0-2(D)：统一锚提取——自压缩后折叠消息不在账本，回退 block.seqSpan；
+      // 此前「无 seq 锚」让长会话全部存量块永久失桥（核心承诺失效）。
+      const span = this.blockSeqAnchors(wj, b);
+      if (!span) { out.push(`${b.id}: 跳过（无 seq 锚，宿主无法定位区间）`); continue; }
+      const [start, end] = span;
       const st0 = bridgeStatus?.[b.id]?.status;
       if (st0 === 'ok') { out.push(`${b.id}: 已打通（seq ${start}→${end}），跳过`); continue; }
       if (st0 === 'skip') { out.push(`${b.id}: 已终态（${(bridgeStatus[b.id]?.error ?? '').slice(0, 300)}），跳过`); continue; }
@@ -448,6 +475,12 @@ export function apply(ctx, config = {}) {
     try { ctx._wj.pushLog('warn', '重复 apply：已存在活跃实例，直接复用（如需重载请重启宿主）'); } catch {}
     return ctx._wj;
   }
+  // v0.7.7 P2-4(D)：config.dir 校验——缺失时 join(undefined) 会在每个事件上炸 catch，
+  // 且 catch 块自身再炸一次（existsSync(join(...))），冒泡成每事件一条 warn。
+  if (!config || typeof config.dir !== 'string' || !config.dir.trim()) {
+    console.warn('[wanjuan] ⚠️ config.dir 缺失或非法——进入影子模式（只记账不折叠，数据写系统临时目录）');
+    config = { ...config, dir: join(tmpdir(), 'wanjuan-shadow-noconfig'), shadowMode: true };
+  }
   const plugin = new WanjuanPlugin({ config });
   ctx._wj = plugin;
 
@@ -511,6 +544,7 @@ export function apply(ctx, config = {}) {
         }
       }
     } catch {}
+    plugin._lastUsageRecord?.set(sessionId, { provider, model, t: Date.now() }); // v0.7.7 P1-8(D)：内存缓存
     try {
       wj.diagnoser.record({
         usage: usageObj,
@@ -636,7 +670,10 @@ export function apply(ctx, config = {}) {
       const tmpPath = bridgePath + '.tmp';
       writeFileSync(tmpPath, JSON.stringify(srec.bridgeStatus, null, 2), 'utf8');
       renameSync(tmpPath, bridgePath); // 原子替换：多进程下不会读到半截 JSON
-    } catch {}
+    } catch (e) {
+      // v0.7.7 P1-9(D)：桥接状态持久化失败不得静默——它直接影响补桥对账（僵尸判定/终态跳过）
+      plugin.pushLog('warn', `host-bridge.json 持久化失败（${blockId} → ${status}）：${e.message}`);
+    }
   };
       // M4.4：崩溃遗留锁修复——镜像宿主自身的失败收尾路径（补写补偿 compaction/end）。
       // 宿主锁语义：未匹配 start 阻塞一切压缩入口；其自愈依赖 session/end-seed，
@@ -839,7 +876,8 @@ export function apply(ctx, config = {}) {
     const sessionId = ev.sessionId ?? a0?.id ?? 'default';
     try {
       const { wj } = plugin.getOrCreate(sessionId);
-      plugin._lastHostSession = a0; // M3.5：手动折叠桥接用的宿主 session 引用（最近一次事件流）
+      plugin._hostSessions.set(sessionId, a0); // v0.7.7 P1-4(D)：按会话记录宿主 Session
+      plugin._lastHostSession = a0; // M3.5：兼容保留（最近一次事件流）
       if (plugin._currentSessionId !== sessionId) {
         // 多会话：切换当前会话，桥接状态随会话切换（每会话独立 host-bridge.json）
         plugin._currentSessionId = sessionId;
@@ -904,7 +942,8 @@ export function apply(ctx, config = {}) {
             const nodes = a0?.surface?.nodes;
             if (Array.isArray(nodes) && nodes.length > 0) {
               const surfaceIds = new Set();
-              let readOk = 0; // v0.7.6 P1(C1)：表面节点读取成功计数——契约漂移保险丝
+              let readOk = 0; // v0.7.6 P1(C1)：表面节点读取成功计数
+              let drift = 0; // v0.7.7 P0-3(D)：类型命中但提取不到 id 的节点数（宿主 data 形态漂移信号）
               for (const sq of nodes) {
                 const sev = a0.eventAt?.(sq);
                 if (sev) readOk++;
@@ -912,14 +951,16 @@ export function apply(ctx, config = {}) {
                 if (!t.includes('user') && !t.includes('assistant') && !t.includes('tool')) continue;
                 const mid = (t.includes('assistant') || t.includes('tool')) ? sev?.data?.message?.id : sev?.data?.id;
                 if (mid) surfaceIds.add(mid);
+                else drift++; // v0.7.7 P0-3(D)：user/assistant/tool 节点竟无 id
               }
               const actives = wj.ledger.getActiveMessages();
               const missing = actives.filter((m) => !surfaceIds.has(m.id));
-              if (missing.length > 0 && readOk === 0) {
-                // v0.7.6 P1(C1)：零读取 = 宿主契约漂移，surfaceIds 空集会把全部活跃消息误判为已压缩。evict 不可逆。
-                plugin.pushLog('warn', `指纹对账（M5.1）：表面 ${nodes.length} 个节点全部读取失败（宿主契约漂移？），本轮跳过驱逐防批量误删`);
+              // v0.7.7 P0-3(D)：护栏收紧到「全量读取成功且零形态漂移」——部分失败同样会把
+              // 活消息误判为已压缩（evict 不可逆、无自动撤销路径），只观察不驱逐。
+              if (missing.length > 0 && (readOk < nodes.length || drift > 0)) {
+                plugin.pushLog('warn', `指纹对账（M5.1）：表面读取不完整（读 ${readOk}/${nodes.length}，形态漂移 ${drift}），本轮跳过驱逐防误删`);
               }
-              if (missing.length > 0 && readOk > 0) {
+              if (missing.length > 0 && readOk === nodes.length && drift === 0) {
                 // v0.7.4 M5.1b：驱逐判据升级——「不在表面 且 宿主已推进到其后」。
                 // 消息不在 surfaceIds，且表面存在 seq 更大的节点 ⟹ 宿主已处理到该消息之后，
                 // 它已被压缩/移除。对「最老收缩」与「中部空洞」两种宿主压缩形态都成立，
@@ -931,7 +972,7 @@ export function apply(ctx, config = {}) {
                   .map((m) => m.id);
                 if (evictIds.length > 0 && readOk > 0) { // readOk=0 时 evictIds 必为误判
                   wj.ledger.recordEvict({ ids: evictIds, why: 'reconcile' });
-                  plugin.pushLog('warn', `指纹对账（M5.1）：账本活跃 ${actives.length} 条中 ${evictIds.length} 条已被宿主压缩（不在表面且宿主已推进到其后），已驱逐对齐`);
+                  plugin.pushLog('warn', `指纹对账（M5.1）：账本活跃 ${actives.length} 条中 ${evictIds.length} 条已被宿主压缩（不在表面且宿主已推进到其后），已驱逐对齐：${evictIds.slice(0, 8).join(',')}${evictIds.length > 8 ? '…' : ''}`);
                 }
                 const rest = missing.length - evictIds.length;
                 if (rest > 0) {
@@ -967,12 +1008,18 @@ export function apply(ctx, config = {}) {
         const byTime = [...activeMsgs].sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
 
         let provider = '', model = '';
-        try {
-          const last = wj.diagnoser.readAll().at(-1);
-          if (last?.provider) { provider = last.provider; model = last.model ?? ''; }
-        } catch (e) {
-          // v0.7.6 P1(C1)：读取失败必须可见——静默跌回 128K 兜底会误强折大窗口会话
-          plugin.pushLog('warn', `requests.jsonl 读取失败（provider/model 探测降级 128K 窗口）：${e.message}`);
+        // v0.7.7 P1-8(D)：优先内存缓存，miss 才读盘（原每轮全量解析 ≤5MB）
+        const lastU = plugin._lastUsageRecord?.get(sessionId);
+        if (lastU?.provider) {
+          provider = lastU.provider; model = lastU.model ?? '';
+        } else {
+          try {
+            const last = wj.diagnoser.readAll().at(-1);
+            if (last?.provider) { provider = last.provider; model = last.model ?? ''; }
+          } catch (e) {
+            // v0.7.6 P1(C1)：读取失败必须可见——静默跌回 128K 兜底会误强折大窗口会话
+            plugin.pushLog('warn', `requests.jsonl 读取失败（provider/model 探测降级 128K 窗口）：${e.message}`);
+          }
         }
 
         const est = wj.estimator.estimate({ messages: byTime }, { provider, model });
@@ -1025,7 +1072,7 @@ export function apply(ctx, config = {}) {
             const summary = `【万卷引擎自动折叠】水位已达 ${(usageRatio * 100).toFixed(1)}%，最老的 ${n} 条消息已折叠为本摘要；如需原文可用 wj_decompress 恢复。`;
             // v0.6.12：折叠前算好宿主 seq 跨度，随 fold 事件入账（审计可追溯）
             const foldSeqs = toFold.map((m) => m.seq).filter((x) => typeof x === 'number');
-            const foldSeqSpan = foldSeqs.length ? [Math.min(...foldSeqs), Math.max(...foldSeqs)] : undefined;
+            const foldSeqSpan = foldSeqs.length ? [foldSeqs.reduce((a, b) => (a < b ? a : b)), foldSeqs.reduce((a, b) => (a > b ? a : b))] : undefined; // v0.7.7 P1-3(D)：reduce 防栈溢出
             const blockId = wj.compressor.compress({
               ids: toFold.map((m) => m.id),
               seqSpan: foldSeqSpan,
@@ -1037,7 +1084,8 @@ export function apply(ctx, config = {}) {
             // M3.5：账本折完，桥接宿主原生压缩，把真实会话日志的同段区间也收掉
             const seqs = toFold.map((m) => m.seq).filter((s) => typeof s === 'number');
             if (seqs.length > 0) {
-              foldBridge = tryHostCompaction(a0, Math.min(...seqs), Math.max(...seqs), blockId, sessionId);
+              const lo = seqs.reduce((a, b) => (a < b ? a : b)), hi = seqs.reduce((a, b) => (a > b ? a : b)); // v0.7.7 P1-3(D)：reduce
+              foldBridge = tryHostCompaction(a0, lo, hi, blockId, sessionId);
             }
           } catch (err) {
             plugin.pushLog('error', `自动折叠失败: ${err.message}`);
@@ -1048,8 +1096,12 @@ export function apply(ctx, config = {}) {
           const pool = byTime.slice(0, byTime.length - TAIL_RETENTION);
           const cand = pool;
           const cseqs = cand.map((m) => m.seq).filter((x) => typeof x === 'number');
-          const span = cseqs.length ? `（seq ${Math.min(...cseqs)}→${Math.max(...cseqs)}，共 ${cand.length} 条）` : `（共 ${cand.length} 条）`;
-          const turnNo = ev.data?.turn ?? 0;
+          const clo = cseqs.reduce((a, b) => (a < b ? a : b)), chi = cseqs.reduce((a, b) => (a > b ? a : b)); // v0.7.7 P1-3(D)：reduce
+          const span = cseqs.length ? `（seq ${clo}→${chi}，共 ${cand.length} 条）` : `（共 ${cand.length} 条）`;
+          // v0.7.7 P1-5(D)：宿主缺 turn 字段时自增兜底——否则 _injectedTurns 恒记 {0}，
+          // 第二个 pending 起全被防御分支吞掉，nudge 一生只注入一次。
+          plugin._turnCounter = (plugin._turnCounter ?? 0) + 1;
+          const turnNo = ev.data?.turn ?? plugin._turnCounter;
           // v0.6.35 二次确认：Day-3 实测个别 turn/end 的观测>预测纠偏未生效
           // （bb00f425 真实 26~32% 时仍产出 6 次）——产出前用最近真实观测复核，
           // 双重保险；无新鲜观测时记诊断日志，定位失效路径。
@@ -1072,9 +1124,10 @@ export function apply(ctx, config = {}) {
           } catch {}
           let nudgeMsg = null;
           let candidateIds = [];
+          let candidates = []; // v0.7.7 P0-1(D)：候选对象（含各自 range），reject/accept 逐候选记账
           try {
             // 池已按 TAIL_RETENTION 切过，禁用 findCandidates 内部的二次尾部保留
-            const candidates = wj.nudge.findCandidates(pool, { tailKeepTok: 0 });
+            candidates = wj.nudge.findCandidates(pool, { tailKeepTok: 0 });
             if (candidates.length > 0) {
               nudgeMsg = wj.nudge.buildNudgeMessage(candidates, turnNo);
               candidateIds = candidates.flatMap((c) => [c.range[0], c.range[1]]);
@@ -1087,12 +1140,12 @@ export function apply(ctx, config = {}) {
             const old = plugin._pendingNudge.get(sessionId);
             if (old && old.injectedAt !== undefined && old.turn !== turnNo && old.candidateIds.length > 0) {
               try {
-                const range = [old.candidateIds[0], old.candidateIds[old.candidateIds.length - 1]];
-                wj.nudge.recordReject(range, turnNo);
-                plugin.pushLog('log', `[nudge] 上一轮 nudge 未被消费（turn ${old.turn}），记 reject 降频`);
+                // v0.7.7 P0-1(D)：逐候选记账（并集 key 清不掉单候选状态）
+                wj.nudge.recordRejectCandidates(old.candidates ?? [], turnNo);
+                plugin.pushLog('log', `[nudge] 上一轮 nudge 未被消费（turn ${old.turn}），已按 ${old.candidates?.length ?? 0} 个候选记 reject 降频`);
               } catch (e) { plugin.pushLog('warn', `[nudge] reject 记账失败：${e.message}`); }
             }
-            plugin._pendingNudge.set(sessionId, { message: nudgeMsg, turn: turnNo, candidateIds });
+            plugin._pendingNudge.set(sessionId, { message: nudgeMsg, turn: turnNo, candidateIds, candidates });
             plugin.pushLog('warn', `⚠️ 水位达到 ${(usageRatio * 100).toFixed(1)}%，nudge 已产出（turn ${turnNo}，${nudgeMsg.tok} tok），待下轮 pre-step 注入${span}。`);
           } else if (!skipNudge) {
             plugin.pushLog('warn', `⚠️ 水位达到 ${(usageRatio * 100).toFixed(1)}%，nudge 被降频规则过滤（建议主动调用 wj_compress 折叠最老消息${span}）。`);

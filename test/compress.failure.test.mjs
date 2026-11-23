@@ -48,7 +48,10 @@ test('compress：跨越已折叠消息报错', () => {
 test('restore.decompress：块不存在时报错', () => {
   const { restorer, cleanup } = fresh();
   try {
-    assert.throws(() => restorer.decompress('b-none'), /不存在/);
+    // v0.7.7 P2-1(D)：b-none 走白名单拒绝；不存在块用合法格式 b999
+    assert.throws(() => restorer.decompress('b-none'), /b<数字>/, '非法格式应被白名单拦截');
+    assert.throws(() => restorer.decompress('../etc/passwd'), /b<数字>/, '路径穿越应被白名单拦截');
+    assert.throws(() => restorer.decompress('b999'), /不存在/);
   } finally { cleanup(); }
 });
 

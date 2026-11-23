@@ -82,6 +82,17 @@ export class NudgeManager {
 
   recordAccept(range) { this.rangeStates.delete(this._key(range)); }
 
+  // v0.7.7 P0-1(D)：候选级记账——key 契约收编进 NudgeManager。此前 dsh 用「并集跨度」
+  // 做 key（id0-id9），shouldNudge 按单候选区间查（id0-id0）——多候选场景 reject 永远
+  // 查不到、accept 永远清不掉，降频生命周期整体死逻辑（Day5-6 压缩率连续下滑的病灶）。
+  recordRejectCandidates(candidates, turn) {
+    for (const c of candidates) this.recordReject(c.range, turn);
+  }
+
+  recordAcceptCandidates(candidates) {
+    for (const c of candidates) this.rangeStates.delete(this._key(c.range));
+  }
+
   shouldNudge(range, currentTurn) {
     const k = this._key(range);
     const state = this.rangeStates.get(k);

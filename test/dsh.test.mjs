@@ -653,7 +653,7 @@ test('M4：宿主突变吸收——同 id 内容变化走 mut 事件（幂等 + 
     const m = wj.ledger.messages.get('u1');
     assert.ok(JSON.stringify(m.ev.content).includes('改写'), '账本应吸收突变后的内容');
     assert.ok(m.ev.mutatedAt, '应记录 mutatedAt');
-    assert.equal(m.ev.tok, 11, '突变后 tok 应按 CJK 口径重估（8 中文×1.2 + 2 标点×0.25 → 11）');
+    assert.equal(m.ev.tok, 12, '突变后 tok 应按 CJK 口径重估（v0.7.7 P1-6：全角标点升权 1.2 → 10 字×1.2 = 12；旧口径标点 0.25 系系统性低估）');
     // 幂等：相同内容重复投递不再追加 mut
     const before = wj.store.replay().events.length;
     emit('你好（已被宿主改写）');
@@ -1159,8 +1159,8 @@ test('M5.2：accept 链路——注入后 wj_compress 命中候选 → recordAcc
       data: { turn: 5, reason: { kind: 'completed' } } });
     const pending = ctx._wj._pendingNudge.get('s1');
     assert.ok(pending, '前置：pending 已产出');
-    const range = [pending.candidateIds[0], pending.candidateIds[pending.candidateIds.length - 1]];
-    ctx._wj.getOrCreate('s1').wj.nudge.recordReject(range, 4); // 预置 reject，使 accept 的清账可观察
+    // v0.7.7 P0-1(D)：按候选逐个预置 reject（并集 key 时代已死——accept/reject 都按单候选记账）
+    for (const c of pending.candidates) ctx._wj.getOrCreate('s1').wj.nudge.recordReject(c.range, 4);
     // 注入
     await ctx._wj._preStepHandler({ agent: { id: 's1' }, turn: 5 }, async () => ({ messages: [{ id: 'm' }] }));
     assert.equal(ctx._wj._pendingNudge.get('s1').injectedAt, 5, '注入后保留 pending');
@@ -1644,6 +1644,101 @@ test('v0.7.6 P2(C1)：tokenizer string 型 content 与 object 型 arguments 计�
   const { estimateTok } = await import('../src/tokenizer.mjs');
   assert.ok(estimateTok([{ type: 'tool-result', content: '这是一段很长的工具输出'.repeat(10) }]) > 50, 'string content 计入');
   assert.ok(estimateTok([{ type: 'tool-call', name: 'f', arguments: { big: 'x'.repeat(500) } }]) > 50, 'object arguments 计入');
+});
+
+test('v0.7.7 P0-1(D)：nudge 候选级记账——3 次 reject 后过滤，accept 清账（旧并集 key 恒不过滤）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-d7-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    const cands = [{ range: ['a', 'b'] }, { range: ['c', 'd'] }];
+    assert.ok(wj.nudge.buildNudgeMessage(cands, 5) !== null, '前置：无 reject 应产出');
+    wj.nudge.recordRejectCandidates(cands, 5);
+    wj.nudge.recordRejectCandidates(cands, 6);
+    wj.nudge.recordRejectCandidates(cands, 7);
+    assert.equal(wj.nudge.buildNudgeMessage(cands, 8), null, '3 次 reject 后应过滤（旧并集 key 记账永远到不了这里）');
+    assert.ok(wj.nudge.buildNudgeMessage(cands, 12) !== null, 'turn 前进 ≥3 后恢复');
+    wj.nudge.recordAcceptCandidates(cands);
+    assert.ok(wj.nudge.buildNudgeMessage(cands, 12) !== null, 'accept 清账后状态归零');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.7 P0-2(D)：自压缩后锚回退 block.seqSpan——长会话补桥不失锚', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-d7-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    for (let i = 1; i <= 3; i++) wj.ledger.recordMsg({ id: 'm' + i, at: i, tok: 5, content: 'x', seq: 100 + i });
+    const blockId = wj.compressor.compress({ ids: ['m1', 'm2'], summary: 's', sumTok: 3, seqSpan: [101, 102] });
+    wj.ledger.compactNow();
+    const block = wj.ledger.getBlock(blockId);
+    assert.deepEqual(ctx._wj.blockSeqAnchors(wj, block), [101, 102], '应回退 seqSpan（旧代码恒 null → 永久失桥）');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.7 P0-3(D)：表面部分读取失败/形态漂移 → 零驱逐（evict 不可逆）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-d7-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    for (let i = 1; i <= 3; i++) wj.ledger.recordMsg({ id: 'u' + i, at: i, tok: 5, content: 'x', seq: i });
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 1, reason: { kind: 'completed' } },
+      surface: { nodes: [1, 2, 3] }, eventAt: (q) => (q === 2 ? undefined : { type: 'user/message', data: { id: 'u' + q } }) });
+    for (let i = 1; i <= 3; i++) assert.equal(wj.ledger.messages.get('u' + i).status, 'active', '部分读取失败下 u' + i + ' 不得误驱逐');
+    ctx._wj._lastFpProbe = 0; // 重置 10 分钟限流，让第二轮真正走到护栏
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 100, time: 10000, data: { turn: 2, reason: { kind: 'completed' } },
+      surface: { nodes: [1, 2, 3] }, eventAt: () => ({ type: 'user/message', data: {} }) });
+    for (let i = 1; i <= 3; i++) assert.equal(wj.ledger.messages.get('u' + i).status, 'active', '形态漂移下 u' + i + ' 不得误驱逐');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.7 P1-3(D)：25 万元素锚提取不崩（旧 Math.min(...a) 在 20 万即抛 RangeError）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-d7-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const fakeWj = { ledger: { messages: new Map() } };
+    for (let i = 1; i <= 250000; i++) fakeWj.ledger.messages.set('k' + i, { status: 'folded', blockId: 'bX', ev: { seq: i } });
+    assert.deepEqual(ctx._wj.blockSeqAnchors(fakeWj, { id: 'bX' }), [1, 250000], '单趟循环求极值不崩');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.7 P1-1(D)：normalizeUsage 按形态显式分支——OpenAI 总数不双计，Anthropic cache_read 计入', async () => {
+  const { normalizeUsage } = await import('../src/dsh.mjs');
+  assert.deepEqual(normalizeUsage({ inputTokens: 100, cacheReadTokens: 40 }), { input: 140, cached: 40 });
+  assert.deepEqual(normalizeUsage({ prompt_tokens: 100, prompt_tokens_details: { cached_tokens: 40 } }), { input: 100, cached: 40 });
+  assert.deepEqual(normalizeUsage({ input_tokens: 100, cache_read_input_tokens: 40 }), { input: 140, cached: 40 });
+  assert.equal(normalizeUsage({ foo: 1 }).degraded, 'usage-shape-unknown');
+});
+
+test('v0.7.7 P1-6(D)：tokenizer 区间表——韩文/假名/全角标点不再按 0.25 低估', async () => {
+  const { estimateTok } = await import('../src/tokenizer.mjs');
+  assert.ok(estimateTok('한국어텍스트') >= 10, '谚文 5 字 ×2.0');
+  assert.ok(estimateTok('カタカナ') >= 4, '假名 4 字 ×1.2');
+  assert.ok(estimateTok('，。') >= 2, '全角标点 2 字 ×1.2（旧口径 0.5）');
+  assert.ok(estimateTok('你好') >= 2, '汉字口径不变');
+});
+
+test('v0.7.7 P2-2(D)：wj_compress 缺 ids/range → 明确报错而非裸 TypeError', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-d7-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    assert.throws(() => wj.compressor.compress({ summary: '只有摘要' }), /ids 与 range 至少提供一个/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.7 P2-4(D)：config.dir 缺失 → 影子模式而非每事件崩', async () => {
+  const { ctx } = freshCtx(join(tmpdir(), 'wj-d7-nodir'));
+  try {
+    apply(ctx, {});
+    assert.equal(ctx._wj.config.shadowMode, true, '应进入影子模式');
+    assert.ok(String(ctx._wj.config.dir).length > 0, '应有兜底目录');
+  } finally { try { rmSync(ctx._wj.config.dir, { recursive: true, force: true }); } catch {} }
 });
 
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
