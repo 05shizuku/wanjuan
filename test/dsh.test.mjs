@@ -1976,6 +1976,68 @@ test('v0.8.0 根锁：持有者死亡 → 抢锁；半截锁 → 宁可只读', 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.8.0-phase1a：只读实例执行全部工具——会话目录逐文件 SHA-256 零变化', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-ro-'));
+  try {
+    // writer：正常实例，产生账本/遥测/日志/锁
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 25; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: i <= 4 ? 25000 : 10 } });
+    }
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 5, reason: { kind: 'completed' } } });
+    await new Promise((r) => setTimeout(r, 120)); // writer 异步链落定
+    // reader：同目录只读实例
+    const { ctx: ctx2, registered, eventHandlers: eh2 } = freshCtx(dir);
+    apply(ctx2, { dir, shadowMode: false });
+    assert.equal(ctx2._wj.readOnly, true, '前置：reader 应只读');
+    // reader 也接收事件流（真实宿主下两实例都会收到）：跟踪先行（纯内存），处理闸死
+    eh2['session/event']({ type: 'user/message', sessionId: 's1', seq: 100, time: 12000,
+      data: { id: 'x9', role: 'user', content: 'x', tok: 1 } });
+    assert.equal(ctx2._wj._currentSessionId, 's1', 'P0 本体：跟踪先行——只读实例的会话路由保持正确');
+    const { createHash } = await import('node:crypto');
+    const { readdirSync, readFileSync } = await import('node:fs');
+    const snap = () => {
+      const out = {};
+      const walk = (d) => {
+        for (const e of readdirSync(d, { withFileTypes: true })) {
+          const p = join(d, e.name);
+          if (e.isDirectory()) { walk(p); continue; }
+          out[p.slice(dir.length)] = createHash('sha256').update(readFileSync(p)).digest('hex');
+        }
+      };
+      walk(dir);
+      return out;
+    };
+    const before = snap();
+    const invoke = (name, args) => {
+      const t = registered.find((x) => x.name === name);
+      assert.ok(t, `工具 ${name} 应已注册`);
+      return t.handler(args);
+    };
+    // 全部工具：写类应被闸住并返回只读原因；读类正常工作
+    for (const [name, args] of [
+      ['wj_report', {}],
+      ['wj_search', { query: 'm' }],
+      ['wj_decompress', { blockId: 'b1' }],
+      ['wj_unfold', { blockId: 'b1' }],
+      ['wj_compress', { ids: ['u01'], summary: 'x' }],
+      ['wj_reconcile', {}],
+    ]) {
+      const r = await invoke(name, args);
+      const text = typeof r === 'string' ? r : (r?.content?.[0]?.text ?? JSON.stringify(r));
+      if (['wj_compress', 'wj_reconcile', 'wj_unfold', 'wj_decompress'].includes(name)) {
+        assert.ok(text.includes('只读'), `${name} 应返回只读原因（实际：${String(text).slice(0, 60)}）`);
+      }
+    }
+    await ctx2._wj._toolCompress({ ids: ['u01'], summary: 'x' });
+    await ctx2._wj._toolReconcile();
+    const after = snap();
+    assert.deepEqual(after, before, '只读实例执行全部工具前后：会话目录必须逐文件零变化');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {

@@ -87,7 +87,7 @@ flowchart TB
 - **桥接超时兜底**：宿主摘要挂死 180s（`bridgeTimeoutMs` 可调）转瞬态失败，不永久阻塞手动路径。
 - **自包含依赖**：bundle patch 自动启用宿主 `compaction-basic`（纯 ASCII patch 文件，防编码事故），安装即完整。
 - **启动环境探针**：压缩服务缺失时启动即大字报警，绝不静默待机。
-- **防弹测试**：229 个自动化测试用例（含大量失败注入），`node --test` 全绿。
+- **防弹测试**：230 个自动化测试用例（含大量失败注入），`node --test` 全绿。
 - **账本 append 无 fsync 的取舍（v0.7.7 明示）**：断电最多丢尾部事件；块原文（raw）带 fsync 永远完整；重启后由指纹探针从宿主表面重建。
 
 ## 🧩 已知未接线（预留模块）
@@ -125,6 +125,13 @@ flowchart TB
 | `requests.jsonl` | 请求遥测（校准/归因） | 5MB 轮转留尾 2000 行 |
 | `models.learned.json` | 自学习窗口（跨重启） | 每模型一条，极小 |
 | `host-bridge.json` | 每块宿主桥接状态 | 每块一条，极小 |
+| `models-calib.json`（数据根） | k̂ EMA 校准状态（按模型，跨会话共享） | 30s 节流落盘，极小 |
+| `calib.json`（会话目录；首会话收编根目录时落数据根*） | baseline / lastRealInput（会话校准持久化） | 60s 节流落盘，极小 |
+| `owner.json` | 根目录收编归属（首会话 sid） | 一次写入，tmp+rename 原子 |
+| `dirmapping.json` | sessionId → 目录名映射（碰撞防护） | 每会话一条，极小 |
+| `wanjuan.lock` | 根锁（持有实例 pid/boot） | 插件运行期存在，进程退出释放 |
+
+\* 首会话被收编到根目录时，其 calib.json 落在数据根而非 sessions/<sid>/——owner 采纳路径的副作用，行为正确但排查时容易看漏（第三轮复审提示）。
 | `wanjuan.log.jsonl` | 审计日志 | 256KB 轮转留尾 100 行 |
 | `snapshot.json` | 预留快照接口 | 未启用（M4.3 摊销压缩已以更简方式覆盖该需求） |
 
@@ -133,7 +140,7 @@ flowchart TB
 ```bash
 # 获取代码并自检
 git clone https://github.com/05shizuku/wanjuan.git
-cd wanjuan && npm test        # 预期 229 个用例全绿
+cd wanjuan && npm test        # 预期 230 个用例全绿
 
 # 挂进 DSH profile（junction/软链到 profile 的 node_modules）
 # Windows: mklink /J "<profile>\node_modules\wanjuan" "<本仓库>"

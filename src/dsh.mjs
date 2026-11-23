@@ -244,6 +244,10 @@ this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（�
   }
 
   async _toolCompress(args) {
+    // v0.8.0-phase1a（第三轮 P0）：只读闸门优先于影子模式（根锁实例两者同置，只读原因更精确）
+    if (this.readOnly) {
+      return '只读实例：根目录锁被其他进程持有，wj_compress 需要写账本与宿主表面，请到持有根锁的实例操作。';
+    }
     if (this.shadowMode) {
       return '影子模式：只提示，不真的折叠。把 shadowMode 设为 false 才生效。';
     }
@@ -295,6 +299,8 @@ this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（�
   // v0.6.2 补桥：对「账本已折、宿主未折」的历史块补发 compactRegion，
   // 修复审查指出的「白折」错位（水位低估、真实上下文仍堆满老消息）。
   async _toolReconcile() {
+    // v0.8.0-phase1a（第三轮 P0）：只读闸门优先于影子模式
+    if (this.readOnly) return '只读实例：根目录锁被其他进程持有，wj_reconcile 需要写账本与宿主表面，请到持有根锁的实例操作。';
     if (this.shadowMode) return '影子模式：不执行补桥。';
     if (!this.tryHostCompaction || !this.dir) return '桥接未初始化（config.dir 未设置？）。';
     if (!this._lastHostSession) return '跳过（尚无宿主 session 引用，等首个会话事件后可用）。';
@@ -473,6 +479,8 @@ function buildTools(plugin) {
       { blockId: { type: 'string', description: '要恢复的块 ID（如 b1）' } },
       ['blockId'],
       (args) => {
+        // v0.8.0-phase1a（第三轮 P0）：只读闸门——unfold 写账本（recordUnfold → Store.append）
+        if (plugin.readOnly) return '只读实例：根目录锁被其他进程持有，wj_unfold 需要写账本，请到持有根锁的实例操作。';
         const wj = plugin._currentWj();
         // 不调 getBlock：unfold 的 _apply 会删除块记录（BlockError），消息计数天然幂等
         let count = 0;
@@ -985,7 +993,6 @@ export function apply(ctx, config = {}) {
     // a1 才是 SessionEvent（有 .type/.data/.time）。
     const ev = a1 && a1.type ? a1 : a0;
     if (!ev || !ev.type) return;
-    if (plugin.readOnly) return; // v0.8.0 根锁：只读实例不入账事件流（账本保持装载态快照，读类工具不受影响）
     const sessionId = ev.sessionId ?? a0?.id ?? 'default';
     try {
       const { wj } = plugin.getOrCreate(sessionId);
@@ -996,6 +1003,11 @@ export function apply(ctx, config = {}) {
         plugin._currentSessionId = sessionId;
         plugin._bridgeStatus = plugin.getOrCreate(sessionId).bridgeStatus ?? {};
       }
+      // v0.8.0-phase1a（第三轮 P0）：早退下移——会话跟踪（纯内存，无持久化写入）先行，
+      // 只读实例的读类工具路由保持正确（_currentSessionId/_hostSessions 不再被闸死）；
+      // 冷启动踢脚及其后的一切事件处理保持只读闸死（busyLockRepair 的补偿 end、
+      // 启动回溯的 recordOne、autoReconcile 的桥接都是持久化写入）。
+      if (plugin.readOnly) return;
       // M4：重启恢复——v0.6.21 起按会话独立踢脚：每个会话的首次事件各自触发一次
       // 冷启动扫描（A 先打开不再遮蔽 B 的遗留锁）
       const srecEv = plugin.getOrCreate(sessionId);
