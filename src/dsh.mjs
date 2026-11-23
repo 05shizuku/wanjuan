@@ -36,9 +36,10 @@ export function normalizeUsage(usage) { // v0.7.7：导出供形态表测试
     return { input: usage.prompt_tokens, cached };
   }
   if (usage.input_tokens !== undefined) {
-    // Anthropic/中继：input_tokens 不含 cache_read
+    // Anthropic/中继：input_tokens 不含 cache_read；cache_creation 是本次真实写入
+    // 上下文的量，必须计入（漏计 → 水位系统性低估 → 折叠过晚）
     const cached = usage.cache_read_input_tokens ?? usage.cacheReadTokens ?? usage.cached_tokens ?? usage.cached ?? 0;
-    return { input: usage.input_tokens + cached, cached };
+    return { input: usage.input_tokens + (usage.cache_creation_input_tokens ?? 0) + cached, cached };
   }
   if (usage.input !== undefined) {
     const cached = usage.cacheReadTokens ?? usage.cached_tokens ?? usage.cached ?? 0;
@@ -91,6 +92,8 @@ export class WanjuanPlugin {
     this._sessionBaseline = new Map(); // sessionId -> { baseline, t }（v0.7 附加量模型：结构性开销）
 this._hostSessions = new Map(); // v0.7.7 P1-4(D)：sessionId→Session——单槽 _lastHostSession 在多会话事件交错下会把 A 的 seq 区间送进 B 的表面
 this._lastUsageRecord = new Map(); // v0.7.7 P1-8(D)：会话最近一次 provider/model 记录（turn/end 免全量读盘）
+this._lastFpProbeMap = new Map(); // v0.7.7 E2-4：每会话独立 10 分钟探针配额（全局槽让多会话互相吃配额）
+this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（跨会话共享会代偿降频/陈旧判定）
   }
 
   pushLog(level, msg) {
@@ -145,7 +148,12 @@ this._lastUsageRecord = new Map(); // v0.7.7 P1-8(D)：会话最近一次 provid
           const otmp = join(this.dir, `.owner-${Date.now()}.tmp`);
           writeFileSync(otmp, JSON.stringify({ sid: key, at: Date.now() }), 'utf8');
           renameSync(otmp, join(this.dir, 'owner.json'));
-        } catch {}
+        } catch (e) {
+          // v0.7.7 E2-6/E1-P2-3：写失败不得静默——sessions/ 一旦存在，重启后原 owner 会话
+          // 将映射到空目录（根账本历史不可达）。_legacyAdopted 回退，下次 getOrCreate 重试补写。
+          this._legacyAdopted = false;
+          console.warn(`[wanjuan] owner.json 写入失败（收编归属未持久化，将重试）：${e.message}`);
+        }
       }
       const wj = createWanjuan({ dir: sessionDir, compactionThreshold: this.config?.compactionThreshold });
       this._loadLearnedInto(wj); // 模型学习是全局知识，注入每个新会话
@@ -267,10 +275,18 @@ this._lastUsageRecord = new Map(); // v0.7.7 P1-8(D)：会话最近一次 provid
         renameSync(tp, bp);
       }
     } catch {}
+    // v0.7.7 P0-2(D)+E2-3：单趟扫描建 blockId→[lo,hi] 索引（blockSeqAnchors 逐块全扫
+    // 会复活 P1-7 的 O(块×消息) 形态：实测 1000 块 × 5 万消息 346ms 同步阻塞）。
+    // 自压缩后折叠消息不在账本，回退 block.seqSpan——「无 seq 锚」曾让长会话永久失桥。
+    const spanByIdx = new Map();
+    for (const m of wj.ledger.messages.values()) {
+      if (m.status !== 'folded' || typeof m.ev.seq !== 'number' || !m.blockId) continue;
+      const cur = spanByIdx.get(m.blockId);
+      if (!cur) spanByIdx.set(m.blockId, [m.ev.seq, m.ev.seq]);
+      else { if (m.ev.seq < cur[0]) cur[0] = m.ev.seq; if (m.ev.seq > cur[1]) cur[1] = m.ev.seq; }
+    }
     for (const b of wj.ledger.listBlocks()) {
-      // v0.7.7 P0-2(D)：统一锚提取——自压缩后折叠消息不在账本，回退 block.seqSpan；
-      // 此前「无 seq 锚」让长会话全部存量块永久失桥（核心承诺失效）。
-      const span = this.blockSeqAnchors(wj, b);
+      const span = spanByIdx.get(b.id) ?? (Array.isArray(b.seqSpan) && Number.isFinite(b.seqSpan[0]) && Number.isFinite(b.seqSpan[1]) ? [b.seqSpan[0], b.seqSpan[1]] : null);
       if (!span) { out.push(`${b.id}: 跳过（无 seq 锚，宿主无法定位区间）`); continue; }
       const [start, end] = span;
       const st0 = bridgeStatus?.[b.id]?.status;
@@ -711,6 +727,15 @@ export function apply(ctx, config = {}) {
             plugin.pushLog('log', `M4.4：重扫命中不同 start（seq ${unmatched.seq} ≠ ${firstSeq}）或有在途桥接，放弃本轮补偿（inFlight=${plugin._bridgeInFlight ?? 0} vs 首扫=${inFlightAtScan}）`);
             return false;
           }
+          // v0.7.7 E2-2：孤儿运行时长护栏——未匹配 start 的时间戳若很新，它可能是仍在
+          // 摘要的孤儿（abort 不保证宿主中止），补偿会与迟到的真 end 撞出双 end（会话消失）；
+          // 超过 15 分钟仍无 end 的按崩溃遗留补偿（M4.4 主路径不受影响：无时间戳或老事件照常）。
+          // 此信号比宽限窗更精确：直接锚定压缩的开始时刻，宽限窗过期 ≠ 孤儿已死。
+          const startTs = Number(unmatched.time);
+          if (Number.isFinite(startTs) && startTs > 0 && Date.now() - startTs < 15 * 60 * 1000) {
+            plugin.pushLog('log', `M4.4：未匹配 start 开启于 ${Math.round((Date.now() - startTs) / 1000)}s 前（可能是仍在摘要的孤儿），拒绝补偿以防双 end`);
+            return false;
+          }
           // v0.7.6 P0-2(C2)：孤儿压缩宽限窗——该会话最近有桥接超时，宿主可能仍在摘要，
           // 此时补 end 会与迟到的真 end 撞出双 end。窗内拒绝（过期后照常补偿）。
           const limboUntil = sid ? (plugin._bridgeLimbo?.get(sid) ?? 0) : 0;
@@ -937,8 +962,8 @@ export function apply(ctx, config = {}) {
         // 宿主侧若绕过万卷自行压缩（压力触发），此处会看到账本活跃消息从表面消失的漂移。
         try {
           const fpNow = Date.now();
-          if (fpNow - (plugin._lastFpProbe ?? 0) > 10 * 60 * 1000) {
-            plugin._lastFpProbe = fpNow;
+          if (fpNow - (plugin._lastFpProbeMap?.get(sessionId) ?? 0) > 10 * 60 * 1000) {
+            plugin._lastFpProbeMap.set(sessionId, fpNow);
             const nodes = a0?.surface?.nodes;
             if (Array.isArray(nodes) && nodes.length > 0) {
               const surfaceIds = new Set();
@@ -1096,12 +1121,14 @@ export function apply(ctx, config = {}) {
           const pool = byTime.slice(0, byTime.length - TAIL_RETENTION);
           const cand = pool;
           const cseqs = cand.map((m) => m.seq).filter((x) => typeof x === 'number');
-          const clo = cseqs.reduce((a, b) => (a < b ? a : b)), chi = cseqs.reduce((a, b) => (a > b ? a : b)); // v0.7.7 P1-3(D)：reduce
-          const span = cseqs.length ? `（seq ${clo}→${chi}，共 ${cand.length} 条）` : `（共 ${cand.length} 条）`;
+          // v0.7.7 E1-1：reduce 挪进空数组守卫内——旧写法在守卫前求值，seq 缺失的遗留账本
+          // （M3.5 之前的 msg 事件无 seq）在此抛 RangeError，本轮 nudge 不产出且补桥链不执行
+          const span = cseqs.length ? `（seq ${cseqs.reduce((a, b) => (a < b ? a : b))}→${cseqs.reduce((a, b) => (a > b ? a : b))}，共 ${cand.length} 条）` : `（共 ${cand.length} 条）`;
           // v0.7.7 P1-5(D)：宿主缺 turn 字段时自增兜底——否则 _injectedTurns 恒记 {0}，
           // 第二个 pending 起全被防御分支吞掉，nudge 一生只注入一次。
-          plugin._turnCounter = (plugin._turnCounter ?? 0) + 1;
-          const turnNo = ev.data?.turn ?? plugin._turnCounter;
+          const myTurn = (plugin._turnCounters?.get(sessionId) ?? 0) + 1;
+          plugin._turnCounters?.set(sessionId, myTurn);
+          const turnNo = ev.data?.turn ?? myTurn;
           // v0.6.35 二次确认：Day-3 实测个别 turn/end 的观测>预测纠偏未生效
           // （bb00f425 真实 26~32% 时仍产出 6 次）——产出前用最近真实观测复核，
           // 双重保险；无新鲜观测时记诊断日志，定位失效路径。
@@ -1128,6 +1155,9 @@ export function apply(ctx, config = {}) {
           try {
             // 池已按 TAIL_RETENTION 切过，禁用 findCandidates 内部的二次尾部保留
             candidates = wj.nudge.findCandidates(pool, { tailKeepTok: 0 });
+            // v0.7.7 E1-2：先按 shouldNudge 过滤再入 pending——否则 pending.candidates 含
+            // 未注入的被压制候选，accept 清账会旁路击穿其 3-strike 降频状态
+            candidates = candidates.filter((c) => wj.nudge.shouldNudge(c.range, turnNo));
             if (candidates.length > 0) {
               nudgeMsg = wj.nudge.buildNudgeMessage(candidates, turnNo);
               candidateIds = candidates.flatMap((c) => [c.range[0], c.range[1]]);
@@ -1148,6 +1178,12 @@ export function apply(ctx, config = {}) {
             plugin._pendingNudge.set(sessionId, { message: nudgeMsg, turn: turnNo, candidateIds, candidates });
             plugin.pushLog('warn', `⚠️ 水位达到 ${(usageRatio * 100).toFixed(1)}%，nudge 已产出（turn ${turnNo}，${nudgeMsg.tok} tok），待下轮 pre-step 注入${span}。`);
           } else if (!skipNudge) {
+            // v0.7.7 E2-1：降频压制时清掉未消费的旧 pending——否则 pre-step 会把同一
+            // stale 消息逐轮重注入（实测 9 轮 9 注入，「静默 3 轮」从未发生）。
+            if (plugin._pendingNudge.has(sessionId)) {
+              plugin._pendingNudge.delete(sessionId);
+              plugin.pushLog('log', '[nudge] 被降频规则过滤——已清未消费的旧 pending，停止重注入');
+            }
             plugin.pushLog('warn', `⚠️ 水位达到 ${(usageRatio * 100).toFixed(1)}%，nudge 被降频规则过滤（建议主动调用 wj_compress 折叠最老消息${span}）。`);
           }
         }

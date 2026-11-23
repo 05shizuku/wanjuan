@@ -26,6 +26,17 @@ function extractText(blocks) {
   return out;
 }
 
+// v0.7.7 E1-P2-2：image 块计数（递归含嵌套 content）——纯图消息原按 1 tok 计
+function countImages(blocks) {
+  let n = 0;
+  for (const b of blocks) {
+    if (!b || typeof b !== 'object') continue;
+    if (b.type === 'image') n++;
+    else if (Array.isArray(b.content)) n += countImages(b.content);
+  }
+  return n;
+}
+
 function _estimateString(s) {
   // v0.7.7 P1-6(D)：区间表扩展——韩文/假名/CJK 扩展A/全角标点原按 0.25 计，
   // 系统性低估 → 水位偏晚折叠（危险方向：偏早才安全）。
@@ -52,7 +63,8 @@ export function estimateTok(content) {
     return _estimateString(content);
   }
   if (Array.isArray(content)) {
-    return _estimateString(extractText(content));
+    // v0.7.7 E1-P2-2：image 块按常量 1100 tok/张计入（多模态水位系统性低估的补口）
+    return _estimateString(extractText(content)) + countImages(content) * 1100;
   }
   return 1;
 }

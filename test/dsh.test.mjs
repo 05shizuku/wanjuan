@@ -1688,7 +1688,7 @@ test('v0.7.7 P0-3(D)：表面部分读取失败/形态漂移 → 零驱逐（evi
     eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 1, reason: { kind: 'completed' } },
       surface: { nodes: [1, 2, 3] }, eventAt: (q) => (q === 2 ? undefined : { type: 'user/message', data: { id: 'u' + q } }) });
     for (let i = 1; i <= 3; i++) assert.equal(wj.ledger.messages.get('u' + i).status, 'active', '部分读取失败下 u' + i + ' 不得误驱逐');
-    ctx._wj._lastFpProbe = 0; // 重置 10 分钟限流，让第二轮真正走到护栏
+    ctx._wj._lastFpProbeMap = new Map(); // 重置 10 分钟限流，让第二轮真正走到护栏
     eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 100, time: 10000, data: { turn: 2, reason: { kind: 'completed' } },
       surface: { nodes: [1, 2, 3] }, eventAt: () => ({ type: 'user/message', data: {} }) });
     for (let i = 1; i <= 3; i++) assert.equal(wj.ledger.messages.get('u' + i).status, 'active', '形态漂移下 u' + i + ' 不得误驱逐');
@@ -1739,6 +1739,101 @@ test('v0.7.7 P2-4(D)：config.dir 缺失 → 影子模式而非每事件崩', as
     assert.equal(ctx._wj.config.shadowMode, true, '应进入影子模式');
     assert.ok(String(ctx._wj.config.dir).length > 0, '应有兜底目录');
   } finally { try { rmSync(ctx._wj.config.dir, { recursive: true, force: true }); } catch {} }
+});
+
+test('v0.7.7 E1-1：seq 缺失的遗留账本在 nudge 带不崩（reduce 空数组守卫）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-e1-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 25; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: i <= 4 ? 25000 : 10 } });
+    }
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 5, reason: { kind: 'completed' } } });
+    assert.ok(!ctx._wj.logs.some((l) => l.msg.startsWith('session/event turn/end fail')), '处理器不得抛错（旧 reduce 在此崩空数组）');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('nudge')), '水位带内应正常产出/过滤 nudge');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.7 E2-1：降频压制清旧 pending——pre-step 不再重注入 stale 消息', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-e2-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    ctx.compaction = { compactRegion: async () => ({ ok: true }) };
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 25; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: i <= 4 ? 25000 : 10 } });
+    }
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 99, time: 9999, data: { turn: 5, reason: { kind: 'completed' } } });
+    assert.ok(ctx._wj._pendingNudge.get('s1'), '前置：pending 已产出');
+    await ctx._wj._preStepHandler({ agent: { id: 's1' }, turn: 5 }, async () => ({ messages: [{ id: 'm' }] }));
+    for (const t of [6, 7, 8]) {
+      eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 98 + t, time: 9000 + t, data: { turn: t, reason: { kind: 'completed' } } });
+      await ctx._wj._preStepHandler({ agent: { id: 's1' }, turn: t }, async () => ({ messages: [{ id: 'm' }] }));
+    }
+    assert.ok(ctx._wj._pendingNudge.get('s1'), '前置：T8 后 pending 仍在（rejects 刚到 3）');
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 107, time: 9107, data: { turn: 9, reason: { kind: 'completed' } } });
+    assert.equal(ctx._wj._pendingNudge.has('s1'), false, '压制时旧 pending 应被清（静默 3 轮的实现前提）');
+    await ctx._wj._preStepHandler({ agent: { id: 's1' }, turn: 9 }, async () => ({ messages: [{ id: 'm' }] }));
+    assert.equal(ctx._wj._pendingNudge.has('s1'), false, 'pre-step 无 pending 可注入');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('已清未消费的旧 pending')), '应记清账日志');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.7 E2-2：孤儿时龄护栏——新 start 拒补偿防双 end，超龄/无时间戳照常补偿', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-e3-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    ctx._wj._repairWaitMs = 1;
+    const mk = (time) => ({
+      appended: [], get seq() { return 5; },
+      append(type, data) { this.appended.push([type, data]); },
+      eventAt(q) { if (q === 4) return { type: 'compaction/start', seq: 4, time, data: { compactionId: 'old' } }; return undefined; },
+    });
+    const fresh = mk(Date.now() - 30000);
+    assert.equal(await ctx._wj.busyLockRepair(fresh, 's1'), false, '新 start 拒绝补偿（宽限窗过期≠孤儿已死）');
+    assert.equal(fresh.appended.length, 0, '不得补 end');
+    const old = mk(Date.now() - 16 * 60 * 1000);
+    assert.equal(await ctx._wj.busyLockRepair(old, 's1'), true, '超龄照常补偿（M4.4 主路径）');
+    assert.equal(old.appended.length, 1, '补偿 end 已写');
+    const noTime = mk(undefined);
+    assert.equal(await ctx._wj.busyLockRepair(noTime, 's1'), true, '无时间戳不误伤');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.7 E2-4：指纹探针配额按会话隔离——s1 探测后 s2 同轮仍评估', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-e4-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const wj1 = ctx._wj.getOrCreate('s1').wj;
+    wj1.ledger.recordMsg({ id: 'a1', at: 1, tok: 5, content: 'x', seq: 1 });
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 1, time: 1, data: { turn: 1 },
+      surface: { nodes: [1] }, eventAt: () => ({ type: 'user/message', data: { id: 'a1' } }) });
+    const wj2 = ctx._wj.getOrCreate('s2').wj;
+    wj2.ledger.recordMsg({ id: 'v1', at: 1, tok: 5, content: 'x', seq: 1 });
+    wj2.ledger.recordMsg({ id: 'v2', at: 2, tok: 5, content: 'x', seq: 2 });
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's2', seq: 2, time: 2, data: { turn: 1 },
+      surface: { nodes: [4] }, eventAt: () => ({ type: 'user/message', data: { id: 'vX' } }) });
+    assert.equal(wj2.ledger.messages.get('v1').status, 'evicted', 's2 的漂移应被独立评估并驱逐');
+    assert.equal(wj2.ledger.messages.get('v2').status, 'evicted', 'v2 同步驱逐');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.7 E1-P2-1：Anthropic cache_creation 计入 input（漏计 → 水位低估 98%）', async () => {
+  const { normalizeUsage } = await import('../src/dsh.mjs');
+  assert.deepEqual(normalizeUsage({ input_tokens: 100, cache_creation_input_tokens: 5000, cache_read_input_tokens: 0 }), { input: 5100, cached: 0 });
+  assert.deepEqual(normalizeUsage({ input_tokens: 100, cache_read_input_tokens: 40 }), { input: 140, cached: 40 });
+});
+
+test('v0.7.7 E1-P2-2：image 块按常量计入（纯图消息不再按 1 tok）', async () => {
+  const { estimateTok } = await import('../src/tokenizer.mjs');
+  assert.ok(estimateTok([{ type: 'image' }]) >= 1000, '纯图消息 ≥1000 tok');
+  assert.ok(estimateTok([{ type: 'text', text: 'hi' }, { type: 'image' }]) >= 1001, '图文混合计入图片');
+  assert.ok(estimateTok([{ type: 'tool-result', content: [{ type: 'image' }] }]) >= 1000, '嵌套 image 也计入');
 });
 
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
