@@ -252,7 +252,17 @@ export class Ledger {
   // 已折叠/已驱逐消息的 msg 事件可安全丢弃：原文在块 raw 文件里永远可达（原文可达不变式）。
   _compactionEvents() {
     const out = [];
+    const evictedIds = [];
     for (const m of this.getActiveMessages()) out.push({ ...m });
+    // v0.7.9 N-1：折叠/已驱逐消息保留「无 content 的元数据 msg 事件」——原方案直接丢弃，
+    // 自压缩后 wj_unfold 计 0 条、wj_report 折叠统计失真。每条 ~150 字节（content 才是
+    // KB 级大头），replay 时由后续 fold/evict 事件恢复状态。
+    for (const m of this.messages.values()) {
+      if (m.status === 'active') continue;
+      const { content, ...meta } = m.ev;
+      out.push(meta);
+      if (m.status === 'evicted') evictedIds.push(m.ev.id);
+    }
     // v0.7.7 P1-7(D)：单趟扫描建 blockId→[min,max] 映射——原 O(消息×块) 嵌套在
     // 10 万消息 × 1 千块 = 1 亿次迭代，长会话 turn/end 撞阈值那轮会卡停宿主事件循环。
     const spanByBlock = new Map();
@@ -270,6 +280,7 @@ export class Ledger {
       out.push({ k: 'fold', block: b.id, tier: b.tier, range: b.range, srcTok: b.srcTok, sumTok: b.sumTok, rawRef: b.rawRef,
         ...(b.ids ? { ids: b.ids } : {}), ...(span ? { seqSpan: span } : {}), ...(b.atRange ? { atRange: b.atRange } : {}), ...(b.note ? { note: b.note } : {}) });
     }
+    if (evictedIds.length > 0) out.push({ k: 'evict', ids: evictedIds }); // v0.7.9 N-1：驱逐状态随流恢复
     for (const b of this.blocks.values()) {
       if (b.children && b.children.length > 0) {
         out.push({ k: 'promote', parent: b.id, children: b.children, srcTok: b.srcTok, sumTok: b.sumTok, tier: b.tier,

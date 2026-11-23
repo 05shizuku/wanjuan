@@ -1,3 +1,4 @@
+import { readFileSync, writeFileSync, renameSync } from 'node:fs';
 // src/estimate.mjs
 const BIAS = 1.05;
 const PRIOR_WEIGHT_M = 5;
@@ -50,6 +51,17 @@ export class Estimator {
     return rec.khatObserved;
   }
 
+  // v0.7.9 P1-2：挂载 k̂ 校准持久化文件——EMA 状态跨重启回灌，重启不再冷启动
+  // （README「已知局限」冷启动两条的根）。30s 节流落盘，崩溃最多丢 30s 样本。
+  attachCalibFile(path) {
+    if (this.calibFile) return;
+    this.calibFile = path;
+    try {
+      const raw = JSON.parse(readFileSync(path, 'utf8'));
+      for (const [k, rec] of Object.entries(raw)) this.calib.set(k, rec);
+    } catch {}
+  }
+
   getCalibrationState(provider, model) {
     const rec = this.calib.get(this._key(provider, model));
     const n = rec?.n ?? 0;
@@ -80,6 +92,17 @@ export class Estimator {
     rec.khatObserved = rec.n === 0 ? observed : (1 - PRIOR_ALPHA) * rec.khatObserved + PRIOR_ALPHA * observed;
     rec.n += 1;
     this.calib.set(key, rec);
+    // v0.7.9 P1-2：节流落盘（30s）
+    if (this.calibFile && Date.now() - (this._calibLastSave ?? 0) > 30 * 1000) {
+      this._calibLastSave = Date.now();
+      try {
+        const obj = {};
+        for (const [k, v] of this.calib) obj[k] = v;
+        const tpath = this.calibFile + '.tmp';
+        writeFileSync(tpath, JSON.stringify(obj), 'utf8');
+        renameSync(tpath, this.calibFile);
+      } catch {}
+    }
     return true;
   }
 

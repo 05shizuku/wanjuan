@@ -681,7 +681,8 @@ test('M4：重启恢复——首个会话事件即触发补扫（限流兜底）
     await new Promise((r) => setImmediate(r));
     assert.equal(ctx._wj.getOrCreate('s2')._recoveryKicked, true, 'B 的首次事件应独立踢脚');
     assert.equal(ctx._wj.getOrCreate('s1')._recoveryKicked, true, 'A 的踢脚状态不受影响');
-    assert.ok(ctx._wj._lastAutoReconcile > 0, '自动补桥限流时间戳应更新');
+    // v0.7.9 P2-10：限流改按会话 Map
+    assert.ok([...(ctx._wj._lastAutoReconcileMap?.values() ?? [])].some((v) => v > 0), '自动补桥限流时间戳应更新');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -697,7 +698,13 @@ test('M4.1：账本对数压缩——等价极简流 + 旧卷归档 + 重放一�
     ledger.recordEvict({ ids: ['m5'], why: 'reconcile' });
     const before = ledger._lastReplayEventCount;
     const r = ledger.compactNow();
-    assert.ok(r.before >= before && r.after < r.before, `压缩应缩减事件数 ${r.before} → ${r.after}`);
+    // v0.7.9 N-1：保留元数据 msg 事件后事件数持平——真缩减在 content 剥离
+    assert.ok(r.before >= before && r.after <= r.before, `压缩不膨胀 ${r.before} → ${r.after}`);
+    for (const ev of ledger.store.replay().events) {
+      if (ev.k === 'msg' && ['m1', 'm2', 'm3', 'm4', 'm5'].includes(ev.id)) {
+        assert.equal(ev.content, undefined, `折叠/驱逐消息 ${ev.id} 的 content 应剥离`);
+      }
+    }
     assert.deepEqual(ledger.getActiveMessages().map((m) => m.id), ['m6', 'm7', 'm8'], '活跃集不变');
     assert.equal(ledger.getBlock('b1').rawRef, 'block.b1.raw.jsonl', '块元数据保留');
     const { existsSync: ex, readdirSync: rd } = await import('node:fs');
@@ -1836,6 +1843,94 @@ test('v0.7.7 E1-P2-2：image 块按常量计入（纯图消息不再按 1 tok）
   assert.ok(estimateTok([{ type: 'tool-result', content: [{ type: 'image' }] }]) >= 1000, '嵌套 image 也计入');
 });
 
+test('v0.7.9 P1-2：k̂/baseline/lastRealInput 持久化——重启不再冷启动', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-p12-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    for (let i = 0; i < 6; i++) wj.estimator.observeUsage({ provider: 'p', model: 'm', usageInputTokens: 2000, estRaw: 1000, baseline: 0 });
+    wj.estimator._calibLastSave = 0; // 重置 30s 节流，强制末次状态落盘
+    wj.estimator.observeUsage({ provider: 'p', model: 'm', usageInputTokens: 2000, estRaw: 1000, baseline: 0 });
+    const { existsSync: ex } = await import('node:fs');
+    assert.ok(ex(join(dir, 'models-calib.json')), 'k̂ calib 应落盘（首写不受 30s 节流限制）');
+    const sdir = ctx._wj.getOrCreate('s1').sid;
+    const { writeFileSync: wf } = await import('node:fs');
+    wf(join(sdir, 'calib.json'), JSON.stringify({ baseline: { baseline: 4200, t: 1 }, lastRealInput: { input: 50000, t: 2 } }), 'utf8');
+    const { ctx: ctx2 } = freshCtx(dir);
+    apply(ctx2, { dir, shadowMode: false });
+    const wj2 = ctx2._wj.getOrCreate('s1').wj;
+    assert.equal(ctx2._wj._sessionBaseline.get('s1')?.baseline, 4200, 'baseline 应回灌');
+    assert.equal(ctx2._wj._lastRealInput.get('s1')?.input, 50000, 'lastRealInput 应回灌');
+    assert.equal(wj2.estimator.getCalibrationState('p', 'm').n, 7, 'k̂ 样本数应回灌');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.9 N-1：自压缩保留元数据 msg 事件——unfold 计数与状态重放不再失真', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-n1-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    for (let i = 1; i <= 3; i++) wj.ledger.recordMsg({ id: 'm' + i, at: i, tok: 5, content: 'x' + i, seq: 10 + i });
+    const blockId = wj.compressor.compress({ ids: ['m1', 'm2'], summary: 's', sumTok: 3 });
+    wj.ledger.recordEvict({ ids: ['m3'], why: 'reconcile' });
+    wj.ledger.compactNow();
+    assert.equal(wj.ledger.messages.get('m1').status, 'folded', '折叠消息元数据存活');
+    assert.equal(wj.ledger.messages.get('m1').ev.content, undefined, 'content 已剥离');
+    assert.equal(wj.ledger.messages.get('m3').status, 'evicted', '驱逐状态随流恢复');
+    let count = 0;
+    for (const m of wj.ledger.messages.values()) if (m.status === 'folded' && m.blockId === blockId) count += 1;
+    assert.equal(count, 2, 'wj_unfold 计数恢复（旧代码计 0）');
+    const { ctx: ctx2 } = freshCtx(dir);
+    apply(ctx2, { dir, shadowMode: false });
+    const wj2 = ctx2._wj.getOrCreate('s1').wj;
+    assert.equal(wj2.ledger.messages.get('m1').status, 'folded', '重放后折叠状态一致');
+    assert.equal(wj2.ledger.messages.get('m3').status, 'evicted', '重放后驱逐状态一致');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.9 N-3：normalizeUsage 未知 input 语义 → 丢遥测 + degraded（绝不猜加法）', async () => {
+  const { normalizeUsage } = await import('../src/dsh.mjs');
+  assert.deepEqual(normalizeUsage({ input: 500, cached: 5 }), { input: 0, cached: 0, degraded: 'usage-input-semantics-unknown' });
+});
+
+test('v0.7.9 P2-6：会话目录碰撞防护——dirmapping 单射且重启稳定', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-p26-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const sA = ctx._wj.getOrCreate('a/b').sid;
+    const sB = ctx._wj.getOrCreate('a:b').sid;
+    assert.notEqual(sA, sB, '同形清洗名必须分开');
+    const { ctx: ctx2 } = freshCtx(dir);
+    apply(ctx2, { dir, shadowMode: false });
+    assert.equal(ctx2._wj.getOrCreate('a/b').sid, sA, '映射重启稳定');
+    assert.equal(ctx2._wj.getOrCreate('a:b').sid, sB, '映射重启稳定');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.7.9 P2-10：补桥单次预算——最多 3 块，超出下轮继续', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-p210-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    let calls = 0;
+    ctx.compaction = { compactRegion: async () => { calls += 1; return { ok: true }; } };
+    apply(ctx, { dir, shadowMode: false });
+    // 注册当前会话（_toolReconcile 按 _currentSessionId 取块与宿主引用）
+    eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: 99, time: 99, data: { id: 'x0', role: 'user', content: 'x', tok: 1 } });
+    await new Promise((r2) => setTimeout(r2, 50)); // 冷启动链（回溯+autoReconcile）先跑完，避免与被测调用并发
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    for (let i = 1; i <= 10; i++) wj.ledger.recordMsg({ id: 'm' + i, at: i, tok: 5, content: 'x', seq: i });
+    for (let b = 1; b <= 5; b++) {
+      wj.compressor.compress({ ids: ['m' + (2 * b - 1), 'm' + (2 * b)], summary: 's' + b, sumTok: 3 });
+    }
+    const out = await ctx._wj._toolReconcile();
+    assert.equal(calls, 3, '单次最多 3 块');
+    assert.ok(out.includes('预算用尽'), '应提示下轮继续');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {
@@ -2038,7 +2133,8 @@ test('M4 战役三：compactionThreshold 可配——超阈值重启即压缩', 
     const ledger2 = new Ledger({ store: new Store({ dir }), compactionThreshold: 5 });
     const { existsSync: ex } = await import('node:fs');
     assert.ok(ex(join(dir, 'ledger.0000.jsonl')), '超阈值重启应触发对数压缩');
-    assert.ok(ledger2._lastReplayEventCount <= 7, `重放事件数应有界（实际 ${ledger2._lastReplayEventCount}）`);
+    // v0.7.9 N-1：+折叠消息元数据条数（m1/m2 两条）
+    assert.ok(ledger2._lastReplayEventCount <= 9, `重放事件数应有界（实际 ${ledger2._lastReplayEventCount}）`);
     assert.deepEqual(ledger2.getActiveMessages().map((m) => m.id), ['m3', 'm4', 'm5', 'm6', 'm7', 'm8'], '活跃集保持');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });

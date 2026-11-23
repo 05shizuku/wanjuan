@@ -1,5 +1,6 @@
 import { tmpdir } from 'node:os';
 // src/dsh.mjs
+import { createHash } from 'node:crypto';
 // 万卷 DSH 插件。2026-11-14 真机契约最终修正：
 //  - 不注册 ctx.on('llm/stream')。
 //  - 工具定义使用 parameters 字段。
@@ -42,8 +43,9 @@ export function normalizeUsage(usage) { // v0.7.7：导出供形态表测试
     return { input: usage.input_tokens + (usage.cache_creation_input_tokens ?? 0) + cached, cached };
   }
   if (usage.input !== undefined) {
-    const cached = usage.cacheReadTokens ?? usage.cached_tokens ?? usage.cached ?? 0;
-    return { input: usage.input + (cached || 0), cached };
+    // v0.7.9 N-3：语义不明（miss 还是总数未知）——按「绝不猜加法」原则丢弃遥测并标记，
+    // 宁可少一条记录也不污染水位权威分子（_lastRealInput）
+    return { input: 0, cached: 0, degraded: 'usage-input-semantics-unknown' };
   }
   return { input: 0, cached: 0, degraded: 'usage-shape-unknown' };
 }
@@ -139,7 +141,27 @@ this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（�
       try { ownerSid = JSON.parse(readFileSync(join(this.dir, 'owner.json'), 'utf8')).sid ?? null; } catch { ownerCorrupt = existsSync(join(this.dir, 'owner.json')); }
       if (ownerCorrupt) console.warn('[wanjuan] owner.json 解析失败（疑似写入中断），已拒绝根目录收编，会话走独立目录'); // v0.7.6 P2(C1)
       const legacyReady = ownerSid !== null ? key === ownerSid : (!ownerCorrupt && this._legacyAdopted !== true && !existsSync(join(this.dir, 'sessions')));
-      const sid = key.replace(/[^\w.-]/g, '_').slice(0, 80) || 'default';
+      const baseSid = key.replace(/[^\w.-]/g, '_').slice(0, 80) || 'default';
+      // v0.7.9 P2-6：目录名碰撞防护——清洗映射多对一（a/b 与 a:b 同为 a_b；80 字截断）。
+      // dirmapping.json 持久化 key→目录名：首见记录，base 被其他 key 占用时追加 8 位哈希；
+      // 重启稳定（映射先于目录存在），已存在的老目录不受影响。
+      this._dirMapping = this._dirMapping ?? new Map();
+      if (this._dirMapping.size === 0) {
+        try { for (const [k, v] of Object.entries(JSON.parse(readFileSync(join(this.dir, 'dirmapping.json'), 'utf8')))) this._dirMapping.set(k, v); } catch {}
+      }
+      let mapped = this._dirMapping.get(key);
+      if (!mapped) {
+        mapped = [...this._dirMapping.values()].includes(baseSid)
+          ? `${baseSid}-${createHash('sha256').update(key).digest('hex').slice(0, 8)}`
+          : baseSid;
+        this._dirMapping.set(key, mapped);
+        try {
+          const mt = join(this.dir, `.dirmapping-${Date.now()}.tmp`);
+          writeFileSync(mt, JSON.stringify(Object.fromEntries(this._dirMapping)), 'utf8');
+          renameSync(mt, join(this.dir, 'dirmapping.json'));
+        } catch {}
+      }
+      const sid = mapped; // 下游沿用原名
       const sessionDir = legacyReady ? this.dir : (ownerSid === key ? this.dir : join(this.dir, 'sessions', sid));
       if (legacyReady) {
         this._legacyAdopted = true;
@@ -157,11 +179,30 @@ this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（�
       }
       const wj = createWanjuan({ dir: sessionDir, compactionThreshold: this.config?.compactionThreshold });
       this._loadLearnedInto(wj); // 模型学习是全局知识，注入每个新会话
+      this._attachCalibInto(wj, key, sessionDir); // v0.7.9 P1-2：k̂ 校准 + baseline/lastRealInput 回灌
       let bridgeStatus = {};
       try { bridgeStatus = JSON.parse(readFileSync(join(sessionDir, 'host-bridge.json'), 'utf8')); } catch {}
       this._sessions.set(key, { wj, sid: sessionDir, bridgeStatus });
     }
     return this._sessions.get(key);
+  }
+
+  // v0.7.9 P1-2：校准状态持久化——k̂（按 model，根目录共享跨会话收敛）+
+  // baseline/lastRealInput（按会话 calib.json）。重启不再冷启动：README「已知局限」
+  // 冷启动两条的根，也是第二轮复审唯一遗留 P1。
+  _attachCalibInto(wj, key, sessionDir) {
+    try {
+      if (wj.estimator && !wj.estimator.calibFile) wj.estimator.attachCalibFile(join(this.dir, 'models-calib.json'));
+    } catch {}
+    try {
+      this._calibLoaded = this._calibLoaded ?? new Map();
+      if (!this._calibLoaded.has(key)) {
+        this._calibLoaded.set(key, true);
+        const cal = JSON.parse(readFileSync(join(sessionDir, 'calib.json'), 'utf8'));
+        if (cal.baseline && !this._sessionBaseline.has(key)) this._sessionBaseline.set(key, cal.baseline);
+        if (cal.lastRealInput && !this._lastRealInput.has(key)) this._lastRealInput.set(key, cal.lastRealInput);
+      }
+    } catch {}
   }
 
   // 模型学习是全局知识（不属于会话）：从根目录注入会话 estimator
@@ -285,6 +326,8 @@ this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（�
       if (!cur) spanByIdx.set(m.blockId, [m.ev.seq, m.ev.seq]);
       else { if (m.ev.seq < cur[0]) cur[0] = m.ev.seq; if (m.ev.seq > cur[1]) cur[1] = m.ev.seq; }
     }
+    let bridged = 0;
+    const recT0 = Date.now();
     for (const b of wj.ledger.listBlocks()) {
       const span = spanByIdx.get(b.id) ?? (Array.isArray(b.seqSpan) && Number.isFinite(b.seqSpan[0]) && Number.isFinite(b.seqSpan[1]) ? [b.seqSpan[0], b.seqSpan[1]] : null);
       if (!span) { out.push(`${b.id}: 跳过（无 seq 锚，宿主无法定位区间）`); continue; }
@@ -310,6 +353,12 @@ this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（�
         }
         out.push(`${b.id}: failed 冷却结束，重试`);
       }
+      // v0.7.9 P2-10：单次预算——最多 3 块 / 300s，超出部分下轮继续（防宿主工具超时中途掐断成僵尸抖动）
+      if (bridged >= 3 || Date.now() - recT0 > 300 * 1000) {
+        out.push(`（预算用尽：本轮已补 ${bridged} 块，其余下轮继续）`);
+        break;
+      }
+      bridged += 1;
       const p = this.tryHostCompaction(hostSession, start, end, b.id, entrySid); // v0.7.5 P1-1：快照
       if (p) await p;
       // v0.6.21 P0：读 srec.bridgeStatus（markBridge 原地修改该记录）——
@@ -476,8 +525,8 @@ function buildTools(plugin) {
         // v0.6.19：月报接线（buildReport 终于上生产——命中率/责任归属/块统计）
         let monthly = '';
         try {
-          monthly = '\r\n\r\n' + buildReport({ dir: wj.dir, ledger: wj.ledger, diagnoser: wj.diagnoser });
-        } catch (e) { monthly = '\r\n\r\n月报生成失败：' + e.message; }
+          monthly = '\n\n' + buildReport({ dir: wj.dir, ledger: wj.ledger, diagnoser: wj.diagnoser });
+        } catch (e) { monthly = '\n\n月报生成失败：' + e.message; }
         return `万卷报告：requests.jsonl 累计 ${total} 条${span}${warn}。${logTail}${deepLog}${monthly}`;
       }
     ),
@@ -561,6 +610,22 @@ export function apply(ctx, config = {}) {
       }
     } catch {}
     plugin._lastUsageRecord?.set(sessionId, { provider, model, t: Date.now() }); // v0.7.7 P1-8(D)：内存缓存
+    // v0.7.9 P1-2：会话校准状态节流落盘（60s）——baseline/lastRealInput 重启回灌
+    try {
+      const nowTs = Date.now();
+      if (sessionId && nowTs - (plugin._calibSavedAt?.get(sessionId) ?? 0) > 60 * 1000) {
+        (plugin._calibSavedAt ?? new Map()).set(sessionId, nowTs);
+        const sdir = plugin.getOrCreate(sessionId)?.sid;
+        if (sdir) {
+          const ct = join(sdir, 'calib.json.tmp');
+          writeFileSync(ct, JSON.stringify({
+            baseline: plugin._sessionBaseline?.get(sessionId) ?? null,
+            lastRealInput: plugin._lastRealInput?.get(sessionId) ?? null,
+          }), 'utf8');
+          renameSync(ct, join(sdir, 'calib.json'));
+        }
+      }
+    } catch {}
     try {
       wj.diagnoser.record({
         usage: usageObj,
@@ -569,7 +634,7 @@ export function apply(ctx, config = {}) {
         est: est ?? undefined,
         khat: est?.khat,
         calibrating: est?.calibrating,
-        degraded: wj.estimator.getDegraded(),
+        degraded: [...wj.estimator.getDegraded(), ...(u.degraded ? [u.degraded] : [])], // v0.7.9 N-2：usage 形态漂移信号入档
         baseline,
       });
     } catch (e) {
@@ -881,8 +946,11 @@ export function apply(ctx, config = {}) {
   // v0.6.4：自动补桥（10 分钟限流）。turn/end 时排队执行；候选只含未达终态的块。
   plugin._autoReconcile = () => {
     const now = Date.now();
-    if (now - (plugin._lastAutoReconcile ?? 0) < 10 * 60 * 1000) return Promise.resolve('限流跳过');
-    plugin._lastAutoReconcile = now;
+    // v0.7.9 P2-10：限流按会话（全局槽让 B 会话的补桥被 A 的额度挡 10 分钟）
+    const sidKey = plugin._currentSessionId ?? 'default';
+    plugin._lastAutoReconcileMap = plugin._lastAutoReconcileMap ?? new Map();
+    if (now - (plugin._lastAutoReconcileMap.get(sidKey) ?? 0) < 10 * 60 * 1000) return Promise.resolve('限流跳过');
+    plugin._lastAutoReconcileMap.set(sidKey, now);
     return Promise.resolve()
       .then(() => plugin._toolReconcile())
       .then((r) => {
