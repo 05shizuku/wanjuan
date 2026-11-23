@@ -9,6 +9,7 @@ import { readFileSync, writeFileSync, appendFileSync, statSync, existsSync, rena
 import { join } from 'node:path';
 import { createWanjuan, PHILOSOPHY_KEEP_DROP } from './index.mjs';
 import { buildReport } from './report.mjs';
+import { LockManager } from './lock.mjs'; // v0.8.0 根锁
 import { estimateTok } from './tokenizer.mjs';
 
 export const name = 'wanjuan';
@@ -84,6 +85,7 @@ export class WanjuanPlugin {
     this._sessions = new Map();
     this._legacyAdopted = false; // 多会话隔离：首个会话收编根目录旧账本（升级无感），后续会话独立目录
     this._currentSessionId = null; // 最近活跃会话（工具与桥接状态的归属依据）
+    this.readOnly = this.config?.readOnly === true; // v0.8.0 根锁：只读降级实例
     // 日志环：Electron 主进程的 console 在 Windows 双击启动时不可见，
     // 文件日志也不收插件的 console 输出——所以内存留一份最近 30 条，wj_report 展示。
     this.logs = [];
@@ -113,7 +115,8 @@ this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（�
 
   // v0.6.4：日志落盘到 <数据目录>/wanjuan.log.jsonl，超 256KB 轮转保留最后 100 行
   _appendLogFile(level, msg) {
-    if (!this.logToFile || !this.dir) return;
+    // v0.8.0（增量④）：只读实例日志留内存——log 轮转是读-截-写三步，共享写会截掉持锁实例的日志
+    if (this.readOnly || !this.logToFile || !this.dir) return;
     try {
       const path = join(this.dir, 'wanjuan.log.jsonl');
       const line = JSON.stringify({ t: Date.now(), level, msg: String(msg) }) + '\n';
@@ -155,7 +158,7 @@ this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（�
           ? `${baseSid}-${createHash('sha256').update(key).digest('hex').slice(0, 8)}`
           : baseSid;
         this._dirMapping.set(key, mapped);
-        try {
+        if (!this.readOnly) try {
           const mt = join(this.dir, `.dirmapping-${Date.now()}.tmp`);
           writeFileSync(mt, JSON.stringify(Object.fromEntries(this._dirMapping)), 'utf8');
           renameSync(mt, join(this.dir, 'dirmapping.json'));
@@ -163,7 +166,7 @@ this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（�
       }
       const sid = mapped; // 下游沿用原名
       const sessionDir = legacyReady ? this.dir : (ownerSid === key ? this.dir : join(this.dir, 'sessions', sid));
-      if (legacyReady) {
+      if (legacyReady && !this.readOnly) {
         this._legacyAdopted = true;
         // v0.7.6 P2(C2)：tmp+rename 原子写（与 host-bridge.json 同款）
         try {
@@ -177,7 +180,7 @@ this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（�
           console.warn(`[wanjuan] owner.json 写入失败（收编归属未持久化，将重试）：${e.message}`);
         }
       }
-      const wj = createWanjuan({ dir: sessionDir, compactionThreshold: this.config?.compactionThreshold });
+      const wj = createWanjuan({ dir: sessionDir, compactionThreshold: this.config?.compactionThreshold, readOnly: this.readOnly }); // v0.8.0 根锁：只读降级透传
       this._loadLearnedInto(wj); // 模型学习是全局知识，注入每个新会话
       this._attachCalibInto(wj, key, sessionDir); // v0.7.9 P1-2：k̂ 校准 + baseline/lastRealInput 回灌
       let bridgeStatus = {};
@@ -192,7 +195,10 @@ this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（�
   // 冷启动两条的根，也是第二轮复审唯一遗留 P1。
   _attachCalibInto(wj, key, sessionDir) {
     try {
-      if (wj.estimator && !wj.estimator.calibFile) wj.estimator.attachCalibFile(join(this.dir, 'models-calib.json'));
+      if (wj.estimator && !wj.estimator.calibFile) {
+        wj.estimator.attachCalibFile(join(this.dir, 'models-calib.json'));
+        if (this.readOnly) wj.estimator.readOnly = true; // v0.8.0：只读实例不落 k̂ 校准
+      }
     } catch {}
     try {
       this._calibLoaded = this._calibLoaded ?? new Map();
@@ -442,6 +448,11 @@ function buildTools(plugin) {
       },
       ['blockId'],
       (args) => {
+        // v0.8.0 根锁（复审⑥）：context 模式会写账本（recordUnfold）——只读实例明确拒绝，
+        // 否则出现「宿主侧已恢复原文、账本仍记 folded」的状态分裂
+        if (plugin.readOnly && (args.mode ?? 'context') !== 'file') {
+          return '只读实例：context 恢复需要写账本（会与持有根锁的实例分裂状态），请用 file 模式或到持有根锁的实例操作';
+        }
         const wj = plugin._currentWj(); // 模型不知道 sessionId，跟随当前活跃会话
         return wj.restorer.decompress(args.blockId, args.mode ?? 'context');
       }
@@ -546,6 +557,14 @@ export function apply(ctx, config = {}) {
     console.warn('[wanjuan] ⚠️ config.dir 缺失或非法——进入影子模式（只记账不折叠，数据写系统临时目录）');
     config = { ...config, dir: join(tmpdir(), 'wanjuan-shadow-noconfig'), shadowMode: true };
   }
+  // v0.8.0 第一批（根锁）：插件级 LockManager——同一根目录的第二个实例降级只读，
+  // 双写撕裂在入口处根绝。半截锁先等再读；无法确认持有者死亡宁可只读（复审冻结方案）。
+  const lock = new LockManager({ dir: config.dir, bootId: _boot, onWarn: (m) => console.warn(m) });
+  lock.acquire();
+  if (lock.readOnly) {
+    config = { ...config, readOnly: true, shadowMode: true };
+    console.warn('[wanjuan] 本实例以只读模式运行（根目录锁被其他进程持有）：账本事件不入账、折叠/桥接停用；wj_report / wj_search / wj_decompress(file) 仍可用');
+  }
   const plugin = new WanjuanPlugin({ config });
   ctx._wj = plugin;
 
@@ -572,7 +591,7 @@ export function apply(ctx, config = {}) {
   const recordUsage = (wj, usage, provider, model, sessionId) => {
     const u = normalizeUsage(usage);
     if (!u) return;
-    warmupModelWindow(wj, provider, model); // M3.6：顺手预热当前模型的窗口解析（并自学习落盘）
+    if (!plugin.readOnly) warmupModelWindow(wj, provider, model); // v0.8.0：只读实例不写模型自学习/窗口缓存
     const usageObj = {
       input_tokens: u.input,
       input: u.input,
@@ -613,7 +632,7 @@ export function apply(ctx, config = {}) {
     // v0.7.9 P1-2：会话校准状态节流落盘（60s）——baseline/lastRealInput 重启回灌
     try {
       const nowTs = Date.now();
-      if (sessionId && nowTs - (plugin._calibSavedAt?.get(sessionId) ?? 0) > 60 * 1000) {
+      if (sessionId && !plugin.readOnly && nowTs - (plugin._calibSavedAt?.get(sessionId) ?? 0) > 60 * 1000) {
         (plugin._calibSavedAt ?? new Map()).set(sessionId, nowTs);
         const sdir = plugin.getOrCreate(sessionId)?.sid;
         if (sdir) {
@@ -741,7 +760,7 @@ export function apply(ctx, config = {}) {
   const markBridge = (sid, blockId, status, error) => {
     // v0.6.20：sid 由发起方锁定——异步回调完成时 _currentSessionId 可能已切换，
     // 猜当前会话会把 A 的状态写进 B 的 host-bridge.json（竞态推演属实）
-    if (!blockId || !plugin.dir) return;
+    if (!blockId || !plugin.dir || plugin.readOnly) return; // v0.8.0：只读实例不持久化桥接状态
     try {
       const srec = plugin.getOrCreate(sid ?? 'default');
       const rec = { status, at: Date.now(), ...(error ? { error: String(error).slice(0, 200) } : {}) };
@@ -966,6 +985,7 @@ export function apply(ctx, config = {}) {
     // a1 才是 SessionEvent（有 .type/.data/.time）。
     const ev = a1 && a1.type ? a1 : a0;
     if (!ev || !ev.type) return;
+    if (plugin.readOnly) return; // v0.8.0 根锁：只读实例不入账事件流（账本保持装载态快照，读类工具不受影响）
     const sessionId = ev.sessionId ?? a0?.id ?? 'default';
     try {
       const { wj } = plugin.getOrCreate(sessionId);

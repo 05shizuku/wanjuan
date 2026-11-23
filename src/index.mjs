@@ -41,6 +41,7 @@ export function createWanjuan({
   models = DEFAULT_MODELS,
   snapshotBudget,
   segBytes,
+  readOnly, // v0.8.0 根锁：只读降级实例
   sampleEvery,
   gateOptions,
   nudgeOptions,
@@ -48,12 +49,12 @@ export function createWanjuan({
 } = {}) {
   if (!dir) throw new Error('createWanjuan: dir 必填');
   
-  const store = new Store({ dir, snapshotBudget, segBytes });
+  const store = new Store({ dir, snapshotBudget, segBytes, readOnly });
   const ledger = new Ledger({ store, compactionThreshold });
   const estimator = new Estimator({ models });
   const observer = new Observer({ estimator });
   const fingerprinter = new Fingerprinter({ ledger, sampleEvery });
-  const diagnoser = new Diagnoser({ dir });
+  const diagnoser = new Diagnoser({ dir, readOnly });
   const blocks = new BlocksManager({ store });
   const compressor = new Compressor({ ledger, blocks });
   const restorer = new Restorer({ ledger, blocks });

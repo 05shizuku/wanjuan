@@ -21,8 +21,9 @@ export function hashCanonical(v, fields) {
 const SEG_RE = /^ledger\.(\d{4})\.jsonl$/;
 
 export class Store {
-  constructor({ dir, snapshotBudget = 1000, segBytes = 100 * 1024 * 1024, blockMaxBytes = 4 * 1024 * 1024, onWarn } = {}) {
+  constructor({ dir, snapshotBudget = 1000, segBytes = 100 * 1024 * 1024, blockMaxBytes = 4 * 1024 * 1024, onWarn, readOnly = false } = {}) {
     this.dir = dir;
+    this.readOnly = readOnly; // v0.8.0 根锁：只读降级实例（append/compact 拒绝写入）
     this.snapshotBudget = snapshotBudget;
     this.segBytes = segBytes;
     this.blockMaxBytes = blockMaxBytes;
@@ -30,8 +31,8 @@ export class Store {
     this.degraded = [];
     this._degradedWarned = false;
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    // v0.7.7 P2-7(D)：清扫崩溃残留的 tmp 文件（>1 小时；SEG_RE 不匹配所以无害但会堆积）
-    try {
+    // v0.7.7 P2-7(D)：清扫崩溃残留的 tmp 文件（>1 小时）——只读实例不扫（不写共享目录）
+    if (!this.readOnly) try {
       for (const f of readdirSync(this.dir)) {
         if (!/\.tmp/.test(f)) continue;
         try { if (Date.now() - statSync(join(this.dir, f)).mtimeMs > 3600 * 1000) unlinkSync(join(this.dir, f)); } catch {}
@@ -56,6 +57,8 @@ export class Store {
   }
 
   append(ev) {
+    // v0.8.0 根锁：只读实例拒绝写入（loud——上层 catch 会记日志，账本保持装载态快照）
+    if (this.readOnly) throw new Error('wanjuan: 只读实例拒绝写入（根目录锁被其他进程持有）');
     const line = JSON.stringify(ev) + '\n';
     this._rotateIfNeeded(Buffer.byteLength(line));
     // v0.6.14：崩溃半行隔离——强杀可能留下无换行符的半行 JSON，若直接追加，
@@ -159,6 +162,8 @@ export class Store {
   // M4.1 对数压缩：把等价极简事件流写为 ledger.0000.jsonl（排序最前，replay 语义零改动），
   // 其余卷移入 archive/（原文永不删除）。月度会话的启动重放延迟从此有界。
   compact(events) {
+    // v0.8.0 根锁：只读实例拒绝重写 0000 卷（会与持锁实例的账本分裂）
+    if (this.readOnly) throw new Error('wanjuan: 只读实例拒绝对数压缩（根目录锁被其他进程持有）');
     const body = events.map((ev) => JSON.stringify(ev) + '\n').join('');
     // v0.7.6 P0-1(C2)：原子重写——裸 writeFileSync 先截断后写，崩溃撕裂即账本损坏，
     // 默认 100MB 单卷下 archive 为空、无副本可恢复。与 writeRaw 同款：tmp+fsync+rename。
@@ -176,7 +181,8 @@ export class Store {
     // EEXIST，旧方案二次压缩必现并无限失败循环；新方案重名根除，且各次归档互不混淆
     const adir = join(this.dir, 'archive', String(Date.now()));
     if (!existsSync(adir)) mkdirSync(adir, { recursive: true });
-    for (const f of readdirSync(this.dir).filter((x) => SEG_RE.test(x) && x !== 'ledger.0000.jsonl')) {
+    // v0.8.0 增量①（复审冻结项）：归档顺序不能依赖 readdir 的隐式字母序（NTFS 惯例而非契约）
+    for (const f of readdirSync(this.dir).filter((x) => SEG_RE.test(x) && x !== 'ledger.0000.jsonl').sort()) {
       renameSync(join(this.dir, f), join(adir, f));
     }
     this._syncSegIndex();

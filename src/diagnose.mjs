@@ -29,13 +29,15 @@ export function classifyMiss({ usage, est, divergeAt = null, baseline = 0 }) {
 }
 
 export class Diagnoser {
-  constructor({ dir }) {
+  constructor({ dir, readOnly = false }) {
     this.dir = dir;
+    this.readOnly = readOnly; // v0.8.0 根锁
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     this.path = join(dir, 'requests.jsonl');
   }
 
   record({ n, t = Date.now(), provider, model, usage, est, khat, calibrating, degraded = [], divergeAt = null, overrideMissKind = null, baseline = 0 }) {
+    if (this.readOnly) return null; // v0.8.0 根锁：只读实例不写共享遥测（requests.jsonl 为 append 型，双进程交错会撕裂半行）
     const input = usage?.input_tokens ?? 0;
     const cached = usage?.cached ?? 0;
     const missTok = Math.max(0, input - cached);

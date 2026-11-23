@@ -1931,6 +1931,51 @@ test('v0.7.9 P2-10：补桥单次预算——最多 3 块，超出下轮继续',
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.8.0 根锁：第二实例降级只读——Store.append 拒绝、首实例不受影响', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-lock-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    assert.equal(ctx._wj.readOnly, false, '首个实例应持有根锁');
+    // 同进程第二个实例：锁被本进程持有（pid 存活）→ 降级只读
+    const { ctx: ctx2 } = freshCtx(dir);
+    apply(ctx2, { dir, shadowMode: false });
+    assert.equal(ctx2._wj.readOnly, true, '第二实例应降级只读');
+    const wj2 = ctx2._wj.getOrCreate('s9').wj;
+    assert.throws(() => wj2.ledger.recordMsg({ id: 'z1', at: 1, tok: 1 }), /只读/, 'Store.append 应拒绝写入');
+    assert.equal(ctx._wj.readOnly, false, '首实例不受影响');
+    // 首实例照常可写
+    const wj1 = ctx._wj.getOrCreate('s1').wj;
+    wj1.ledger.recordMsg({ id: 'ok1', at: 1, tok: 1, content: 'x' });
+    assert.equal(wj1.ledger.messages.get('ok1').status, 'active', '持锁实例写入正常');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.8.0 根锁：持有者死亡 → 抢锁；半截锁 → 宁可只读', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-lock2-'));
+  try {
+    const { LockManager } = await import('../src/lock.mjs');
+    const { writeFileSync: wf } = await import('node:fs');
+    // 死 pid（近 32 位上限，几乎不可能存活）→ 应抢锁
+    wf(join(dir, 'wanjuan.lock'), JSON.stringify({ pid: 2147483000, boot: 'dead', at: Date.now() }), 'utf8');
+    const lm = new LockManager({ dir, bootId: 'me' });
+    lm.acquire();
+    assert.equal(lm.acquired, true, '持有者已死应抢锁');
+    // 半截锁（故意截断的 JSON）→ 无法确认持有者死亡 → 宁可只读
+    wf(join(dir, 'wanjuan.lock'), '{"pid":123,"boot":', 'utf8');
+    const lm2 = new LockManager({ dir, bootId: 'me2', readRetryMs: 1 });
+    lm2.acquire();
+    assert.equal(lm2.readOnly, true, '半截锁应降级只读');
+    assert.equal(lm2.reason, 'lock-unreadable');
+    // 活 pid（本进程）→ 只读
+    wf(join(dir, 'wanjuan.lock'), JSON.stringify({ pid: process.pid, boot: 'live', at: Date.now() }), 'utf8');
+    const lm3 = new LockManager({ dir, bootId: 'me3' });
+    lm3.acquire();
+    assert.equal(lm3.readOnly, true, '活进程持锁应只读');
+    assert.equal(lm3.holder.pid, process.pid);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {

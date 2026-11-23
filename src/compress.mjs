@@ -54,9 +54,11 @@ export class Compressor {
     const ats = toFold.map((m) => m.at).filter((t) => typeof t === 'number' && t > 0);
     const atRange = ats.length > 0 ? [ats.reduce((a, b) => (a < b ? a : b)), ats.reduce((a, b) => (a > b ? a : b))] : null; // v0.7.7 P1-3(D)：reduce 防栈溢出
 
-    this.blocks.writeRaw(blockId, toFold);
-
+    // v0.8.0 根锁批（复审④）：writeRaw 纳入 try——此前在 try 外，写失败走不进
+    // catch 的 deleteRaw 清理（其内部 tmp+rename 决定了只残留 .tmp 被清扫兜住，
+    // 但调用方应得到统一的有清理错误路径 + loud 上抛）。
     try {
+      this.blocks.writeRaw(blockId, toFold);
       this.blocks.writeBlockMeta(blockId, {
         id: blockId, tier, range, srcTok, sumTok,
         summary, topics, rawRef, createdAt: Date.now(),
