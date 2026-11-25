@@ -18,6 +18,14 @@ export function buildReport({ dir, ledger, diagnoser }) {
 
   const lines = [];
   lines.push('== 万卷月报 ==');
+  // v0.8.0 根锁：常驻锁状态行（复审建议项；周度哨兵观察点⑤）
+  try {
+    const lk = JSON.parse(readFileSync(join(dir, 'wanjuan.lock'), 'utf8'));
+    const ageMin = Math.round((Date.now() - (lk.at || 0)) / 60000);
+    lines.push(`根锁：pid=${lk.pid}（${ageMin} 分钟前获取，第二实例将只读）`);
+  } catch {
+    lines.push('根锁：无（无实例持锁）');
+  }
   lines.push('');
   lines.push(`请求总数：${summary.total}`);
   lines.push(`总命中率：${pct(summary.hitRate)}`);

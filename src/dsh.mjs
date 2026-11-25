@@ -346,7 +346,18 @@ this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（�
       const [start, end] = span;
       const st0 = bridgeStatus?.[b.id]?.status;
       if (st0 === 'ok') { out.push(`${b.id}: 已打通（seq ${start}→${end}），跳过`); continue; }
-      if (st0 === 'skip') { out.push(`${b.id}: 已终态（${(bridgeStatus[b.id]?.error ?? '').slice(0, 300)}），跳过`); continue; }
+      if (st0 === 'skip') {
+        // v0.8.1：不平衡类 skip 不再是死终态——tryHostCompaction 已支持 end/start 边界
+        // 回退重试，这类块补桥即可通过；且宿主边界校验先于 LLM 摘要，失败重试零成本。
+        // 其余 skip（区间不在表面/摘要不缩）维持终态，防每轮重烧 LLM。
+        const skipErr = String(bridgeStatus[b.id]?.error ?? '');
+        if (skipErr.includes('not a balanced boundary')) {
+          out.push(`${b.id}: skip 原因是边界不平衡（v0.8.1 已支持边界回退），重试`);
+        } else {
+          out.push(`${b.id}: 已终态（${skipErr.slice(0, 300)}），跳过`);
+          continue;
+        }
+      }
       if (st0 === 'pending') {
         // v0.6.16 P0-2：pending 超 3 分钟即僵尸（崩溃/挂起遗留）——按 failed 重试，不再永久跳过。
         // 同进程内 in-flight 的桥接 at 是新鲜的，仍受保护。
@@ -885,6 +896,36 @@ export function apply(ctx, config = {}) {
         } catch {}
         return null;
       };
+      // v0.8.1：终点切线拆散 tool-call/result 对（或 step 仍开着）时，回退到最近的
+      // 平衡切线。规则与宿主 dsh-compaction/tool-pairing 同款：assistant/message 的
+      // tool-call 块 +1，tool/result -1，切线处未闭合数归零才算平衡。此前 end 不平衡
+      // 直接终态 skip，块永远桥接不上（bb00f425 seq 1011 实测路径）。
+      const walkToBalancedEnd = (sess, from) => {
+        try {
+          const nodes = sess?.surface?.nodes;
+          if (!Array.isArray(nodes) || nodes.length === 0) return null;
+          const idx = nodes.indexOf(from);
+          if (idx < 0) return null;
+          let open = 0;
+          const cutAfter = []; // cutAfter[i]：切在 nodes[i] 之后是否平衡
+          for (let i = 0; i < nodes.length; i++) {
+            const ev = sess.eventAt?.(nodes[i]);
+            const t = String(ev?.type ?? '');
+            if (t === 'assistant/message') {
+              const blocks = ev?.data?.message?.content;
+              if (Array.isArray(blocks)) for (const b of blocks) if (b && b.type === 'tool-call') open += 1;
+            } else if (t === 'tool/result') {
+              open -= 1;
+              if (open < 0) open = 0;
+            }
+            cutAfter.push(open === 0);
+          }
+          for (let i = Math.min(idx, cutAfter.length - 1); i >= 0 && idx - i <= 60; i--) {
+            if (cutAfter[i]) return nodes[i];
+          }
+        } catch {}
+        return null;
+      };
       // v0.6.9 风险四：signal 传入宿主（compactRegion 第 4 参）——超时时 ac.abort 
       // 真正通知宿主中止摘要，不再空烧 LLM；宿主不认 signal 时 race 仍兜底。
       const ac = new AbortController();
@@ -898,20 +939,30 @@ export function apply(ctx, config = {}) {
       }, timeoutMs);
       if (bridgeTimer.unref) bridgeTimer.unref();
       timeoutP.catch(() => {}); // 迟到的拒绝不得成为 unhandledRejection
+      let usedEnd = endSeq; // v0.8.1：成功日志报告真实使用的终点（边界回退后与 endSeq 不同）
       const workP = Promise.resolve()
         .then(async () => {
           let start = startSeq;
+          let end = endSeq;
           for (let attempt = 0; ; attempt++) {
             try {
-              const res = await svc.compactRegion(start, endSeq, agent, ac.signal);
-              if (attempt > 0) plugin.pushLog('log', `M3.5：起点回退 ${startSeq}→${start} 后重试成功`);
+              const res = await svc.compactRegion(start, end, agent, ac.signal);
+              if (attempt > 0) plugin.pushLog('log', `M3.5：边界回退 ${startSeq}→${start}/${endSeq}→${end} 后重试成功`);
+              usedEnd = end;
               return res;
             } catch (err) {
               const msg = String(err?.message ?? err);
-              if (!msg.includes('not a balanced boundary') || !msg.includes('start seq') || attempt >= 3) throw err;
-              const prev = walkToUserStart(session, start);
-              if (prev === null || prev >= start) throw err;
-              start = prev;
+              if (!msg.includes('not a balanced boundary') || attempt >= 3) throw err;
+              if (msg.includes('start seq')) {
+                const prev = walkToUserStart(session, start);
+                if (prev === null || prev >= start) throw err;
+                start = prev;
+              } else if (msg.includes('end seq')) {
+                const prevEnd = walkToBalancedEnd(session, end);
+                if (prevEnd === null || prevEnd >= end || prevEnd <= start) throw err;
+                plugin.pushLog('log', `M3.5：end 边界不平衡（${msg.slice(0, 90)}），回退 ${end}→${prevEnd} 重试`);
+                end = prevEnd;
+              } else throw err;
             }
           }
         });
@@ -919,7 +970,7 @@ export function apply(ctx, config = {}) {
         .then((res) => {
           clearTimeout(bridgeTimer);
           markBridge(sid, blockId, 'ok');
-          plugin.pushLog('log', `M3.5：宿主原生压缩完成（seq ${startSeq}→${endSeq}）${res ? JSON.stringify(res).slice(0, 120) : ''}`);
+          plugin.pushLog('log', `M3.5：宿主原生压缩完成（seq ${startSeq}→${usedEnd}）${res ? JSON.stringify(res).slice(0, 120) : ''}`);
         })
         .catch(async (err) => {
           clearTimeout(bridgeTimer);
@@ -1317,9 +1368,12 @@ export function apply(ctx, config = {}) {
             plugin._pendingNudge.delete(hitKey); // 防御性兜底
           } else {
             const msgs = decision?.messages;
-            if (!Array.isArray(msgs) || Object.isFrozen(msgs) || msgs.length === 0) {
-              plugin.pushLog('warn', '[nudge] pre-step decision.messages 不可写或为空，跳过注入');
-              plugin._pendingNudge.delete(hitKey);
+            if (!Array.isArray(msgs) || msgs.length === 0) {
+              // v0.8.1：空 messages = 没有新 claimed 的空转 pre-step（驱动器重踢/桥接唤醒的
+              // 常见形态）。这不是失败：保留 pending 等下一个真正载有用户消息的 pre-step。
+              // 此前这里连 frozen 一起拦并无条件 delete——nudge 被第一个空转步骤吃掉，
+              // 永远到不了模型（bb00f425 turn 527 实测：产出后 41ms 即被空转 pre-step 清掉）。
+              plugin.pushLog('log', '[nudge] pre-step decision.messages 为空（空转步骤），pending 保留待下步注入');
             } else {
               const nudgeMsg = {
                 id: pending.message.id ?? `wj-nudge-${turnNo}-${Date.now()}`,

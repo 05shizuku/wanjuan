@@ -586,7 +586,7 @@ test('v0.6.3：起点拆散 pair 时自动回退到 user 消息重试', async ()
     ctx._wj.tryHostCompaction(ctx._wj._lastHostSession, 3, 5, 'bx');
     await new Promise((r) => setImmediate(r));
     assert.deepEqual(calls, [[1, 5]], '应回退到 user 消息起点重试');
-    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('起点回退 3→1')), '应记录回退日志');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('回退 3→1')), '应记录回退日志');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -2038,6 +2038,18 @@ test('v0.8.0-phase1a：只读实例执行全部工具——会话目录逐文件
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.8.0：wj_report 常驻锁状态行（周度哨兵观察点⑤）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-lockline-'));
+  try {
+    const { buildReport } = await import('../src/report.mjs');
+    const { writeFileSync: wf } = await import('node:fs');
+    wf(join(dir, 'wanjuan.lock'), JSON.stringify({ pid: 424242, boot: 'bt', at: Date.now() - 60000 }), 'utf8');
+    const fakeDiag = { summarize: () => ({ total: 0, hitRate: 0, coreHitRate: 0, byOwner: { host: 0, upstream: 0, wanjuan: 0, unattributed: 0 } }) };
+    const out = buildReport({ dir, ledger: null, diagnoser: fakeDiag });
+    assert.ok(out.includes('根锁：pid=424242'), '应含锁状态行');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {
@@ -2276,5 +2288,132 @@ test('v0.6.5：桥接超时——宿主挂死时转 failed 而非永远等待', 
     assert.equal(ctx._wj.getOrCreate('default').bridgeStatus.bt.status, 'failed', '超时应标记 failed（瞬态，下轮重试）');
     assert.ok(ctx._wj.getOrCreate('default').bridgeStatus.bt.error.includes('桥接超时'), '错误信息应注明超时');
     assert.ok(ctx._wj.logs.some((l) => l.msg.includes('桥接超时')), '日志环应记录超时');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+// ===== v0.8.1：M3.5 end 边界回退 + nudge 空转步骤保留（bb00f425 实测回归）=====
+
+test('v0.8.1：M3.5 end 边界不平衡——回退到最近平衡切线重试成功，不再终态 skip', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    const nodes = [1, 2, 3, 4, 5, 6];
+    const evAt = (q) => ({
+      1: { type: 'user/message', seq: 1, data: {} },
+      2: { type: 'assistant/message', seq: 2, data: { message: { content: [{ type: 'tool-call', id: 't1' }] } } },
+      3: { type: 'tool/result', seq: 3, data: {} },
+      4: { type: 'assistant/message', seq: 4, data: { message: { content: [{ type: 'tool-call', id: 't2' }] } } },
+      5: { type: 'tool/result', seq: 5, data: {} },
+      6: { type: 'user/message', seq: 6, data: {} },
+    }[q]);
+    const fakeSession = { surface: { nodes }, eventAt: evAt };
+    const calls = [];
+    ctx.compaction = { compactRegion: async (start, end) => {
+      calls.push([start, end]);
+      if (end === 4) throw new Error('compactRegion: end seq 4 is not a balanced boundary (would split a step, or the step is still open)');
+      return { ok: true };
+    } };
+    apply(ctx, { dir, shadowMode: false });
+    await ctx._wj.tryHostCompaction(fakeSession, 1, 4, 'b1', 's1');
+    assert.deepEqual(calls, [[1, 4], [1, 3]], 'end 应回退 4→3 后成功');
+    assert.equal(ctx._wj.getOrCreate('s1').bridgeStatus?.b1?.status, 'ok', '桥接应落 ok 而非 skip');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('end 边界不平衡')), '应有边界回退日志');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('宿主原生压缩完成（seq 1→3）')), '完成日志应报告真实终点');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.8.1：M3.5 end 边界回退耗尽仍不平衡——终态 skip 保持（防御上限不失效）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    const nodes = [1, 2, 3, 4, 5, 6];
+    const evAt = (q) => ({
+      1: { type: 'user/message', seq: 1, data: {} },
+      2: { type: 'assistant/message', seq: 2, data: { message: { content: [{ type: 'tool-call', id: 't1' }] } } },
+      3: { type: 'tool/result', seq: 3, data: {} },
+      4: { type: 'assistant/message', seq: 4, data: { message: { content: [{ type: 'tool-call', id: 't2' }] } } },
+      5: { type: 'tool/result', seq: 5, data: {} },
+      6: { type: 'user/message', seq: 6, data: {} },
+    }[q]);
+    const fakeSession = { surface: { nodes }, eventAt: evAt };
+    let calls = 0;
+    ctx.compaction = { compactRegion: async () => { calls += 1; throw new Error('compactRegion: end seq 4 is not a balanced boundary (would split a step, or the step is still open)'); } };
+    apply(ctx, { dir, shadowMode: false });
+    await ctx._wj.tryHostCompaction(fakeSession, 1, 4, 'b2', 's1');
+    assert.ok(calls >= 2 && calls <= 4, `重试应有上限（实际 ${calls} 次）`);
+    assert.equal(ctx._wj.getOrCreate('s1').bridgeStatus?.b2?.status, 'skip', '重试耗尽仍应终态 skip');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.8.1：空 messages 的空转 pre-step 保留 pending，不吞 nudge', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    ctx._wj._pendingNudge.set('s1', {
+      message: { id: 'wj-nudge-5', cls: 'sys', tok: 42, content: '【测试 nudge】' },
+      turn: 5,
+      candidateIds: [],
+    });
+    // 空转 pre-step（驱动器重踢/桥接唤醒形态）：messages 空
+    const r1 = await ctx._wj._preStepHandler({ agent: { id: 's1' }, turn: 5 }, async () => ({ messages: [] }));
+    assert.equal(r1.messages.length, 0);
+    assert.equal(ctx._wj._pendingNudge.has('s1'), true, '空转步骤不得吞掉 pending（旧版在此 delete → nudge 永远到不了模型）');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('空转步骤')), '应留诊断日志');
+    // 下一个真正载有用户消息的 pre-step：注入成功
+    const r2 = await ctx._wj._preStepHandler({ agent: { id: 's1' }, turn: 5 }, async () => ({ messages: [{ id: 'u' }] }));
+    assert.equal(r2.messages.length, 2);
+    assert.equal(r2.messages[1].source.kind, 'wanjuan-nudge');
+    assert.equal(ctx._wj._pendingNudge.get('s1').injectedAt, 5);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.8.1：冻结的 decision.messages 照样注入（toSpliced 非变异，原数组不被改动）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    ctx._wj._pendingNudge.set('s2', {
+      message: { id: 'wj-nudge-3', cls: 'sys', tok: 42, content: '【冻结注入测试】' },
+      turn: 3,
+      candidateIds: [],
+    });
+    const frozenDecision = Object.freeze({ kind: 'enter', messages: Object.freeze([{ id: 'u' }]) });
+    const r = await ctx._wj._preStepHandler({ agent: { id: 's2' }, turn: 3 }, async () => frozenDecision);
+    assert.equal(r.messages.length, 2);
+    assert.equal(r.messages[1].source.kind, 'wanjuan-nudge');
+    assert.equal(r.messages[1].content[0].text, '【冻结注入测试】');
+    assert.ok(Object.isFrozen(frozenDecision.messages), '原冻结数组不得被改动');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.8.1：不平衡类 skip 块重新可补桥（其余 skip 维持终态）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-dsh-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    ctx.compaction = { compactRegion: async () => ({ ok: true }) };
+    apply(ctx, { dir, shadowMode: false });
+    for (let i = 1; i <= 25; i++) {
+      eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: i, time: 1000 + i,
+        data: { id: `u${String(i).padStart(2, '0')}`, role: 'user', content: `m${i}`, tok: 10 } });
+    }
+    // 折两块：bA（将被标成不平衡 skip）、bB（其他原因 skip）
+    await ctx._wj._toolCompress({ ids: ['u01', 'u02', 'u03'], summary: '块A摘要' });
+    await ctx._wj._toolCompress({ ids: ['u04', 'u05', 'u06'], summary: '块B摘要' });
+    const blocks = ctx._wj.getOrCreate('s1').wj.ledger.listBlocks();
+    assert.ok(blocks.length >= 2, '前置：两个块已折叠');
+    const [bA, bB] = blocks;
+    const srec = ctx._wj.getOrCreate('s1');
+    srec.bridgeStatus[bA.id] = { status: 'skip', at: Date.now(), error: 'compactRegion: end seq 3 is not a balanced boundary (would split a step, or the step is still open)' };
+    srec.bridgeStatus[bB.id] = { status: 'skip', at: Date.now(), error: 'summary is not smaller than the original span' };
+    ctx._wj._lastHostSession = {
+      surface: { nodes: Array.from({ length: 25 }, (_, k) => k + 1) },
+      eventAt: (q) => ({ type: 'user/message', seq: q, data: {} }),
+    };
+    const out = await ctx._wj._toolReconcile();
+    assert.ok(out.includes(`${bA.id}: seq`) && out.includes('→ ok'), '不平衡 skip 块应被重试并打通');
+    assert.ok(out.includes(`${bB.id}: 已终态`), '其他 skip 维持终态');
+    assert.equal(srec.bridgeStatus[bA.id].status, 'ok', 'bA 桥接应落 ok');
+    assert.equal(srec.bridgeStatus[bB.id].status, 'skip', 'bB 保持 skip');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
