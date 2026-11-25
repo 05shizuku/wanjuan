@@ -256,10 +256,24 @@ this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（�
     const hostSession = this._hostSessions?.get(sid) ?? this._lastHostSession; // v0.7.7 P1-4(D)：按入口会话取
     const wj = this.getOrCreate(sid).wj;
     const before = new Set(wj.ledger.listBlocks().map((b) => b.id));
+    // v0.8.2（方案①）：手动折叠的 summary 由模型自写、无自述——wj_search 命中该块时
+    // 模型无从分辨这是原文还是折叠摘要。自动折叠模板已有自述，这里对手动路径补齐。
+    // 可见性边界（DESIGN 附A）：脚注只进万卷摘要；宿主摘要措辞不受万卷控制。
+    let manualSummary = args.summary ?? '';
+    let foldNote = '';
+    if (Array.isArray(args.ids)) foldNote = `原文共 ${args.ids.length} 条`;
+    else if (Array.isArray(args.range)) {
+      const act = wj.ledger.getActiveMessages();
+      const si = act.findIndex((mm) => mm.id === args.range[0]);
+      const ei = act.findIndex((mm) => mm.id === args.range[1]);
+      if (si >= 0 && ei >= 0 && si <= ei) foldNote = `原文共 ${ei - si + 1} 条`;
+    }
+    manualSummary += `\n\n【折叠产物】${foldNote ? foldNote + '，' : ''}此块已折叠、原文不在当前上下文中；需要原文请用 wj_decompress（档案调阅，非当前记忆）。`;
     wj.compressor.compress({
       ...args,
+      summary: manualSummary,
       // 手动路径也补 sumTok（此前只有自动折叠路径传了）
-      sumTok: estimateTok(args.summary ?? ''), // P0-8 + P2：单消息场景 estRaw ≡ tok，直用 estimateTok 不触发 unknown-model degrade
+      sumTok: estimateTok(manualSummary), // P0-8 + P2：单消息场景 estRaw ≡ tok，直用 estimateTok 不触发 unknown-model degrade
     });
     // M3.5：手动折叠后同样桥接宿主原生压缩（1M 大窗口下自然折叠稀少，
     // 手动路径同时是 M3.5 的实时验证通路）。
@@ -471,7 +485,17 @@ function buildTools(plugin) {
           return '只读实例：context 恢复需要写账本（会与持有根锁的实例分裂状态），请用 file 模式或到持有根锁的实例操作';
         }
         const wj = plugin._currentWj(); // 模型不知道 sessionId，跟随当前活跃会话
-        return wj.restorer.decompress(args.blockId, args.mode ?? 'context');
+        const res = wj.restorer.decompress(args.blockId, args.mode ?? 'context');
+        // v0.8.2（方案③）：档案免责声明——decompress 取回的是万卷自己存的副本，
+        // 宿主表面被折的那段模型看到的仍是摘要；防止把档案调阅当当前记忆。
+        if (Array.isArray(res)) {
+          return {
+            说明: '以下原文来自万卷档案（wj_decompress 档案调阅），是一次性取回，不在当前上下文中；宿主侧该段仍是折叠摘要。如需引用请注明来源是档案。',
+            恢复条数: res.length,
+            原文: res,
+          };
+        }
+        return res; // file 模式返回路径字符串；父块幂等提示字符串
       }
     ),
     makeTool(

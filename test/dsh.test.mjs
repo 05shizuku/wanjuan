@@ -2050,6 +2050,57 @@ test('v0.8.0：wj_report 常驻锁状态行（周度哨兵观察点⑤）', asyn
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.8.2 方案③：wj_decompress 档案免责声明——原文包装在说明对象里，file 模式不包装', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-v82d-'));
+  try {
+    const { ctx, registered } = freshCtx(dir);
+    ctx.compaction = { compactRegion: async () => ({ ok: true }) };
+    apply(ctx, { dir, shadowMode: false });
+    ctx._wj._currentSessionId = 's1';
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    for (let i = 1; i <= 2; i++) wj.ledger.recordMsg({ id: 'm' + i, at: i, tok: 5, content: '内容' + i, seq: i });
+    const blockId = wj.compressor.compress({ ids: ['m1', 'm2'], summary: 's', sumTok: 3 });
+    const t = registered.find((x) => x.name === 'wj_decompress');
+    assert.ok(t, '前置：wj_decompress 已注册');
+    // file 模式先测（无副作用）；context 模式会 recordUnfold 删除块记录，必须放最后
+    const resFile = await t.handler({ blockId, mode: 'file' });
+    const textFile = resFile.content[0].text;
+    assert.ok(!textFile.includes('说明'), 'file 模式（路径字符串）不包装');
+    assert.ok(textFile.includes('.raw.jsonl'), 'file 模式返回路径');
+    const res = await t.handler({ blockId });
+    const parsed = JSON.parse(res.content[0].text);
+    assert.ok(String(parsed.说明).includes('档案'), '应带档案免责声明');
+    assert.ok(String(parsed.说明).includes('不在当前上下文中'), '应说明非当前上下文');
+    assert.equal(parsed.恢复条数, 2, '恢复条数正确');
+    assert.ok(Array.isArray(parsed.原文) && parsed.原文.length === 2, '原文数组完整');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.8.2 方案①：手动折叠 summary 补自述脚注（ids 与 range 两种形态）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-v82m-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    ctx.compaction = { compactRegion: async () => ({ ok: true }) };
+    apply(ctx, { dir, shadowMode: false });
+    ctx._wj._currentSessionId = 's1';
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    for (let i = 1; i <= 4; i++) wj.ledger.recordMsg({ id: 'm' + i, at: i, tok: 5, content: '内容' + i, seq: i });
+    const out1 = await ctx._wj._toolCompress({ ids: ['m1', 'm2'], summary: '手工摘要一' });
+    assert.ok(out1.includes('✅'), 'ids 折叠成功');
+    const b1 = wj.ledger.listBlocks().find((b) => b.ids && b.ids.length === 2 && b.ids.includes('m1'));
+    const meta1 = wj.blocks.readBlockMeta(b1.id);
+    assert.ok(meta1.summary.includes('手工摘要一'), '原摘要保留');
+    assert.ok(meta1.summary.includes('【折叠产物】'), '应有自述脚注');
+    assert.ok(meta1.summary.includes('原文共 2 条'), '应含原文条数');
+    assert.ok(meta1.summary.includes('不在当前上下文'), '应说明非当前上下文');
+    const out2 = await ctx._wj._toolCompress({ range: ['m3', 'm4'], summary: '手工摘要二' });
+    assert.ok(out2.includes('✅'), 'range 折叠成功');
+    const b2 = wj.ledger.listBlocks().find((b) => !(b.ids && b.ids.includes('m1')) && b.id !== b1.id);
+    const meta2 = wj.blocks.readBlockMeta(b2.id);
+    assert.ok(meta2.summary.includes('原文共 2 条'), 'range 形态也计数');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {
