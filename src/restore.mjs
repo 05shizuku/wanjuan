@@ -54,10 +54,11 @@ export class Restorer {
     const q = query.toLowerCase();
     const blocks = this.ledger.listBlocks();
     const matches = [];
+    const metaErrors = []; // v0.8.3 R1b：meta 读失败不再静默吞块——调用方必须看到排除名单
     for (const b of blocks) {
       if (b.promotedInto) continue;
       let meta;
-      try { meta = this.blocks.readBlockMeta(b.id); } catch { continue; }
+      try { meta = this.blocks.readBlockMeta(b.id); } catch { metaErrors.push(b.id); continue; }
       const inSummary = (meta.summary || '').toLowerCase().includes(q);
       const inTopics = (meta.topics || []).some((t) => t.toLowerCase().includes(q));
       if (inSummary || inTopics) {
@@ -67,6 +68,6 @@ export class Restorer {
         });
       }
     }
-    return matches;
+    return { matches, metaErrors };
   }
 }

@@ -2101,6 +2101,86 @@ test('v0.8.2 方案①：手动折叠 summary 补自述脚注（ids 与 range �
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.8.3 F1a：compact tmp 残留（未 rename）——重放不受影响', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-f1a-'));
+  try {
+    const { Store } = await import('../src/store.mjs');
+    const { Ledger } = await import('../src/ledger.mjs');
+    const { writeFileSync: wf } = await import('node:fs');
+    const store1 = new Store({ dir });
+    const ledger1 = new Ledger({ store: store1 });
+    for (let i = 1; i <= 3; i++) ledger1.recordMsg({ id: 'm' + i, at: i, tok: 5, content: 'x' + i, seq: i });
+    ledger1.recordFold({ block: 'b1', ids: ['m1'], range: ['m1', 'm1'], srcTok: 5, sumTok: 2, tier: 0, rawRef: 'block.b1.raw.jsonl' });
+    // 注入：compact 的 tmp 已写、rename 未发生（进程被杀的中间态）
+    wf(join(dir, 'ledger.0000.jsonl.tmp-1795000000000-ab3d9f'), '{"k":"msg","id":"m1",', 'utf8');
+    const ledger2 = new Ledger({ store: new Store({ dir }) });
+    assert.deepEqual(ledger2.getActiveMessages().map((m) => m.id), ['m2', 'm3'], '重放与中断前一致');
+    assert.equal(ledger2.messages.get('m1').status, 'folded', '折叠状态保留');
+    assert.ok(ledger2.getBlock('b1'), '块重建');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.8.3 F1b：compact 归档中断（部分旧卷已移）——重放收敛', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-f1b-'));
+  try {
+    const { Store } = await import('../src/store.mjs');
+    const { Ledger } = await import('../src/ledger.mjs');
+    const { writeFileSync: wf, mkdirSync: mkd, renameSync: rn, readdirSync: rds } = await import('node:fs');
+    const store1 = new Store({ dir, segBytes: 1 }); // 每 append 一卷 → 0001..N
+    const ledger1 = new Ledger({ store: store1 });
+    for (let i = 1; i <= 4; i++) ledger1.recordMsg({ id: 'm' + i, at: i, tok: 5, content: 'x' + i, seq: i });
+    ledger1.recordFold({ block: 'b1', ids: ['m1', 'm2'], range: ['m1', 'm2'], srcTok: 10, sumTok: 4, tier: 0, rawRef: 'block.b1.raw.jsonl' });
+    ledger1.recordEvict({ ids: ['m3'], why: 'reconcile' });
+    // 注入：0000 已写、归档中途——只移第一卷，其余残留
+    const events = ledger1._compactionEvents();
+    wf(join(dir, 'ledger.0000.jsonl'), events.map((ev) => JSON.stringify(ev) + '\n').join(''), 'utf8');
+    const segs = rds(dir).filter((f) => /^ledger\.\d{4}\.jsonl$/.test(f) && f !== 'ledger.0000.jsonl').sort();
+    assert.ok(segs.length >= 2, '前置：多卷存在（实际 ' + segs.length + '）');
+    const adir = join(dir, 'archive', '1000');
+    mkd(adir, { recursive: true });
+    rn(join(dir, segs[0]), join(adir, segs[0]));
+    const ledger2 = new Ledger({ store: new Store({ dir }) });
+    assert.deepEqual(ledger2.getActiveMessages().map((m) => m.id), ['m4'], '活跃集收敛');
+    assert.equal(ledger2.messages.get('m1').status, 'folded', '折叠状态收敛');
+    assert.equal(ledger2.messages.get('m3').status, 'evicted', '驱逐状态收敛');
+    assert.ok(ledger2.getBlock('b1'), '块重建');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.8.3 F2：meta 撕裂——search 显式排除不再静默、decompress raw 兜底、id 跳号不撞', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-f2-'));
+  try {
+    const { Store } = await import('../src/store.mjs');
+    const { Ledger } = await import('../src/ledger.mjs');
+    const { BlocksManager } = await import('../src/blocks.mjs');
+    const { Compressor } = await import('../src/compress.mjs');
+    const { Restorer } = await import('../src/restore.mjs');
+    const { writeFileSync: wf } = await import('node:fs');
+    const store = new Store({ dir });
+    const ledger = new Ledger({ store });
+    const blocks = new BlocksManager({ store });
+    const compressor = new Compressor({ ledger, blocks });
+    const restorer = new Restorer({ ledger, blocks });
+    for (let i = 1; i <= 2; i++) ledger.recordMsg({ id: 'm' + i, at: i, tok: 5, content: 'hello ' + i, seq: i });
+    const b1 = compressor.compress({ ids: ['m1', 'm2'], summary: 'greeting block', sumTok: 3 });
+    // 注入：meta 撕裂（半截 JSON——v0.8.3 之前的裸写窗口产物）
+    wf(join(dir, `block.${b1}.json`), '{"summary":"trunc', 'utf8');
+    // search：显式排除名单（修复前静默 continue，该块从搜索宇宙消失）
+    const res = restorer.search('hello');
+    assert.deepEqual(res.metaErrors, [b1], 'meta 撕裂块进排除名单');
+    assert.equal(res.matches.length, 0, '撕裂块不参与匹配');
+    // decompress context：raw 兜底，不砖
+    const msgs = restorer.decompress(b1, 'context');
+    assert.equal(msgs.length, 2, 'raw 兜底完整');
+    // readBlockMeta 裸抛（撕裂事实本身）
+    assert.throws(() => blocks.readBlockMeta(b1), /JSON/);
+    // id 生成跳号不撞（复审意见 5 定稿断言）：新块 = 孤儿 id + 1
+    ledger.recordMsg({ id: 'm3', at: 3, tok: 5, content: 'x3', seq: 3 });
+    const b2 = compressor.compress({ ids: ['m3'], summary: 'next', sumTok: 2 });
+    assert.equal(b2, 'b2', '撕裂 meta 文件名仍占号 → 新块跳到 b2（不撞号）');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {

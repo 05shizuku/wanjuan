@@ -66,9 +66,10 @@ test('restore.search：块粒度检索命中 summary', () => {
     ledger.recordMsg({ id: 'm1', tok: 10 });
     compressor.compress({ range: ['m1', 'm1'], summary: 'Database migration schema', topics: ['db'] });
 
-    const res = restorer.search('migration');
-    assert.equal(res.length, 1);
-    assert.equal(res[0].id, 'b1');
+    const res = restorer.search('migration'); // v0.8.3 R1b：返回 {matches, metaErrors}
+    assert.equal(res.matches.length, 1);
+    assert.equal(res.matches[0].id, 'b1');
+    assert.deepEqual(res.metaErrors, []);
   } finally { cleanup(); }
 });
 
@@ -79,8 +80,8 @@ test('restore.search：块粒度检索命中 topics', () => {
     compressor.compress({ range: ['m1', 'm1'], summary: 'Log output', topics: ['error', 'auth'] });
 
     const res = restorer.search('auth');
-    assert.equal(res.length, 1);
-    assert.equal(res[0].id, 'b1');
+    assert.equal(res.matches.length, 1);
+    assert.equal(res.matches[0].id, 'b1');
   } finally { cleanup(); }
 });
 

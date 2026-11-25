@@ -155,7 +155,18 @@ export class Store {
       err.code = 'BLOCK_TOO_LARGE';
       throw err;
     }
-    writeFileSync(join(this.dir, `block.${id}.json`), text, 'utf8');
+    // v0.8.3 R1a（故障注入 F2）：裸 writeFileSync 撕裂即半截 JSON——readBlockMeta 抛错、
+    // search 静默吞块。与 writeRaw 同款：tmp+fsync+rename。
+    const target = join(this.dir, `block.${id}.json`);
+    const tmp = join(this.dir, `block.${id}.json.tmp-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`);
+    const fd = openSync(tmp, 'w');
+    try {
+      writeFileSync(fd, text, 'utf8');
+      fsyncSync(fd);
+    } finally {
+      closeSync(fd);
+    }
+    renameSync(tmp, target);
     return bytes;
   }
 

@@ -85,8 +85,8 @@ test('createWanjuan：M2 折叠与恢复全流程', () => {
     assert.equal(wj.ledger.getActiveMessages().length, 0);
 
     const searchRes = wj.restorer.search('greeting');
-    assert.equal(searchRes.length, 1);
-    assert.equal(searchRes[0].id, bId);
+    assert.equal(searchRes.matches.length, 1);
+    assert.equal(searchRes.matches[0].id, bId);
 
     const msgs = wj.restorer.decompress(bId, 'context');
     assert.equal(msgs.length, 2);

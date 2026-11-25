@@ -505,7 +505,12 @@ function buildTools(plugin) {
       ['query'],
       (args) => {
         const wj = plugin._currentWj(); // 模型不知道 sessionId，跟随当前活跃会话
-        return wj.restorer.search(args.query);
+        const res = wj.restorer.search(args.query);
+        // v0.8.3 R1b：meta 撕裂的块显式排除并告知——不再静默消失
+        if (res.metaErrors.length > 0) {
+          return `⚠️ ${res.metaErrors.length} 个块的元数据不可读（疑似写入中断撕裂），已从本次检索排除：${res.metaErrors.join('、')}。可用 wj_decompress(mode:file) 按 raw 兜底取原文。\n` + JSON.stringify(res.matches, null, 2);
+        }
+        return res.matches;
       }
     ),
     makeTool(
