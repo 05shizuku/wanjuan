@@ -2181,6 +2181,80 @@ test('v0.8.3 F2：meta 撕裂——search 显式排除不再静默、decompress 
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
+test('v0.8.4 ①：锚点重解析——宿主编辑后按 id 重解析当前表面，用新 seq 发桥', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-v84a-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    let captured = null;
+    ctx.compaction = { compactRegion: async (s0, e0) => { captured = [s0, e0]; return { ok: true }; } };
+    apply(ctx, { dir, shadowMode: false });
+    ctx._wj._currentSessionId = 's1';
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    for (let i = 1; i <= 2; i++) wj.ledger.recordMsg({ id: 'm' + i, at: i, tok: 5, content: 'x' + i, seq: i });
+    const b1 = wj.compressor.compress({ ids: ['m1', 'm2'], summary: 's', sumTok: 3, seqSpan: [1, 2] });
+    // 宿主编辑：表面 seq 变为 20/21，顺序正常（m1@20、m2@21）——旧 seq 1/2 已不在表面
+    const sess = { surface: { nodes: [20, 21] }, eventAt: (q) => (q === 20 ? { type: 'user/message', seq: 20, data: { id: 'm1' } } : { type: 'user/message', seq: 21, data: { id: 'm2' } }) };
+    await ctx._wj.tryHostCompaction(sess, 1, 2, b1, 's1');
+    assert.deepEqual(captured, [20, 21], '应按重解析后的当前表面 seq 发桥（旧值 1/2 已失准）');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.8.4 ①：锚点顺序颠倒（b24 案）——诚实 skip，不进 failed 冷却循环', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-v84b-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    let called = 0;
+    ctx.compaction = { compactRegion: async () => { called += 1; return { ok: true }; } };
+    apply(ctx, { dir, shadowMode: false });
+    ctx._wj._currentSessionId = 's1';
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    for (let i = 1; i <= 2; i++) wj.ledger.recordMsg({ id: 'm' + i, at: i, tok: 5, content: 'x' + i, seq: i });
+    const b1 = wj.compressor.compress({ ids: ['m1', 'm2'], summary: 's', sumTok: 3, seqSpan: [1, 2] });
+    // 表面 m1@位置1、m2@位置0——起始锚在终锚之后（宿主重排致颠倒）
+    const sess = { surface: { nodes: [20, 21] }, eventAt: (q) => (q === 20 ? { type: 'user/message', seq: 20, data: { id: 'm2' } } : { type: 'user/message', seq: 21, data: { id: 'm1' } }) };
+    await ctx._wj.tryHostCompaction(sess, 1, 2, b1, 's1');
+    assert.equal(called, 0, '顺序颠倒时不得发起任何 compactRegion');
+    const st = ctx._wj.getOrCreate('s1').bridgeStatus?.[b1];
+    assert.equal(st.status, 'skip', '应诚实 skip（非 failed）');
+    assert.ok(String(st.error).includes('颠倒'), 'skip 原因应写明顺序颠倒');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.8.4 ②：宿主真在途压缩（already in progress）——挂起 pending，不再终态 failed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-v84c-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    ctx.compaction = { compactRegion: async () => { throw new Error('compaction already in progress'); } };
+    apply(ctx, { dir, shadowMode: false });
+    ctx._wj._currentSessionId = 's1';
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    for (let i = 1; i <= 2; i++) wj.ledger.recordMsg({ id: 'm' + i, at: i, tok: 5, content: 'x' + i, seq: i });
+    const b1 = wj.compressor.compress({ ids: ['m1', 'm2'], summary: 's', sumTok: 3 });
+    const sess = { surface: { nodes: [1, 2] }, eventAt: (q) => ({ type: 'user/message', seq: q, data: { id: 'm' + q } }) };
+    await ctx._wj.tryHostCompaction(sess, 1, 2, b1, 's1');
+    const st = ctx._wj.getOrCreate('s1').bridgeStatus?.[b1];
+    assert.equal(st.status, 'pending', '在途撞锁应挂起（f5803a07 案曾被标 failed 终态）');
+    assert.ok(String(st.error).includes('deferred: 宿主压缩在途'), '应写明挂起原因');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.8.4 ④：桥接超时随块规模动态放大（801K 表面 180s 摘不完的 b4/b6 案）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-v84d-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    ctx.compaction = { compactRegion: () => new Promise(() => {}) }; // 永不返回（模拟大摘要）
+    apply(ctx, { dir, shadowMode: false, bridgeTimeoutMs: 300, bridgeTimeoutPerTokMs: 0.001, bridgeTimeoutMaxMs: 1200 });
+    ctx._wj._currentSessionId = 's1';
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    for (let i = 1; i <= 2; i++) wj.ledger.recordMsg({ id: 'm' + i, at: i, tok: 5, content: 'x' + i, seq: i });
+    const b1 = wj.compressor.compress({ ids: ['m1', 'm2'], summary: 's', sumTok: 500000, srcTok: 500000 });
+    const sess = { surface: { nodes: [1, 2] }, eventAt: (q) => ({ type: 'user/message', seq: q, data: { id: 'm' + q } }) };
+    ctx._wj.tryHostCompaction(sess, 1, 2, b1, 's1');
+    assert.equal(ctx._wj._lastBridgeTimeout, 1200, '应按 srcTok 放大并截断到上限（60000+500=60500 → min(1200)）；静态 300ms 会注定失败');
+    wj.ledger.messages.clear(); // 防 unref 定时器外的状态干扰（定时器已 unref，不阻塞退出）
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
 test('P0-5：已折叠消息重投递不再污染日志', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'wj-ledger-'));
   try {

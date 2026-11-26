@@ -907,6 +907,44 @@ export function apply(ctx, config = {}) {
       // 返回 promise 供手动路径 await：宿主 compactRegion 硬编码 whole-surface 稳定性，
       // 工具结果消息若落在摘要期间必然触发 "session surface changed"（2026-11-14 实测），
       // 所以手动折叠必须等压缩完成后再返回工具结果。
+      // v0.8.4（外部报告①）：锚点重解析——账本里的 ids/seqSpan 是折叠时刻的快照，
+      // 宿主侧删轮次/重排序号/重压帧后会漂移（UUID 落到非法边界、相对顺序颠倒，
+      // 如 b24 案 5106@表面位382 / 5144@位271）。发桥接前按 id 扫当前表面重解析：
+      // 拿得到新 seq → 用新值发桥；起始锚位置在终锚之后 → 诚实 skip（宿主任何区间
+      // 压缩都不可能成功），不进 failed 冷却循环；全都找不到 → 维持原区间由宿主定夺。
+      let effStart = startSeq;
+      let effEnd = endSeq;
+      try {
+        const blk = plugin.getOrCreate(sid ?? 'default').wj.ledger.getBlock(blockId);
+        const ids = Array.isArray(blk?.ids) ? blk.ids : null;
+        const nodes = session?.surface?.nodes;
+        if (ids && Array.isArray(nodes) && nodes.length > 0) {
+          const posOf = new Map();
+          for (let i = 0; i < nodes.length; i++) {
+            const ev = session.eventAt?.(nodes[i]);
+            const t = String(ev?.type ?? '');
+            const mid = (t.includes('assistant') || t.includes('tool')) ? ev?.data?.message?.id : ev?.data?.id;
+            if (mid && !posOf.has(mid)) posOf.set(mid, { seq: nodes[i], pos: i });
+          }
+          const hit = ids.map((id) => posOf.get(id)).filter(Boolean);
+          if (hit.length > 0) {
+            let lo = Infinity, hi = -Infinity;
+            for (const h of hit) { if (h.seq < lo) lo = h.seq; if (h.seq > hi) hi = h.seq; }
+            const posStart = posOf.get(ids[0])?.pos;
+            const posEnd = posOf.get(ids[ids.length - 1])?.pos;
+            if (posStart !== undefined && posEnd !== undefined && posStart > posEnd) {
+              markBridge(sid, blockId, 'skip', `锚点相对顺序颠倒（宿主编辑漂移，表面位 ${posStart} > ${posEnd}），区间压缩不可能成功——诚实跳过`);
+              plugin.pushLog('warn', `M3.5：${blockId} 锚点顺序颠倒（表面位 ${posStart} > ${posEnd}），跳过桥接`);
+              return;
+            }
+            if (lo !== startSeq || hi !== endSeq) {
+              plugin.pushLog('log', `M3.5：${blockId} 锚点重解析（宿主表面已编辑）：${startSeq}→${lo}，${endSeq}→${hi}`);
+            }
+            effStart = lo;
+            effEnd = hi;
+          }
+        }
+      } catch {}
       // v0.6.5：发起即标 pending——补桥扫描据此跳过 in-flight 的块，杜绝重复压缩
       // （崩溃残留的 pending 无终态标记，下轮自然重试）
       markBridge(sid, blockId, 'pending');
@@ -959,7 +997,23 @@ export function apply(ctx, config = {}) {
       // 真正通知宿主中止摘要，不再空烧 LLM；宿主不认 signal 时 race 仍兜底。
       const ac = new AbortController();
       const agent = session && typeof session === 'object' ? { session, options: {} } : undefined;
-      const timeoutMs = Number(config.bridgeTimeoutMs) > 0 ? Number(config.bridgeTimeoutMs) : 180000;
+      let timeoutMs = Number(config.bridgeTimeoutMs) > 0 ? Number(config.bridgeTimeoutMs) : 180000;
+      // v0.8.4（外部报告④）：静态 180s 对大 span 是「注定失败的循环」——800K 表面
+      // 180s 摘不完 → abort → failed → 冷却重试再 abort，每次重试白烧一次 LLM 调用
+      // （b4/b6 案：801K 表面 cached 799K，180s 无 summary，表面不收缩）。
+      // 超时按块规模动态放大：srcTok × bridgeTimeoutPerTokMs（默认 1ms/tok ≈ 保守
+      // 1000 tok/s 吞吐）+ 60s 基线，上限 bridgeTimeoutMaxMs（默认 15 分钟）。
+      // 小 span 仍用原 180s 快速失败。
+      try {
+        const blk = plugin.getOrCreate(sid ?? 'default').wj.ledger.getBlock(blockId);
+        const srcTok = Number(blk?.srcTok ?? 0);
+        if (srcTok > 0) {
+          const perTok = Number(config.bridgeTimeoutPerTokMs) > 0 ? Number(config.bridgeTimeoutPerTokMs) : 1;
+          const cap = Number(config.bridgeTimeoutMaxMs) > 0 ? Number(config.bridgeTimeoutMaxMs) : 900000;
+          timeoutMs = Math.min(cap, Math.max(timeoutMs, 60000 + Math.round(srcTok * perTok)));
+        }
+      } catch {}
+      plugin._lastBridgeTimeout = timeoutMs; // 测试与诊断挂钩
       let timeoutRej;
       const timeoutP = new Promise((_, rej) => { timeoutRej = rej; });
       const bridgeTimer = setTimeout(() => {
@@ -968,15 +1022,15 @@ export function apply(ctx, config = {}) {
       }, timeoutMs);
       if (bridgeTimer.unref) bridgeTimer.unref();
       timeoutP.catch(() => {}); // 迟到的拒绝不得成为 unhandledRejection
-      let usedEnd = endSeq; // v0.8.1：成功日志报告真实使用的终点（边界回退后与 endSeq 不同）
+      let usedEnd = effEnd; // v0.8.1：成功日志报告真实使用的终点（边界回退/重解析后与 endSeq 不同）
       const workP = Promise.resolve()
         .then(async () => {
-          let start = startSeq;
-          let end = endSeq;
+          let start = effStart;
+          let end = effEnd;
           for (let attempt = 0; ; attempt++) {
             try {
               const res = await svc.compactRegion(start, end, agent, ac.signal);
-              if (attempt > 0) plugin.pushLog('log', `M3.5：边界回退 ${startSeq}→${start}/${endSeq}→${end} 后重试成功`);
+              if (attempt > 0) plugin.pushLog('log', `M3.5：边界回退 ${effStart}→${start}/${effEnd}→${end} 后重试成功`);
               usedEnd = end;
               return res;
             } catch (err) {
@@ -999,7 +1053,7 @@ export function apply(ctx, config = {}) {
         .then((res) => {
           clearTimeout(bridgeTimer);
           markBridge(sid, blockId, 'ok');
-          plugin.pushLog('log', `M3.5：宿主原生压缩完成（seq ${startSeq}→${usedEnd}）${res ? JSON.stringify(res).slice(0, 120) : ''}`);
+          plugin.pushLog('log', `M3.5：宿主原生压缩完成（seq ${effStart}→${usedEnd}）${res ? JSON.stringify(res).slice(0, 120) : ''}`);
         })
         .catch(async (err) => {
           clearTimeout(bridgeTimer);
@@ -1010,8 +1064,12 @@ export function apply(ctx, config = {}) {
             (plugin._bridgeLimbo ??= new Map()).set(sid, Date.now() + timeoutMs + 60000);
           }
           // v0.6.9 风险一：崩溃遗留压缩锁——无其他在途桥接时补写补偿 end 并重试一次
-          if (msg.includes('compaction lock is already active')) {
-            if ((plugin._bridgeInFlight ?? 0) <= 1) {
+          if (msg.includes('compaction lock is already active') || msg.includes('already in progress')) {
+            // v0.8.4（外部报告②）：宿主两种锁措辞统一路由——崩溃遗留锁（补偿解锁后重试）
+            // 或真在途压缩（f5803a07 案：`compaction already in progress` 不匹配旧串，
+            // 被标 failed 终态，该块永远失去补桥机会）。修复失败/真在途 → 一律挂起
+            // pending（下一轮补桥重试），绝不终态失败。
+            if (msg.includes('lock is already active') && (plugin._bridgeInFlight ?? 0) <= 1) {
               const repaired = await busyLockRepair(session, sid); // v0.7.6：带 sid 判宽限窗
               if (repaired) {
                 try {
@@ -1024,6 +1082,9 @@ export function apply(ctx, config = {}) {
                 }
               }
             }
+            markBridge(sid, blockId, 'pending', 'deferred: 宿主压缩在途/锁未清，等下一轮补桥重试');
+            plugin.pushLog('log', `M3.5：宿主压缩在途（${msg.slice(0, 80)}），挂起重试`);
+            return;
           }
           // v0.7.6 P0-2(C2)：撞锁发生在宽限窗内 → 孤儿压缩还占着宿主锁，挂起重试而非终态失败。
           if (msg.includes('compaction lock is already active') && Date.now() < (plugin._bridgeLimbo?.get(sid) ?? 0)) {
