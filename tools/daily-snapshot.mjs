@@ -76,6 +76,44 @@ const prev7Counts = mkCounts();
 }
 console.log(`[趋势·近7天] 注入=${recent7Counts.已注入} 接受=${recent7Counts.接受} 率=${rate(recent7Counts)} | [前7天] 注入=${prev7Counts.已注入} 接受=${prev7Counts.接受} 率=${rate(prev7Counts)}`);
 
+// ---- 1c. 验收16：降级率漂移（周环比 >20% 告警）+ 验收15：可感知故障计数 ----
+const reqFilesAll = [];
+if (existsSync(join(dir, 'requests.jsonl'))) reqFilesAll.push(join(dir, 'requests.jsonl'));
+if (existsSync(join(dir, 'sessions'))) {
+  for (const d of readdirSync(join(dir, 'sessions'))) {
+    const f = join(dir, 'sessions', d, 'requests.jsonl');
+    if (existsSync(f)) reqFilesAll.push(f);
+  }
+}
+let recentDeg = 0, recentRec = 0, prevDeg = 0, prevRec = 0;
+{
+  const now = Date.now();
+  const cut = now - WEEK_MS, cut2 = now - 2 * WEEK_MS;
+  for (const f of reqFilesAll) {
+    let rows = [];
+    try { rows = readFileSync(f, 'utf8').split('\n').filter((x) => x.trim()).map((x) => JSON.parse(x)); } catch { continue; }
+    for (const rec of rows) {
+      const t = rec.t ?? 0;
+      const hasDeg = Array.isArray(rec.degraded) && rec.degraded.length > 0;
+      if (t > cut) { recentRec++; if (hasDeg) recentDeg++; }
+      else if (t > cut2) { prevRec++; if (hasDeg) prevDeg++; }
+    }
+  }
+}
+const rateOf = (d, n) => (n >= 30 ? d / n : null); // 样本 <30 不判定（防小样本假漂移）
+const rNow = rateOf(recentDeg, recentRec), rPrev = rateOf(prevDeg, prevRec);
+if (rNow === null || rPrev === null) {
+  console.log(`[验收16·降级率漂移] 样本不足（近7天 ${recentRec} / 前7天 ${prevRec} 条，各需 ≥30）——不判定`);
+} else {
+  const drift = rPrev > 0 ? (rNow - rPrev) / rPrev : (rNow > 0 ? 1 : 0);
+  const pct = (x) => (x * 100).toFixed(1) + '%';
+  const alarm = rPrev > 0 && drift > 0.2 ? ' ⚠️ 周环比漂移 >20%——按 DESIGN 验收 16 应告警排查' : '';
+  console.log(`[验收16·降级率漂移] 近7天 ${pct(rNow)}（${recentDeg}/${recentRec}） vs 前7天 ${pct(rPrev)}（${prevDeg}/${prevRec}）｜漂移 ${(drift * 100).toFixed(1)}%${alarm}`);
+}
+// 验收15 代理计数：failed 终态桥接 + 工具报错（用户可感知故障的保守代理）
+const incidents = recentLines.filter((l) => /宿主压缩失败：(?!(compactRegion: no open turn|compactRegion: start seq))/.test(l) || /执行失败: /.test(l)).length;
+console.log(`[验收15·可感知故障（代理）] 近7天 ${incidents} 次（failed 终态桥接 + 工具报错；目标 0/千会话，≤1/千=达标）`);
+
 // ---- 2. degraded 频次 + 极端会话 k̂ 尾部（按记录数取前 3 大会话） ----
 const reqFiles = [];
 if (existsSync(join(dir, 'requests.jsonl'))) reqFiles.push(join(dir, 'requests.jsonl'));
