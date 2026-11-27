@@ -17,7 +17,21 @@ export const name = 'wanjuan';
 // compaction：M3.5 真实上下文接管必需。宿主访问控制要求先声明 inject
 // （2026-11-14 真机实测：直接属性访问抛 "cannot get property without inject"）。
 // 若 profile 未挂 compaction 实现导致加载失败，需在插件管理里启用原生 compaction-basic。
-export const inject = ['tools', 'compaction', 'llm']; // v0.7.7 P2-12(D)：裁剪全程未使用的 connection/tokenMeter/webServer（缩小访问面）
+export const inject = ['tools', 'compaction', 'llm']; // v0.7.7 P2-12(D)：裁剪全程未使用
+
+// v0.9.0-m5.4a：Config schema——设置页/配置目录的地基（声明后 Config.listConfigs
+// 可见、行 config 获校验、DSH 设置基础设施可渲染）。字段与 apply() 实际消费一一对应。
+export const Config = {
+  type: 'object',
+  properties: {
+    dir: { type: 'string', description: '数据目录（相对 profile 根；改动会迁移会话归属，建议保持默认）', default: '.wanjuan' },
+    shadowMode: { type: 'boolean', description: '影子模式：只记账不折叠（写类工具与桥接全部停用）', default: false },
+    compactionThreshold: { type: 'integer', minimum: 1000, description: '账本事件自压缩阈值（默认 5000）' },
+    bridgeTimeoutMs: { type: 'integer', minimum: 10000, description: '桥接超时基线 ms（默认 180000；大 span 按 srcTok 动态放大）' },
+    bridgeTimeoutPerTokMs: { type: 'number', minimum: 0, description: '每 srcTok 追加的超时 ms（默认 1 ≈ 保守 1000 tok/s 吞吐）' },
+    bridgeTimeoutMaxMs: { type: 'integer', minimum: 30000, description: '动态超时上限 ms（默认 900000 = 15 分钟）' },
+  },
+}; // v0.7.7 P2-12(D)：裁剪全程未使用的 connection/tokenMeter/webServer（缩小访问面）
 
 let _seq = 0;
 const _boot = Date.now().toString(36); // v0.7.7 P2-3(D)：合成 id 带启动戳——重启后不再与历史账本碰撞
