@@ -18,7 +18,7 @@ import { Gate } from './gate.mjs';
 import { NudgeManager } from './nudge.mjs';
 
 export { Estimator } from './estimate.mjs';
-export { Store, canonical, hashCanonical } from './store.mjs';
+export { Store } from './store.mjs'; // v0.8.5 P2-13：快照接口随死代码一并移除
 export { Ledger, InvariantError } from './ledger.mjs';
 export { Observer } from './observe.mjs';
 export { Fingerprinter } from './fingerprint.mjs';

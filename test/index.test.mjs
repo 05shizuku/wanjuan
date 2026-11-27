@@ -20,8 +20,7 @@ test('聚合导出：所有模块的类与函数都在', () => {
   assert.equal(typeof WJ.NudgeManager, 'function');
   assert.equal(typeof WJ.Philosophy, 'function');
   assert.equal(typeof WJ.InvariantError, 'function');
-  assert.equal(typeof WJ.canonical, 'function');
-  assert.equal(typeof WJ.hashCanonical, 'function');
+  // v0.8.5 P2-13：canonical/hashCanonical 断言随死代码删除
   assert.equal(typeof WJ.classifyMiss, 'function');
   assert.equal(typeof WJ.buildReport, 'function');
   assert.equal(typeof WJ.reportFromDisk, 'function');

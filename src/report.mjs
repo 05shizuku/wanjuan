@@ -1,5 +1,5 @@
 // src/report.mjs
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 
 function pct(x) { return (x * 100).toFixed(2) + '%'; }
@@ -42,6 +42,15 @@ export function buildReport({ dir, ledger, diagnoser }) {
   lines.push(`叶子块：${leaves.length}，srcTok=${tok(leafSrcTok)}，sumTok=${tok(leafSumTok)}`);
   // v0.6.25：说明残留块文件的性质（原文可达兜底，非垃圾）
   if (blocks.length > leaves.length) lines.push(`（另有 ${blocks.length - leaves.length} 个历史块元数据留存磁盘，原文归档可 wj_search/wj_decompress 取回，不计入活跃统计）`);
+  // v0.8.5 P2-5：孤儿档案计数（账本无此块的 raw/meta——折叠中断残留，reconcile 时回收）
+  let orphanFiles = 0;
+  try {
+    for (const f of readdirSync(dir)) {
+      const m = f.match(/^block\.(b\d+)\.(raw\.jsonl|json)$/);
+      if (m && ledger && !ledger.getBlock(m[1])) orphanFiles += 1;
+    }
+  } catch {}
+  if (orphanFiles > 0) lines.push(`孤儿档案：${orphanFiles} 个（下次 wj_reconcile 自动移入 archive/orphan-*/，原文仍可读）`);
   // v0.6.21：折叠节省估算（观察期核心数据）——原文本应发送的 token 减去摘要实际占用
   if (leafSrcTok > 0) {
     const saved = Math.max(0, leafSrcTok - leafSumTok);

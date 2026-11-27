@@ -1926,6 +1926,7 @@ test('v0.7.9 P2-10：补桥单次预算——最多 3 块，超出下轮继续',
       wj.compressor.compress({ ids: ['m' + (2 * b - 1), 'm' + (2 * b)], summary: 's' + b, sumTok: 3 });
     }
     const out = await ctx._wj._toolReconcile();
+    assert.ok(out.includes('孤儿已归档'), '应报告回收数');
     assert.equal(calls, 3, '单次最多 3 块');
     assert.ok(out.includes('预算用尽'), '应提示下轮继续');
   } finally { rmSync(dir, { recursive: true, force: true }); }
@@ -2252,6 +2253,49 @@ test('v0.8.4 ④：桥接超时随块规模动态放大（801K 表面 180s 摘�
     ctx._wj.tryHostCompaction(sess, 1, 2, b1, 's1');
     assert.equal(ctx._wj._lastBridgeTimeout, 1200, '应按 srcTok 放大并截断到上限（60000+500=60500 → min(1200)）；静态 300ms 会注定失败');
     wj.ledger.messages.clear(); // 防 unref 定时器外的状态干扰（定时器已 unref，不阻塞退出）
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.8.5 P2-5：孤儿 raw/meta 回收——reconcile 移入 archive/orphan-*，正常块不动', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-v85-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    ctx._wj._currentSessionId = 's1';
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    for (let i = 1; i <= 2; i++) wj.ledger.recordMsg({ id: 'm' + i, at: i, tok: 5, content: 'x' + i, seq: i });
+    const b1 = wj.compressor.compress({ ids: ['m1', 'm2'], summary: 's', sumTok: 3 });
+    // 注入：折叠中断残留——b9 的 raw + meta（账本无此块）
+    const { writeFileSync: wf, existsSync: ex, readdirSync: rds } = await import('node:fs');
+    wf(join(dir, 'block.b9.raw.jsonl'), '{"id":"z1"}\n', 'utf8');
+    wf(join(dir, 'block.b9.json'), '{"id":"b9"}', 'utf8');
+    // 注册会话事件（reconcile 按 _currentSessionId 路由）
+    eventHandlers['session/event']({ type: 'user/message', sessionId: 's1', seq: 99, time: 99, data: { id: 'x0', role: 'user', content: 'x', tok: 1 } });
+    await new Promise((r2) => setTimeout(r2, 30));
+    // 冷启动链的 autoReconcile 可能已抢先回收（30ms 等待期）——断言走日志与文件系统事实
+    const out = await ctx._wj._toolReconcile();
+    console.error('[V85-FULL] logs=' + JSON.stringify(ctx._wj.logs.map((l) => l.msg), null, 1));
+    assert.equal(ex(join(dir, 'block.b9.raw.jsonl')), false, '孤儿 raw 应已移走');
+    assert.equal(ex(join(dir, 'block.b9.json')), false, '孤儿 meta 应已移走');
+    const odir = rds(join(dir, 'archive')).find((d) => d.startsWith('orphan-'));
+    assert.ok(odir, 'archive/orphan-* 应存在');
+    assert.ok(ex(join(dir, 'archive', odir, 'block.b9.raw.jsonl')), '原文仍可达（只是归档）');
+    assert.ok(ex(join(dir, `block.${b1}.raw.jsonl`)), '正常块 raw 不动');
+    assert.ok(ctx._wj.logs.some((l) => l.msg.includes('档案回收')), '应记 loud 日志');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.8.5 P2-5：wj_report 孤儿档案计数', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-v85r-'));
+  try {
+    const { buildReport } = await import('../src/report.mjs');
+    const { writeFileSync: wf } = await import('node:fs');
+    wf(join(dir, 'block.b7.raw.jsonl'), '{"id":"z1"}\n', 'utf8');
+    wf(join(dir, 'block.b7.json'), '{"id":"b7"}', 'utf8');
+    const fakeLedger = { getBlock: () => undefined, getActiveMessages: () => [], listBlocks: () => [], getLeafBlocks: () => [] };
+    const fakeDiag = { summarize: () => ({ total: 0, hitRate: 0, coreHitRate: 0, byOwner: { host: 0, upstream: 0, wanjuan: 0, unattributed: 0 } }) };
+    const out = buildReport({ dir, ledger: fakeLedger, diagnoser: fakeDiag });
+    assert.ok(out.includes('孤儿档案：2 个'), '应计数孤儿（raw + meta）');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

@@ -1,22 +1,8 @@
 // src/store.mjs
-import { createHash } from 'node:crypto';
 import { existsSync, mkdirSync, readFileSync, writeFileSync, appendFileSync, statSync, readdirSync, renameSync, openSync, readSync, closeSync, fsyncSync, unlinkSync } from 'node:fs';
 import { join } from 'node:path';
 
-const FORBIDDEN = new Set(['__proto__', 'constructor', 'prototype']);
-
-export function canonical(v, fields) {
-  const out = {};
-  for (const f of fields) {
-    if (FORBIDDEN.has(f)) continue;
-    if (v && Object.prototype.hasOwnProperty.call(v, f)) out[f] = v[f];
-  }
-  return JSON.stringify(out);
-}
-
-export function hashCanonical(v, fields) {
-  return createHash('sha256').update(canonical(v, fields)).digest('hex');
-}
+// v0.8.5 P2-13：canonical/hashCanonical 已删（snapshot 死代码的伴生，仅测试用过）
 
 const SEG_RE = /^ledger\.(\d{4})\.jsonl$/;
 
@@ -133,19 +119,8 @@ export class Store {
     return { events, messages, blocks, evicted, mutated };
   }
 
-  buildSnapshot() {
-    const state = this.replay();
-    const kept = state.messages.slice(-this.snapshotBudget);
-    const snap = { snapshotVersion: 1, messages: kept, blockIds: [...state.blocks.keys()], evicted: [...state.evicted] };
-    writeFileSync(join(this.dir, 'snapshot.json'), JSON.stringify(snap), 'utf8');
-    return snap;
-  }
-
-  loadSnapshot() {
-    const p = join(this.dir, 'snapshot.json');
-    if (!existsSync(p)) return null;
-    return JSON.parse(readFileSync(p, 'utf8'));
-  }
+  // v0.8.5 P2-13：buildSnapshot/loadSnapshot 已删（生产零接线，M4.3 摊销压缩以更简
+    // 方式覆盖；裸写 snapshot.json 曾是故障清单盲区——删除优于预留）
 
   writeBlock(id, obj) {
     const text = JSON.stringify(obj);

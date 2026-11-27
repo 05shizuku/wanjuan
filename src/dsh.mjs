@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 //  - 不注册 ctx.on('llm/stream')。
 //  - 工具定义使用 parameters 字段。
 //  - render 签名修正为 (_args, value) => value，防止宿主把 args 误当返回值处理导致 content.some 崩溃。
-import { readFileSync, writeFileSync, appendFileSync, statSync, existsSync, renameSync } from 'node:fs';
+import { readFileSync, writeFileSync, appendFileSync, statSync, existsSync, renameSync, readdirSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createWanjuan, PHILOSOPHY_KEEP_DROP } from './index.mjs';
 import { buildReport } from './report.mjs';
@@ -405,6 +405,22 @@ this._turnCounters = new Map(); // v0.7.7 E2-5：每会话独立 turn 计数（�
       // v0.6.25：截断放宽到 300，宿主拒绝原因（如 context length exceeded 的具体数值）可直接定位
       out.push(`${b.id}: seq ${start}→${end} → ${st}${err ? '（' + err.slice(0, 300) + '）' : ''}`);
     }
+    // v0.8.5 P2-5：孤儿档案回收——writeRaw 成功后 recordFold 前崩溃会留下无主 raw/meta
+    // （DESIGN §5 承诺 reconcile 回收并计数）。移入 archive/orphan-<ts>/，原文仍可达。
+    try {
+      const orphans = [];
+      for (const f of readdirSync(srec.sid)) {
+        const m = f.match(/^block\.(b\d+)\.(raw\.jsonl|json)$/);
+        if (m && !wj.ledger.getBlock(m[1])) orphans.push(f);
+      }
+      if (orphans.length > 0) {
+        const odir = join(srec.sid, 'archive', `orphan-${Date.now()}`);
+        mkdirSync(odir, { recursive: true });
+        for (const f of orphans) renameSync(join(srec.sid, f), join(odir, f));
+        this.pushLog('warn', `档案回收：${orphans.length} 个孤儿 raw/meta 移入 archive/orphan-*（DESIGN §5）`); // v0.8.5 修正：类方法内无 plugin 闭包（原写法 ReferenceError 被 catch 吞——文件移走但零日志）
+        out.push(`（档案回收：${orphans.length} 个孤儿已归档）`);
+      }
+    } catch {}
     return out.length ? out.join('\n') : '没有需要补桥的块。';
   }
 }
