@@ -699,7 +699,7 @@ test('M4.1：账本对数压缩——等价极简流 + 旧卷归档 + 重放一�
     const before = ledger._lastReplayEventCount;
     const r = ledger.compactNow();
     // v0.7.9 N-1：保留元数据 msg 事件后事件数持平——真缩减在 content 剥离
-    assert.ok(r.before >= before && r.after <= r.before, `压缩不膨胀 ${r.before} → ${r.after}`);
+    assert.ok(r.before >= before && r.after < r.before, `压缩应缩减 ${r.before} → ${r.after}（v0.9.0-m5.2 起恢复缩减语义）`);
     for (const ev of ledger.store.replay().events) {
       if (ev.k === 'msg' && ['m1', 'm2', 'm3', 'm4', 'm5'].includes(ev.id)) {
         assert.equal(ev.content, undefined, `折叠/驱逐消息 ${ev.id} 的 content 应剥离`);
@@ -2294,6 +2294,75 @@ test('v0.8.5 P2-5：wj_report 孤儿档案计数', async () => {
     const fakeDiag = { summarize: () => ({ total: 0, hitRate: 0, coreHitRate: 0, byOwner: { host: 0, upstream: 0, wanjuan: 0, unattributed: 0 } }) };
     const out = buildReport({ dir, ledger: fakeLedger, diagnoser: fakeDiag });
     assert.ok(out.includes('孤儿档案：2 个'), '应计数孤儿（raw + meta）');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.9.0-m5.2：混合格式幂等 + 双压缩幂等 + 部分/未知 id 物化（复审 c/e/f）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-m52x-'));
+  try {
+    const { Store } = await import('../src/store.mjs');
+    const { Ledger } = await import('../src/ledger.mjs');
+    const { writeFileSync: wf } = await import('node:fs');
+    // c+旧格式：meta msg（v0.7.9 时代）与 fold ids 混合 → 重放幂等
+    wf(join(dir, 'ledger.0000.jsonl'),
+      '{"k":"msg","id":"m2","at":2,"tok":5,"seq":2}\n' +
+      '{"k":"fold","block":"b1","ids":["m2","m3"],"range":["m2","m3"],"srcTok":10,"sumTok":3,"tier":0,"rawRef":"block.b1.raw.jsonl","seqSpan":[2,3]}\n' +
+      '{"k":"msg","id":"m1","at":1,"tok":5,"seq":1}\n', 'utf8');
+    const l1 = new Ledger({ store: new Store({ dir }) });
+    assert.equal(l1.messages.get('m2').status, 'folded', 'meta 记录被 fold 收编');
+    assert.equal(l1.messages.get('m3').status, 'folded', '缺失 id 物化为 stub 并折叠（f）');
+    assert.equal(l1.messages.get('m1').status, 'active', '后置活跃消息正常');
+    const r1 = l1.compactNow();
+    assert.ok(r1.after < r1.before, '混合格式压缩缩减');
+    const l2 = new Ledger({ store: new Store({ dir }) });
+    assert.equal(l2.messages.get('m2').status, 'folded', '二次重放一致');
+    assert.equal(l2.messages.get('m1').status, 'active', '二次重放一致');
+    // e：双压缩幂等
+    const r2 = l2.compactNow();
+    assert.equal(r2.after, r1.after, '双压缩事件数稳定');
+    // f：evict 未知 id 物化
+    l2.recordEvict({ ids: ['ghost'], why: 'reconcile' });
+    assert.equal(l2.messages.get('ghost').status, 'evicted', '未知 id 物化为 evicted stub');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.9.0-m5.2：stub-unfolded 再折叠——锚点回退 seqSpan、新块锚为 null（已接受退化，复审 a）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-m52a-'));
+  try {
+    const { ctx } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    for (let i = 1; i <= 3; i++) wj.ledger.recordMsg({ id: 'm' + i, at: i, tok: 5, content: 'x' + i, seq: 100 + i });
+    const b1 = wj.compressor.compress({ ids: ['m1', 'm2'], summary: 's1', sumTok: 3, seqSpan: [101, 102] });
+    wj.ledger.compactNow(); // 折叠消息元数据消失，仅剩 stub（fold ids 物化）
+    wj.ledger.recordUnfold({ block: b1, why: 'context' }); // stub 变 active（无 seq/at/tok）
+    // 再折叠：手动带 seqSpan（与自动折叠路径同款）——锚回退的正路
+    const b2 = wj.compressor.compress({ ids: ['m1', 'm2'], summary: 's2', sumTok: 3, seqSpan: [101, 102] });
+    wj.ledger.compactNow();
+    assert.deepEqual(ctx._wj.blockSeqAnchors(wj, wj.ledger.getBlock(b2)), [101, 102], 'seqSpan 锚回退正常（消息级扫描对 stub 恒空）');
+    // 无 seqSpan 且成员是 stub-unfolded（无 seq）→ null = 已接受退化（宿主桥接跳过，raw/账本完整）
+    wj.ledger.recordUnfold({ block: b2, why: 'context' }); // m1/m2 stub → active（无 seq）
+    const b3 = wj.compressor.compress({ ids: ['m1'], summary: 's3', sumTok: 3 }); // 未传 seqSpan
+    assert.equal(ctx._wj.blockSeqAnchors(wj, wj.ledger.getBlock(b3)), null, 'stub-unfolded 成员 + 无 seqSpan → null（退化可见、非崩溃）');
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('v0.9.0-m5.2：stub-unfolded 活跃消息（无 seq）永不被指纹驱逐（复审 b，观察项滞留为安全方向）', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'wj-m52b-'));
+  try {
+    const { ctx, eventHandlers } = freshCtx(dir);
+    apply(ctx, { dir, shadowMode: false });
+    const wj = ctx._wj.getOrCreate('s1').wj;
+    for (let i = 1; i <= 2; i++) wj.ledger.recordMsg({ id: 'm' + i, at: i, tok: 5, content: 'x' + i, seq: i });
+    const b1 = wj.compressor.compress({ ids: ['m1', 'm2'], summary: 's', sumTok: 3, seqSpan: [1, 2] });
+    wj.ledger.compactNow();
+    wj.ledger.recordUnfold({ block: b1, why: 'context' }); // stub → active（无 seq）
+    assert.equal(wj.ledger.messages.get('m1').seq, undefined, '前置：stub-unfolded 无 seq');
+    // 表面显示宿主已推进（m1/m2 不在表面、有更大 seq 节点）——无 seq 消息不得驱逐
+    eventHandlers['session/event']({ type: 'turn/end', sessionId: 's1', seq: 9, time: 9, data: { turn: 1 },
+      surface: { nodes: [5] }, eventAt: () => ({ type: 'user/message', seq: 5, data: { id: 'other' } }) });
+    assert.equal(wj.ledger.messages.get('m1').status, 'active', '无 seq 消息保留观察（永不误驱逐）');
+    assert.equal(wj.ledger.messages.get('m2').status, 'active', '同上');
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 

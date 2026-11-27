@@ -64,12 +64,16 @@ export class Ledger {
       this.blocks.set(ev.block, block);
       if (Array.isArray(ev.ids)) {
         // 精确集合折叠：不依赖 id 排序
-        const want = new Set(ev.ids);
-        for (const [id, m] of this.messages) {
-          if (want.has(id) && m.status === 'active') {
-            m.status = 'folded';
-            m.blockId = ev.block;
-          }
+        // v0.9.0-m5.2（复审①）：ids 物化消息 stub——直接 id 查找（整表扫描 270ms 违
+        // 验收 7，实测直接查找 24ms 且语义等价）。压缩流不再携带折叠消息元数据
+        // （撤销 v0.7.9 N-1）：归属由 stub 承载——wj_unfold 计数/再折叠保护/报告
+        // 统计全部满足；锚点回退 block.seqSpan。
+        // 已知取舍（复审修订 3）：stub 无 seq/at/tok——stub-unfolded 消息不参与
+        // 锚点扫描与指纹驱逐（观察项滞留）、再折叠 raw 行缺 at/tok。
+        for (const id of ev.ids) {
+          const m = this.messages.get(id);
+          if (!m) this.messages.set(id, { ev: { k: 'msg', id }, status: 'folded', blockId: ev.block });
+          else if (m.status === 'active') { m.status = 'folded'; m.blockId = ev.block; }
         }
       } else {
         // 旧语义：id 字典序区间（仅当 id 排序与时间序一致时才安全）
@@ -82,9 +86,11 @@ export class Ledger {
         }
       }
     } else if (ev.k === 'evict') {
+      // v0.9.0-m5.2：同 fold——未知 id 物化 evicted stub（压缩流 evict 事件重放自足）
       for (const id of ev.ids) {
         const m = this.messages.get(id);
-        if (m) m.status = 'evicted';
+        if (!m) this.messages.set(id, { ev: { k: 'msg', id }, status: 'evicted' });
+        else m.status = 'evicted';
       }
     } else if (ev.k === 'unfold') {
       const b = this.blocks.get(ev.block);
@@ -254,13 +260,11 @@ export class Ledger {
     const out = [];
     const evictedIds = [];
     for (const m of this.getActiveMessages()) out.push({ ...m });
-    // v0.7.9 N-1：折叠/已驱逐消息保留「无 content 的元数据 msg 事件」——原方案直接丢弃，
-    // 自压缩后 wj_unfold 计 0 条、wj_report 折叠统计失真。每条 ~150 字节（content 才是
-    // KB 级大头），replay 时由后续 fold/evict 事件恢复状态。
+    // v0.9.0-m5.2：撤销 v0.7.9 N-1 的元数据 msg 事件保留——压缩流回到 O(活跃+块数)
+    // （复审实测：10 万消息 100220 → 340 事件，重放 529ms → 24ms）。消费方由 fold/evict
+    // 物化的 stub 承载（wj_unfold 计数/再折叠保护），锚点回退 seqSpan，报告走块级。
+    // 已知边界：字节仍 O(总消息)（fold/evict 的 ids 数组，~10B/id——行数才是重放成本主导）。
     for (const m of this.messages.values()) {
-      if (m.status === 'active') continue;
-      const { content, ...meta } = m.ev;
-      out.push(meta);
       if (m.status === 'evicted') evictedIds.push(m.ev.id);
     }
     // v0.7.7 P1-7(D)：单趟扫描建 blockId→[min,max] 映射——原 O(消息×块) 嵌套在
