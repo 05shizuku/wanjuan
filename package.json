@@ -35,5 +35,8 @@
       "patch": "./dsh.bundle.patch.yml"
     }
   },
-  "license": "MIT"
+  "license": "MIT",
+  "dependencies": {
+    "@deepseek-ai/schemastery": "^3.19.0"
+  }
 }

@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { createWanjuan, PHILOSOPHY_KEEP_DROP } from './index.mjs';
 import { buildReport } from './report.mjs';
 import { LockManager } from './lock.mjs'; // v0.8.0 根锁
+import z from '@deepseek-ai/schemastery'; // v0.9.0-m5.4a：Config schema 用宿主同款 schemastery（3.19.0）
 import { classifyWaterMark } from './gate.mjs'; // v0.9.0-m5.3：水位→动作分类（阈值单点化）
 import { estimateTok } from './tokenizer.mjs';
 
@@ -21,17 +22,16 @@ export const inject = ['tools', 'compaction', 'llm']; // v0.7.7 P2-12(D)：裁�
 
 // v0.9.0-m5.4a：Config schema——设置页/配置目录的地基（声明后 Config.listConfigs
 // 可见、行 config 获校验、DSH 设置基础设施可渲染）。字段与 apply() 实际消费一一对应。
-export const Config = {
-  type: 'object',
-  properties: {
-    dir: { type: 'string', description: '数据目录（相对 profile 根；改动会迁移会话归属，建议保持默认）', default: '.wanjuan' },
-    shadowMode: { type: 'boolean', description: '影子模式：只记账不折叠（写类工具与桥接全部停用）', default: false },
-    compactionThreshold: { type: 'integer', minimum: 1000, description: '账本事件自压缩阈值（默认 5000）' },
-    bridgeTimeoutMs: { type: 'integer', minimum: 10000, description: '桥接超时基线 ms（默认 180000；大 span 按 srcTok 动态放大）' },
-    bridgeTimeoutPerTokMs: { type: 'number', minimum: 0, description: '每 srcTok 追加的超时 ms（默认 1 ≈ 保守 1000 tok/s 吞吐）' },
-    bridgeTimeoutMaxMs: { type: 'integer', minimum: 30000, description: '动态超时上限 ms（默认 900000 = 15 分钟）' },
-  },
-}; // v0.7.7 P2-12(D)：裁剪全程未使用的 connection/tokenMeter/webServer（缩小访问面）
+// 形态说明：DSH 的 Config 导出须为 schemastery schema（宿主 3.19.0 同款依赖，
+// wanjuan 首个有意的运行时依赖——仅 Config 声明用，运行时逻辑仍零依赖）。
+export const Config = z.object({
+  dir: z.string().default('.wanjuan').description('数据目录（相对 profile 根；改动会迁移会话归属，建议保持默认）'),
+  shadowMode: z.boolean().default(false).description('影子模式：只记账不折叠（写类工具与桥接全部停用）'),
+  compactionThreshold: z.natural().description('账本事件自压缩阈值（默认 5000）'),
+  bridgeTimeoutMs: z.number().description('桥接超时基线 ms（默认 180000；大 span 按 srcTok 动态放大）'),
+  bridgeTimeoutPerTokMs: z.number().description('每 srcTok 追加的超时 ms（默认 1 ≈ 保守 1000 tok/s 吞吐）'),
+  bridgeTimeoutMaxMs: z.number().description('动态超时上限 ms（默认 900000 = 15 分钟）'),
+}); // v0.7.7 P2-12(D)：裁剪全程未使用的 connection/tokenMeter/webServer（缩小访问面）
 
 let _seq = 0;
 const _boot = Date.now().toString(36); // v0.7.7 P2-3(D)：合成 id 带启动戳——重启后不再与历史账本碰撞
