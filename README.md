@@ -107,6 +107,8 @@ flowchart TB
 
 ## ⚠️ 已知局限（如实披露）
 
+- **压缩流格式（v0.9.0）**：压缩流不再携带折叠消息元数据（fold/evict 的 `ids` 数组在重放时物化消息存根，等价承载 wj_unfold 计数/再折叠保护）。旧版本万卷读取新压缩流会静默缺失折叠消息记录——归档卷仍持全量历史、原文可达；跨版本混用请以最新版本为准。
+
 - **消息入账 tok 为启发式估算**：字符串与 ContentBlock 数组同口径（CJK 1.2 / 其他 0.25，v0.6.22 起数组分支已对齐）——非精确 tokenizer，残余偏差由 k̂ 校准吸收；入账走 estimator 的口径统一计划于 **v0.7**。
 - **归因分类未完成**：`missKind` 当前只产出 `new / unattributed`，完整归因 M5 交付。
 - **宿主 compaction 异步契约**（上游问题，已报备）：宿主的自动摘要是异步的（可跨 turn 边界），而 loader 要求 compaction/start+end 关在同一个 turn 内——摘要失败或迟到时 end 落在 turn/end 之后，整本日志被判损坏，会话从侧栏消失（磁盘档还在）。万卷侧已修两刀：补偿前等待重扫（防双 end）+「no open turn」挂起重试（防终态停摆）；根治需宿主 loader 容忍跨 turn 的 compaction 对。
