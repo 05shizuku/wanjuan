@@ -28,18 +28,27 @@ export class Store {
   }
 
   _syncSegIndex() {
+    this._segSize = undefined; // v0.9.0：卷索引变化（构造/compact/rotate 后）→ 段大小缓存失效
     const files = readdirSync(this.dir).filter((f) => SEG_RE.test(f)).sort();
     this.segIndex = files.length === 0 ? 1 : Number(files[files.length - 1].match(SEG_RE)[1]);
   }
 
   _segPath(i) { return join(this.dir, `ledger.${String(i).padStart(4, '0')}.jsonl`); }
   _currentSegPath() { return this._segPath(this.segIndex); }
-  _currentSegSize() { const p = this._currentSegPath(); return existsSync(p) ? statSync(p).size : 0; }
+  // v0.9.0（验收 7 风暴预算）：段大小内存计数——此前每 append 两次 statSync + 一次
+  // existsSync（实测 0.42ms/事件，10 万事件 = 40 秒累积阻塞宿主事件循环）。
+  // 单写者不变式（根锁）下缓存安全；_syncSegIndex 处惰性失效。
+  _syncSegSize() {
+    const p = this._currentSegPath();
+    this._segSize = existsSync(p) ? statSync(p).size : 0;
+  }
 
   _rotateIfNeeded(nextBytes) {
-    if (this._currentSegSize() === 0) return;
-    if (this._currentSegSize() + nextBytes <= this.segBytes) return;
+    if (this._segSize === undefined) this._syncSegSize();
+    if (this._segSize === 0) return;
+    if (this._segSize + nextBytes <= this.segBytes) return;
     this.segIndex += 1;
+    this._segSize = 0; // 新卷
   }
 
   append(ev) {
@@ -68,6 +77,8 @@ export class Store {
       } catch {}
     }
     appendFileSync(this._currentSegPath(), line, 'utf8');
+    if (this._segSize === undefined) this._segSize = 0;
+    this._segSize += Buffer.byteLength(line);
     return ev;
   }
 
