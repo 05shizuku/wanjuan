@@ -10,14 +10,11 @@ test('聚合导出：所有模块的类与函数都在', () => {
   assert.equal(typeof WJ.Estimator, 'function');
   assert.equal(typeof WJ.Store, 'function');
   assert.equal(typeof WJ.Ledger, 'function');
-  assert.equal(typeof WJ.Observer, 'function');
-  assert.equal(typeof WJ.Fingerprinter, 'function');
   assert.equal(typeof WJ.Diagnoser, 'function');
   assert.equal(typeof WJ.BlocksManager, 'function');
   assert.equal(typeof WJ.Compressor, 'function');
   assert.equal(typeof WJ.Restorer, 'function');
-  assert.equal(typeof WJ.Gate, 'function');
-  assert.equal(typeof WJ.NudgeManager, 'function');
+  assert.equal(typeof WJ.classifyWaterMark, 'function'); // v0.9.0-m5.3  assert.equal(typeof WJ.NudgeManager, 'function');
   assert.equal(typeof WJ.Philosophy, 'function');
   assert.equal(typeof WJ.InvariantError, 'function');
   // v0.8.5 P2-13：canonical/hashCanonical 断言随死代码删除
@@ -40,17 +37,12 @@ test('createWanjuan：串起所有模块，状态可互通', () => {
   try {
     const wj = WJ.createWanjuan({ dir });
     wj.ledger.recordMsg({ id: 'm1', tok: 100 });
-    const est = wj.observer.beforeRequest({
-      provider: 'deepseek', model: 'deepseek-chat',
-      messages: [{ cls: 'text', tok: 100 }],
-    });
+    // v0.9.0-m5.3：Observer 类退役——k̂ 校准直连 estimator（与生产路径同款）
+    const est = wj.estimator.estimate({ messages: [{ cls: 'text', tok: 100 }] }, { provider: 'deepseek', model: 'deepseek-chat' });
     assert.equal(est.estRaw, 100);
 
-    const rec = wj.observer.afterRequest({
-      provider: 'deepseek', model: 'deepseek-chat',
-      est, usage: { input_tokens: 100, cached: 100 },
-    });
-    assert.equal(rec.calibOk, true);
+    wj.estimator.observeUsage({ provider: 'deepseek', model: 'deepseek-chat', usageInputTokens: 100, estRaw: est.estRaw });
+    assert.equal(wj.estimator.getCalibrationState('deepseek', 'deepseek-chat').n, 1);
 
     wj.diagnoser.record({
       n: 1, provider: 'deepseek', model: 'deepseek-chat',
@@ -60,16 +52,6 @@ test('createWanjuan：串起所有模块，状态可互通', () => {
 
     const text = WJ.buildReport({ dir, ledger: wj.ledger, diagnoser: wj.diagnoser });
     assert.ok(text.includes('万卷月报'));
-  } finally { rmSync(dir, { recursive: true, force: true }); }
-});
-
-test('createWanjuan：fp 与 ledger 共享同一实例', () => {
-  const dir = mkdtempSync(join(tmpdir(), 'wj-idx-'));
-  try {
-    const wj = WJ.createWanjuan({ dir });
-    wj.ledger.recordMsg({ id: 'm1', tok: 10, bytes: 100 });
-    assert.equal(wj.fingerprinter.ledger, wj.ledger);
-    assert.equal(wj.fingerprinter.checkLight(wj.ledger.getActiveMessages()), true);
   } finally { rmSync(dir, { recursive: true, force: true }); }
 });
 
@@ -104,13 +86,9 @@ test('createWanjuan：M3 自动化流水线全链路（estRaw 口径）', () => 
     wj.ledger.recordMsg({ id: 'm2', tok: 60 });
     wj.ledger.recordMsg({ id: 'm3', tok: 60 });
 
-    const gateRes = wj.gate.check({
-      currentEstRaw: 130_000,
-      lastFoldEstRaw: 50_000,
-      estFinal: 130_000,
-      window: 200_000
-    });
-    assert.equal(gateRes.action, 'nudge');
+    // v0.9.0-m5.3：Gate.check 退役——classifyWaterMark 边界
+    assert.equal(WJ.classifyWaterMark(130_000 / 200_000), 'silent');
+    assert.equal(WJ.classifyWaterMark(0.85), 'nudge');
 
     const candidates = wj.nudge.findCandidates(wj.ledger.getActiveMessages());
     assert.equal(candidates.length, 2);

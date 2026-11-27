@@ -10,6 +10,7 @@ import { join } from 'node:path';
 import { createWanjuan, PHILOSOPHY_KEEP_DROP } from './index.mjs';
 import { buildReport } from './report.mjs';
 import { LockManager } from './lock.mjs'; // v0.8.0 根锁
+import { classifyWaterMark } from './gate.mjs'; // v0.9.0-m5.3：水位→动作分类（阈值单点化）
 import { estimateTok } from './tokenizer.mjs';
 
 export const name = 'wanjuan';
@@ -649,7 +650,6 @@ export function apply(ctx, config = {}) {
 
   // ===== M3 水位配置 =====
   const CONTEXT_WINDOW = 128000;     // 兜底窗口（模型未知时；优先用 estimator 的 est.window）
-  const FORCE_FOLD_THRESHOLD = 0.95; // 强折阈值：95%
   const TAIL_RETENTION = 20;         // 尾部保护窗：永远不折叠最新的 N 条消息
 
   const recordUsage = (wj, usage, provider, model, sessionId) => {
@@ -1344,7 +1344,7 @@ export function apply(ctx, config = {}) {
         } catch {}
         let foldBridge = null; // 本轮折叠的宿主桥接 promise（供自动补桥排队）
 
-        if (usageRatio >= FORCE_FOLD_THRESHOLD) {
+        if (classifyWaterMark(usageRatio) === 'emergency') { // v0.9.0-m5.3：≥95%（阈值单点化于 gate.mjs）
           plugin.pushLog('warn', `🚨 水位达到 ${(usageRatio * 100).toFixed(1)}%（模型 ${provider || '?'}/${model || '?'}，窗口 ${window}）！正在强制执行后台保护性折叠...`);
           const toFold = byTime.slice(0, byTime.length - TAIL_RETENTION);
           try {
@@ -1372,7 +1372,7 @@ export function apply(ctx, config = {}) {
           } catch (err) {
             plugin.pushLog('error', `自动折叠失败: ${err.message}`);
           }
-        } else if (usageRatio >= 0.80) {
+        } else if (classifyWaterMark(usageRatio) === 'nudge') { // v0.9.0-m5.3：≥80%（阈值单点化于 gate.mjs）
           // M5.2：结构化 nudge 产出。80% 水位触发（Gate 的 growth 门留给 L2；
           // 方案 B 语义已定：lastFoldEstRaw 取折叠后 estRaw——折叠前基线会让 growth 变负数长哑火）
           const pool = byTime.slice(0, byTime.length - TAIL_RETENTION);

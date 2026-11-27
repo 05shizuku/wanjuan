@@ -8,26 +8,22 @@ import { fileURLToPath } from 'node:url';
 import { Estimator } from './estimate.mjs';
 import { Store } from './store.mjs';
 import { Ledger } from './ledger.mjs';
-import { Observer } from './observe.mjs';
-import { Fingerprinter } from './fingerprint.mjs';
 import { Diagnoser } from './diagnose.mjs';
 import { BlocksManager } from './blocks.mjs';
 import { Compressor } from './compress.mjs';
 import { Restorer } from './restore.mjs';
-import { Gate } from './gate.mjs';
+import { classifyWaterMark } from './gate.mjs';
 import { NudgeManager } from './nudge.mjs';
 
 export { Estimator } from './estimate.mjs';
 export { Store } from './store.mjs'; // v0.8.5 P2-13：快照接口随死代码一并移除
 export { Ledger, InvariantError } from './ledger.mjs';
-export { Observer } from './observe.mjs';
-export { Fingerprinter } from './fingerprint.mjs';
 export { Diagnoser, classifyMiss } from './diagnose.mjs';
 export { buildReport, reportFromDisk } from './report.mjs';
 export { BlocksManager, BlockError } from './blocks.mjs';
 export { Compressor } from './compress.mjs';
 export { Restorer } from './restore.mjs';
-export { Gate } from './gate.mjs';
+export { classifyWaterMark } from './gate.mjs'; // v0.9.0-m5.3：水位→动作分类（Gate 增速门语义退役）
 export { NudgeManager } from './nudge.mjs';
 export { estimateTok } from './tokenizer.mjs';
 export { Philosophy, PHILOSOPHY_KEEP_DROP } from './philosophy.mjs';
@@ -42,8 +38,6 @@ export function createWanjuan({
   snapshotBudget,
   segBytes,
   readOnly, // v0.8.0 根锁：只读降级实例
-  sampleEvery,
-  gateOptions,
   nudgeOptions,
   compactionThreshold,
 } = {}) {
@@ -52,18 +46,15 @@ export function createWanjuan({
   const store = new Store({ dir, snapshotBudget, segBytes, readOnly });
   const ledger = new Ledger({ store, compactionThreshold });
   const estimator = new Estimator({ models });
-  const observer = new Observer({ estimator });
-  const fingerprinter = new Fingerprinter({ ledger, sampleEvery });
   const diagnoser = new Diagnoser({ dir, readOnly });
   const blocks = new BlocksManager({ store });
   const compressor = new Compressor({ ledger, blocks });
   const restorer = new Restorer({ ledger, blocks });
-  const gate = new Gate(gateOptions);
   const nudge = new NudgeManager(nudgeOptions);
   
   return { 
-    dir, store, ledger, estimator, observer, 
-    fingerprinter, diagnoser, blocks, compressor, restorer,
-    gate, nudge
+    dir, store, ledger, estimator,
+    diagnoser, blocks, compressor, restorer,
+    nudge
   };
 }

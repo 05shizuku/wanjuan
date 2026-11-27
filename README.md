@@ -96,11 +96,11 @@ flowchart TB
 
 | 模块 | 现状 | 计划 |
 |---|---|---|
-| `fingerprint` | ✅ 已全线接线（v0.6.19 观察 + **v0.7.1 精确驱逐**） | `turn/end` 限流对账：seq < 表面最小值的零误驱逐（宿主压缩必从最老处收缩），其余保留观察 |
-| `gate` | 有测试（2 项）、未接线 | L2 决策层；阈值与 dsh 内联值（0.80/0.95）对齐后接入 |
+| `fingerprint` 类 | ❌ **v0.9.0-m5.3 类已删除**（M5.1 内联探针为维护版：readOk/drift 护栏 + 驱逐明细审计） | 采样对账算法在 git 历史 |收缩），其余保留观察 |
+| `gate` | ✅ **v0.9.0-m5.3 已拆分接线**（`classifyWaterMark` 纯函数，0.80/0.95 阈值单点化；旧增速门语义由 M5.2 降频生命周期取代） | L2 决策层如需增长门可基于此扩展 |
 | `nudge`（NudgeManager 类） | ✅ **v0.6.29 已接线**（M5.2 探针实证送达路径） | 80% 水位产出 → pre-step 注入模型 → `wj_compress` 命中即 accept / 未消费即 reject 降频；验收指标「主动压缩率 30%」观察中 |
 | `report.buildReport` | ✅ v0.6.19 已接线 | `wj_report` 现附完整月报段（命中率/责任归属/块统计；归因数值 M5 充实） |
-| `Observer` | 有测试（7 项）、未接线 | 与 Diagnoser 两套遥测待合并 |
+| `Observer` | ❌ **v0.9.0-m5.3 已删除**（薄壳被生产内联超越：k̂ 校准直连 estimator + baseline/degraded/持久化） | — |
 | **v0.7 模型自适应**（进行中） | 复审推演沉淀 + 模块审计 | ✅ **baseline 附加量模型已交付** · ✅ **M5.1 指纹精确驱逐已交付**（v0.7.4 判据升级：不在表面且宿主已推进到其后——覆盖最老收缩与中部空洞两种压缩形态，零误驱逐）· ✅ **启动回溯入账已交付**（挂载时从宿主表面反向重建历史，幂等；账本从此覆盖全会话）·（estFinal = estRaw × k̂ × 1.05 + baseline，结构性开销加法吸收，k̂ 回归纯估算误差）· 启动回溯入账（surface 反向重建历史）· 超窗口桥接降级 skip · 切窗主动预警 · 分批折叠（每批 ≤100K）· host-bootstrap 归因类别 · **工程卫生**：Math.min(...spread) 改 reduce（6 万条防栈溢出）· orphan-mut degrade · compress at=0 时间锚修正 · fsync 权衡评估 |
 
 `classifyMiss` 归因分类当前只产出 `new / unattributed`（`overrideMissKind` 注入口已预留），完整归因 **M5 交付**。
